@@ -78,6 +78,7 @@ pub struct FrameDropper {
     cfg: GateConfig,
     moving: bool,
     last_change: Option<Instant>,
+    last_activity: Instant,
     next_capture: Option<Instant>,
     next_keepalive: Option<Instant>,
     /// Counters useful for logs and for the capture probe's before/after report.
@@ -92,6 +93,7 @@ impl FrameDropper {
             cfg,
             moving: false,
             last_change: None,
+            last_activity: Instant::now(),
             next_capture: None,
             next_keepalive: None,
             captures: 0,
@@ -120,6 +122,15 @@ impl FrameDropper {
     pub fn note_change(&mut self, now: Instant) {
         self.moving = true;
         self.last_change = Some(now);
+        self.last_activity = now;
+    }
+
+    /// Interaction without a visible content change (pointer motion while the client
+    /// draws its own cursor, keyboard input): keeps the moving regime alive without
+    /// claiming the pixels changed.
+    pub fn note_activity(&mut self, now: Instant) {
+        self.moving = true;
+        self.last_activity = now;
     }
 
     /// Advance a paced clock along the ideal deadline grid.
@@ -136,12 +147,13 @@ impl FrameDropper {
 
     /// Decide what to emit at `now`.
     pub fn decide(&mut self, now: Instant) -> Action {
-        // Leave the moving regime once nothing changed for `still_after`.
+        // Leave the moving regime once neither content nor interaction happened for
+        // `still_after`. Interaction counts even when the client hides our cursor and
+        // the pixels genuinely never change.
         if self.moving {
-            if let Some(last) = self.last_change {
-                if now.duration_since(last) >= self.cfg.still_after {
-                    self.moving = false;
-                }
+            let quiet_since = self.last_change.unwrap_or(self.last_activity).max(self.last_activity);
+            if self.last_change.is_none() || now.duration_since(quiet_since) >= self.cfg.still_after {
+                self.moving = false;
             }
         }
 

@@ -15,7 +15,10 @@ use linux_uuremote::capture::x11::{DamageLevel, X11Screen};
 use linux_uuremote::config;
 use linux_uuremote::content::ContentChange;
 use linux_uuremote::capability;
-use linux_uuremote::control::{action_name, decode_control, encode_echo_response, ControlMessage};
+use linux_uuremote::control::{
+    action_name, decode_control, encode_capture_setting_sync, encode_echo_response, encode_rpc_response,
+    preset_bitrate_kbps, ControlMessage, RpcRequest,
+};
 use linux_uuremote::encoder::{FrameKind, FramePlanner, OpenH264};
 use linux_uuremote::gating::{Action, FrameDropper, GateConfig};
 use linux_uuremote::initialization::{encode_capture_change, encode_permissions, encode_secure_desktop, encode_screen_sources, Permissions, Screen, ScreenGeometry};
@@ -63,6 +66,33 @@ struct Session {
     /// 这次 soac 会话的路由字段（ice_id / client_id / app_control_id）：
     /// trickle candidate 时必须原样带回，否则云端不知道发给哪个客户端。
     route: Value,
+    /// 诊断用：本会话收到过几条 CONTROL 报文（前几条打形状，查"鼠标没反应"）。
+    control_msgs: u32,
+}
+
+/// 远程可调的采集参数。码率变化触发编码器重建 + IDR；分辨率只支持原生，降档显式拒绝。
+struct RemoteSettings {
+    moving_fps: AtomicU64,
+    still_fps: AtomicU64,
+    /// 目标码率 kbps；0 = 按尺寸自动。
+    bitrate_kbps: AtomicU64,
+    quality: AtomicU64,
+    custom_bps: AtomicU64,
+    /// 实测原生尺寸（采集线程每轮刷新；RPC 回复与 Sync 报真实值）。
+    native: std::sync::Mutex<(u32, u32)>,
+}
+
+impl RemoteSettings {
+    fn new(fps: u32, still_fps: u32) -> Self {
+        Self {
+            moving_fps: AtomicU64::new(fps.max(1) as u64),
+            still_fps: AtomicU64::new(still_fps as u64),
+            bitrate_kbps: AtomicU64::new(0),
+            quality: AtomicU64::new(5),
+            custom_bps: AtomicU64::new(0),
+            native: std::sync::Mutex::new((0, 0)),
+        }
+    }
 }
 
 fn main() {
@@ -162,6 +192,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
         }
     });
 
+    let settings = Arc::new(RemoteSettings::new(fps, still_fps));
     let mut session: Option<Session> = None;
 
     println!("等待客户端拉流（Ctrl-C 退出）…");
@@ -186,7 +217,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     };
                     match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, route: json!({}) }),
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, route: json!({}), control_msgs: 0 }),
                         Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
@@ -241,12 +272,16 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     if label == CONTROL_LABEL {
                         if let Some(session) = session.as_mut() {
                             let keyframe = session.keyframe.clone();
-                            start_video(&display, fps, still_fps, bitrate_kbps, gop, &keyframe, session, emit_tx.clone());
+                            start_video(&display, fps, still_fps, bitrate_kbps, gop, &keyframe, &settings, session, emit_tx.clone());
                         }
                     }
                 }
-                Some(PeerEvent::ControlData { data, .. }) => {
-                    handle_control(&data, session.as_mut()).await;
+                Some(PeerEvent::ControlData { label, data }) => {
+                    if label != CONTROL_LABEL {
+                        println!("   非 CONTROL 通道消息（{label}）：{} 字节", data.len());
+                    } else if let Some(session) = session.as_mut() {
+                        handle_control(&data, session, &settings).await;
+                    }
                 }
                 Some(PeerEvent::KeyframeRequest) => {
                     if let Some(session) = session.as_ref() {
@@ -327,26 +362,50 @@ fn forward_soac(sig_tx: &mpsc::UnboundedSender<Signal>, payload: Value) {
     }
 }
 
-/// 处理一条 CONTROL 报文：输入注入 / 保活 / protobuf 回包。
-async fn handle_control(data: &[u8], session: Option<&mut Session>) {
-    let Ok(message) = decode_control(data) else { return };
+/// 处理一条 CONTROL 报文：输入注入 / 保活 / protobuf 回包 / 设置 RPC。
+async fn handle_control(
+    data: &[u8],
+    session: &mut Session,
+    settings: &Arc<RemoteSettings>,
+) {
+    let now_secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    session.control_msgs += 1;
+    if session.control_msgs <= 3 {
+        println!(
+            "   CONTROL #{} 形状 {}", session.control_msgs,
+            linux_uuremote::wire::wire_shape(data, 3)
+        );
+    }
+    let message = match decode_control(data) {
+        Ok(m) => m,
+        Err(e) => {
+            // 解不开的报文不能哑巴吞掉——上次"鼠标没反应"就是没有任何线索可查。
+            println!("   CONTROL 报文解不开：{e}（形状 {}）", linux_uuremote::wire::wire_shape(data, 2));
+            return;
+        }
+    };
     match message {
-        ControlMessage::KeyboardHeartbeat | ControlMessage::Unsupported(_) => {}
+        ControlMessage::KeyboardHeartbeat => {}
+        ControlMessage::Unsupported(v) => println!("   CONTROL 未识别 JSON：{}", linux_uuremote::wire::json_shape(&v, 2)),
         ControlMessage::Action(action) => {
             println!("   SimpleAction {} seq={}", action_name(action.action).unwrap_or("?"), action.seq);
             // echo_request：官方客户端靠它确认宿主活着，args 里的 seq 必须原样回。
+            // FeatureFlag（encode_echo_response 里带 ff_capture_setting）决定客户端发不发设置 RPC。
             if action.action == 0 {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                let reply = encode_echo_response(action.seq, next_sequence(), now);
-                if let Some(session) = session {
-                    if let Err(e) = session.peer.send_control(&reply).await {
-                        eprintln!("   echo 回包失败：{e}");
-                    }
+                let reply = encode_echo_response(action.seq, next_sequence(), now_secs());
+                if let Err(e) = session.peer.send_control(&reply).await {
+                    eprintln!("   echo 回包失败：{e}");
                 }
             }
         }
+        ControlMessage::Rpc(request) => {
+            apply_rpc(request, &session.peer, settings).await;
+        }
         ControlMessage::Input(_) => {
-            let Some(input) = session.and_then(|s| s.input.clone()) else { return };
+            let Some(input) = session.input.clone() else {
+                println!("   收到输入但没有注入引擎");
+                return;
+            };
             // X 调用是阻塞的，别摁在事件循环里。
             let _ = tokio::task::spawn_blocking(move || {
                 let mut engine = input.lock().unwrap();
@@ -356,6 +415,56 @@ async fn handle_control(data: &[u8], session: Option<&mut Session>) {
             })
             .await;
         }
+    }
+}
+
+/// 应用一条设置 RPC：回 Message 22（request_id 原样），再报 Message 25 真实生效值。
+/// 只支持帧率与码率；分辨率降档需要缩放管线，显式拒绝而不是默默忽略。
+async fn apply_rpc(
+    request: RpcRequest,
+    peer: &linux_uuremote::transport::Peer,
+    settings: &Arc<RemoteSettings>,
+) {
+    let p = request.patch;
+    if request.case == 0 {
+        println!("   未识别的 RpcRequest case={}（只 ack 不执行）", request.case);
+    } else {
+        println!("   设置 RPC case={} fps={:?} quality={:?} bps={:?} {}x{:?}", request.case, p.fps, p.quality, p.custom_bps, "当前", p.width.zip(p.height));
+    }
+    let error = if p.width.is_some() && !p.follow_host {
+        Some("Linux 被控端只输出原生分辨率".to_owned())
+    } else if p.chroma == Some(3) {
+        Some("只支持 4:2:0".to_owned())
+    } else {
+        None
+    };
+    if let Some(fps) = p.fps {
+        settings.moving_fps.store(fps.max(1) as u64, Ordering::Relaxed);
+    }
+    if let Some(quality) = p.quality {
+        settings.quality.store(quality, Ordering::Relaxed);
+        let kbps = preset_bitrate_kbps(quality, p.custom_bps.unwrap_or(0));
+        settings.custom_bps.store(p.custom_bps.unwrap_or(0), Ordering::Relaxed);
+        settings.bitrate_kbps.store(kbps as u64, Ordering::Relaxed);
+    }
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let reply = encode_rpc_response(request.request_id, next_sequence(), ts, error.as_deref());
+    let (native_w, native_h) = *settings.native.lock().unwrap();
+    let fps_now = settings.moving_fps.load(Ordering::Relaxed) as u32;
+    let sync = encode_capture_setting_sync(
+        next_sequence(),
+        ts,
+        fps_now,
+        settings.quality.load(Ordering::Relaxed),
+        settings.custom_bps.load(Ordering::Relaxed),
+        native_w,
+        native_h,
+    );
+    if let Err(e) = peer.send_control(&reply).await {
+        eprintln!("   RPC 回包失败：{e}");
+    }
+    if let Err(e) = peer.send_control(&sync).await {
+        eprintln!("   Sync 上报失败：{e}");
     }
 }
 
@@ -372,6 +481,7 @@ fn start_video(
     bitrate_kbps: u32,
     gop: u32,
     keyframe: &Arc<AtomicBool>,
+    settings: &Arc<RemoteSettings>,
     session: &mut Session,
     emit_tx: mpsc::UnboundedSender<(String, Option<Value>)>,
 ) {
@@ -394,10 +504,11 @@ fn start_video(
     let (init_done_tx, init_done_rx) = oneshot::channel::<()>();
     let keyframe = keyframe.clone();
     let display = display.clone();
+    let thread_settings = settings.clone();
     session.capture = Some(
         std::thread::Builder::new()
             .name("uu-capture".into())
-            .spawn(move || capture_loop(display.as_deref(), fps, still_fps, bitrate_kbps, gop, keyframe, geom_tx, frames_tx))
+            .spawn(move || capture_loop(display.as_deref(), fps, still_fps, bitrate_kbps, gop, keyframe, geom_tx, thread_settings, frames_tx))
             .expect("起采集线程"),
     );
 
@@ -501,6 +612,7 @@ fn capture_loop(
     gop: u32,
     keyframe: Arc<AtomicBool>,
     geom_tx: oneshot::Sender<(u32, u32)>,
+    settings: Arc<RemoteSettings>,
     frames_tx: mpsc::Sender<Encoded>,
 ) {
     let mut screen = match X11Screen::open(display, DamageLevel::BoundingBox) {
@@ -514,7 +626,9 @@ fn capture_loop(
     let width = (screen.width() as usize) & !1;
     let height = (screen.height() as usize) & !1;
     // 上报的是真实屏幕尺寸（编码器只是内部裁 1 像素，坐标空间不变）。
-    let _ = geom_tx.send((u32::from(screen.width()), u32::from(screen.height())));
+    let measured = (u32::from(screen.width()), u32::from(screen.height()));
+    let _ = geom_tx.send(measured);
+    *settings.native.lock().unwrap() = measured;
     let mut encoder = match OpenH264::new(width, height, fps, bitrate_kbps, gop, 4) {
         Ok(e) => e,
         Err(e) => {
@@ -522,17 +636,57 @@ fn capture_loop(
             return;
         }
     };
-    let fps = fps.max(1);
+    let mut fps = fps.max(1);
     let mut gate = FrameDropper::new(GateConfig { moving_fps: fps, still_fps, still_after: Duration::from_millis(1000) });
     let mut planner = FramePlanner::new(fps, still_fps);
+    let mut applied_bitrate = bitrate_kbps;
+    let mut last_cursor: Option<(i32, i32)> = None;
+    let mut last_reported = measured;
     let mut content = ContentChange::new(width, height, 32, 18);
     let mut emitted = 0u64;
     let mut idr_frames = 0u64;
     let started = Instant::now();
 
     loop {
-        std::thread::sleep(Duration::from_nanos(1_000_000_000 / (fps as u64 * 2)));
+        std::thread::sleep(Duration::from_nanos(1_000_000_000 / ((fps.max(1) as u64) * 2)));
         let now = Instant::now();
+        // 分辨率可能被动改变（XRandR/切换显示）：每轮免费量一次，变了就重建编码器与比对器。
+        let geometry = (u32::from(screen.width()), u32::from(screen.height()));
+        if geometry != last_reported {
+            last_reported = geometry;
+            *settings.native.lock().unwrap() = geometry;
+            println!("   屏幕尺寸变化 → {}x{}（客户端要重连才有新清单）", geometry.0, geometry.1);
+        }
+        // 远程改帧率立刻生效（档位 + 睡眠节奏）。
+        let want_fps = (settings.moving_fps.load(Ordering::Relaxed) as u32).max(1);
+        if want_fps != fps {
+            fps = want_fps;
+            let still = settings.still_fps.load(Ordering::Relaxed) as u32;
+            gate.set_config(GateConfig { moving_fps: fps, still_fps: still, still_after: Duration::from_millis(1000) });
+            planner = FramePlanner::new(fps, still);
+            println!("   远程改帧率 → {fps} fps");
+        }
+        // 远程改码率 → 重建编码器（openh264 的码率在建码器时定），重建后下一帧必须 IDR。
+        let want_bitrate = settings.bitrate_kbps.load(Ordering::Relaxed) as u32;
+        if want_bitrate != applied_bitrate {
+            match OpenH264::new(width, height, fps, want_bitrate, gop, 4) {
+                Ok(e) => {
+                    encoder = e;
+                    applied_bitrate = want_bitrate;
+                    planner.note_keyframe_request();
+                    println!("   远程改码率 → {want_bitrate} kbps（编码器已重建）");
+                }
+                Err(e) => eprintln!("   码率重建失败：{e}"),
+            }
+        }
+        // 客户端自己画本地光标（Windows 光标），视频里没有我们的指针；指针移动仍是
+        // "有人在用"的唯一证据，用它维持 moving 档，否则静态桌面永远停在 still 档 3fps。
+        if let Some(pos) = screen.cursor_position() {
+            if last_cursor != Some(pos) {
+                last_cursor = Some(pos);
+                gate.note_activity(now);
+            }
+        }
         match gate.decide(now) {
             Action::Idle => continue,
             Action::Keepalive | Action::Capture => {}
@@ -556,12 +710,8 @@ fn capture_loop(
         if diff.first || diff.changed_pixels > 0 {
             gate.note_change(now);
         }
-        // 光标只合成进要发出去的那一份，参考帧必须保持无光标。
-        let mut out = frame.clone();
-        if let (Ok(sprite), Some(pos)) = (screen.fetch_cursor(), screen.cursor_position()) {
-            screen.composite_cursor(&mut out, &sprite, pos);
-        }
-        match encoder.encode_bgra(&out, plan.force_idr) {
+        // 官方客户端自己在远端画本地光标；再合成一份 X 光标只会重影，也不动客户端的输入坐标。
+        match encoder.encode_bgra(&frame, plan.force_idr) {
             Ok((au, kind)) => {
                 planner.note_success();
                 if kind == FrameKind::Idr {

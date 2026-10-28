@@ -10,7 +10,8 @@
 
 use serde_json::Value;
 
-use crate::wire::{WireField, WireValue, decode_wire, nested};
+use crate::initialization::envelope;
+use crate::wire::{WireField, WireValue, decode_wire, nested, varint_field};
 
 /// 一条输入动作（已经和平台无关）。
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +38,8 @@ pub enum ControlMessage {
     Unsupported(Value),
     /// protobuf SimpleAction 控制面。
     Action(SimpleAction),
+    /// 画质/帧率/分辨率设置 RPC（Message 21）。
+    Rpc(RpcRequest),
 }
 
 /// `Message.simpleAction`（field 3）解出来的东西。
@@ -72,7 +75,14 @@ fn coord_field(v: &Value, name: &str) -> Result<f64, String> {
 pub fn decode_control(data: &[u8]) -> Result<ControlMessage, String> {
     // protobuf 帧首字节是 field 1 的 tag（8 = varint seq）；JSON 永远以 `{` 开头。
     if data.first() != Some(&b'{') {
-        return decode_action(data).map(ControlMessage::Action);
+        let fields = decode_wire(data).map_err(|e| format!("CONTROL protobuf 解不开: {e:?}"))?;
+        if nested(&fields, 3).is_some() {
+            return decode_action(data).map(ControlMessage::Action);
+        }
+        if let Some(request) = decode_rpc_fields(&fields) {
+            return Ok(ControlMessage::Rpc(request));
+        }
+        return Err("CONTROL protobuf 里既没有 simpleAction(3) 也没有 RpcRequest(21)".into());
     }
     let v: Value = serde_json::from_slice(data).map_err(|_| "CONTROL 载荷不是合法 JSON")?;
     if v.get("heartbeat").and_then(Value::as_str) == Some("kbd_heartbeat") {
@@ -139,6 +149,159 @@ fn put_varint(mut v: u64, out: &mut Vec<u8>) {
     out.push(v as u8);
 }
 
+/// 采集设置 RPC（`Message` 21 `RpcRequest`，case 2/3/4/6）带来的变更意图。
+/// None = 这条报文没提该项，保持原值；不要把 0 当"取消"。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SettingPatch {
+    pub fps: Option<u32>,
+    /// 1 Fast / 2 高清2M / 3 超清8M / 4 原画20M / 5 Auto / 6 Custom。
+    pub quality: Option<u64>,
+    /// field 8：客户端自定义码率，单位 **bit/s**。
+    pub custom_bps: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// field 7：1=4:2:0、3=4:4:4。我们只产 4:2:0，Sync 里报实际值。
+    pub chroma: Option<u64>,
+    /// field 13：客户端当前解码的 codec（1=H264、2=H265）。是告知，不是切换指令。
+    pub codec: Option<u64>,
+    /// field 10 == 3：跟随被控端原生分辨率 → 撤销降档。
+    pub follow_host: bool,
+}
+
+/// Message 21 RpcRequest。request_id 必须原样回进 Message 22，否则客户端配不上对。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpcRequest {
+    pub request_id: u64,
+    /// 2=CaptureSetting 3=FpsSetting 4=VideoQuality 6=Resolution；0=认不出的类型（剪贴板 RPC 等），只 ack 不改状态。
+    pub case: u32,
+    pub patch: SettingPatch,
+}
+
+/// fps 菜单序号（field 1）→ 真实帧率。菜单发的是**序号不是帧率**；field 18 fpsCount 优先。
+pub fn fps_from_index(index: Option<u64>) -> Option<u32> {
+    match index? {
+        1 => Some(30),
+        2 => Some(60),
+        3 => Some(90),
+        4 => Some(144),
+        _ => None,
+    }
+}
+
+/// 画质档位 → 目标码率 kbps（参照实现的实测值）。0 = 用宿主自动公式。
+pub fn preset_bitrate_kbps(quality: u64, custom_bps: u64) -> u32 {
+    match quality {
+        1 => 1_000,
+        2 => 2_000,
+        3 => 8_000,
+        4 => 20_000,
+        6 => (custom_bps / 1_000).clamp(1, 100_000) as u32,
+        _ => 0,
+    }
+}
+
+pub fn decode_rpc(data: &[u8]) -> Result<RpcRequest, String> {
+    let fields = decode_wire(data).map_err(|e| format!("CONTROL protobuf 解不开: {e:?}"))?;
+    decode_rpc_fields(&fields).ok_or_else(|| "protobuf 不是 Message 21 RpcRequest（缺 header.request_id）".to_owned())
+}
+
+fn decode_rpc_fields(fields: &[WireField<'_>]) -> Option<RpcRequest> {
+    let body = nested(fields, 21)?;
+    let header = nested(&body, 1)?;
+    let request_id = varint_field(&header, 1)?;
+    let mut patch = SettingPatch::default();
+    let case;
+    if let Some(inner) = nested(&body, 2) {
+        case = 2;
+        patch.quality = varint_field(&inner, 2);
+        // 16/17 优先于 5/6（官方注释）；field 1 是菜单序号，18 才是真实帧率。
+        patch.width = varint_field(&inner, 16).or_else(|| varint_field(&inner, 5)).map(|v| v as u32);
+        patch.height = varint_field(&inner, 17).or_else(|| varint_field(&inner, 6)).map(|v| v as u32);
+        patch.chroma = varint_field(&inner, 7);
+        patch.custom_bps = varint_field(&inner, 8);
+        patch.follow_host = varint_field(&inner, 10) == Some(3);
+        patch.codec = varint_field(&inner, 13);
+        patch.fps = varint_field(&inner, 18).map(|v| v as u32).or_else(|| fps_from_index(varint_field(&inner, 1)));
+    } else if let Some(inner) = nested(&body, 3) {
+        case = 3;
+        patch.fps = fps_from_index(varint_field(&inner, 1));
+    } else if let Some(inner) = nested(&body, 4) {
+        case = 4;
+        patch.quality = varint_field(&inner, 1);
+    } else if let Some(inner) = nested(&body, 6) {
+        case = 6;
+        patch.width = varint_field(&inner, 1).map(|v| v as u32);
+        patch.height = varint_field(&inner, 2).map(|v| v as u32);
+    } else {
+        case = 0;
+    }
+    Some(RpcRequest { request_id, case, patch })
+}
+
+fn put_int(number: u32, value: u64, out: &mut Vec<u8>) {
+    if value != 0 {
+        out.push(((number << 3) | 0) as u8);
+        put_varint(value, out);
+    }
+}
+
+fn put_nested(number: u32, payload: &[u8], out: &mut Vec<u8>) {
+    out.push(((number << 3) | 2) as u8);
+    put_varint(payload.len() as u64, out);
+    out.extend_from_slice(payload);
+}
+
+/// 回 Message 22 RpcResponse：`1 header{1 request_id 原样}` + `2 CaptureSettingResponse{1 errors[]}`。
+/// 空 errors = 已应用；拒绝时 errors[0] = `{1 code=-1, 2 message}`。
+pub fn encode_rpc_response(request_id: u64, own_seq: u64, timestamp: u64, error: Option<&str>) -> Vec<u8> {
+    let mut header = Vec::new();
+    put_int(1, request_id, &mut header);
+    let mut response = Vec::new();
+    if let Some(message) = error {
+        let mut err = Vec::new();
+        // int32 -1 上线是符号扩展的 u64::MAX。
+        put_int(1, -1i64 as u64, &mut err);
+        put_nested(2, message.as_bytes(), &mut err);
+        put_nested(1, &err, &mut response);
+    }
+    let mut payload = Vec::new();
+    put_nested(1, &header, &mut payload);
+    // 成功也要发空消息：官方是 put_bytes(2, &[])，缺字段客户端可能一直等。
+    put_nested(2, &response, &mut payload);
+    envelope(own_seq, timestamp, 22, &payload)
+}
+
+/// Message 25 CaptureSettingSync：报**实际生效**值。客户端要 4:4:4 而我们只产 4:2:0，
+/// chroma 就报 1——参照实现请求 4:4:4、实际 4:2:0、同步报 1。
+pub fn encode_capture_setting_sync(
+    seq: u64,
+    timestamp: u64,
+    fps: u32,
+    quality: u64,
+    custom_bps: u64,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_int(1, u64::from(fps), &mut payload);
+    put_int(2, quality, &mut payload);
+    put_int(3, 1, &mut payload);
+    if quality == 6 && custom_bps > 0 {
+        put_int(4, custom_bps, &mut payload);
+    }
+    put_int(5, u64::from(width), &mut payload);
+    put_int(6, u64::from(height), &mut payload);
+    put_int(9, u64::from(width), &mut payload);
+    put_int(10, u64::from(height), &mut payload);
+    envelope(seq, timestamp, 25, &payload)
+}
+
+/// ff_capture_setting 版本号。4 = 累积含 CUSTOM_BITRATE（fps/预设画质/自定义码率 RPC）。
+/// 声明了就必须每条 21 都回 22；不声明客户端一条 RPC 都不发（安全默认）。
+pub fn capture_setting_feature_version() -> u8 {
+    4
+}
+
 /// 回 `echo_response`：官方形状是 `Message{seq, timestamp, simpleAction{actionType=1, args="{\"seq\":N}"}}`。
 ///
 /// args 里的 `seq` 是**请求**的 seq，客户端靠它配对；自己的 seq 与时间戳另算。
@@ -147,6 +310,12 @@ pub fn encode_echo_response(request_seq: u64, own_seq: u64, timestamp: u64) -> V
     let mut action = vec![8, 1, 18];
     put_varint(args.len() as u64, &mut action);
     action.extend_from_slice(args.as_bytes());
+    // FeatureFlag（SimpleAction field 4）：1 ff_capture_setting = 4。声明了就必须每条 21 都回 22，
+    // 客户端画质菜单才开得起来；不声明它一条 RPC 都不发。
+    let flags = [8u8, capture_setting_feature_version()];
+    action.push(34);
+    action.push(flags.len() as u8);
+    action.extend_from_slice(&flags);
     let mut out = Vec::new();
     if own_seq != 0 {
         out.push(8);
