@@ -14,6 +14,7 @@ use linux_uuremote::api::{ApiClient, Credentials, RoomError};
 use linux_uuremote::capture::x11::{DamageLevel, X11Screen};
 use linux_uuremote::config;
 use linux_uuremote::content::ContentChange;
+use linux_uuremote::capability;
 use linux_uuremote::control::{action_name, decode_control, encode_echo_response, ControlMessage};
 use linux_uuremote::encoder::{FrameKind, FramePlanner, OpenH264};
 use linux_uuremote::gating::{Action, FrameDropper, GateConfig};
@@ -240,7 +241,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     if label == CONTROL_LABEL {
                         if let Some(session) = session.as_mut() {
                             let keyframe = session.keyframe.clone();
-                            start_video(&display, fps, still_fps, bitrate_kbps, gop, &keyframe, session);
+                            start_video(&display, fps, still_fps, bitrate_kbps, gop, &keyframe, session, emit_tx.clone());
                         }
                     }
                 }
@@ -372,6 +373,7 @@ fn start_video(
     gop: u32,
     keyframe: &Arc<AtomicBool>,
     session: &mut Session,
+    emit_tx: mpsc::UnboundedSender<(String, Option<Value>)>,
 ) {
     if session.capture.is_some() {
         return;
@@ -400,6 +402,10 @@ fn start_video(
     );
 
     let peer_init = session.peer.clone();
+    // 能力上报要带这次会议的路由字段；采集线程跑起来时主循环可能已经换了会话，先抓一份。
+    let route = session.route.clone();
+    let field = |k: &str| route.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let (client_id, ice_id, app_control_id) = (field("client_id"), field("ice_id"), field("app_control_id"));
     tokio::spawn(async move {
         let (width, height) = match geom_rx.await {
             Ok(size) => size,
@@ -441,6 +447,38 @@ fn start_video(
         }
         println!("   CONTROL 初始化已发送（{width}x{height}，报文 {} 条）", messages.iter().filter(|m| !m.is_empty()).count());
         let _ = init_done_tx.send(());
+        // 官方被控端在 PeerConnection 进入 Connected 后发三条：device_capability、
+        // sender_para_info、ice_finished_log。缺了客户端画质菜单会锁在默认值。
+        if client_id.is_empty() || ice_id.is_empty() {
+            println!("   没有 client_id/ice_id，跳过能力上报");
+            return;
+        }
+        let waited = Instant::now();
+        while !peer_init.is_connected() && waited.elapsed() < Duration::from_secs(15) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !peer_init.is_connected() {
+            println!("   15 s 内没连通，跳过能力上报");
+            return;
+        }
+        emit_tx
+            .send((
+                capability::FORWARD_SETTING_EVENT.to_owned(),
+                Some(capability::device_capability(&client_id, &ice_id, 0, fps.max(1) as i32, width, height)),
+            ))
+            .ok();
+        emit_tx
+            .send((
+                capability::FORWARD_SETTING_EVENT.to_owned(),
+                Some(capability::sender_para_info(&client_id, &ice_id, "X11", "OpenH264")),
+            ))
+            .ok();
+        println!("   能力已上报：H.264 4:2:0 {width}x{height} @{}fps（X11 采集 / OpenH264 软编）", fps);
+        if !app_control_id.is_empty() {
+            emit_tx
+                .send((capability::ICE_FINISHED_EVENT.to_owned(), Some(capability::ice_finished(&ice_id, &app_control_id))))
+                .ok();
+        }
     });
 
     let peer = session.peer.clone();

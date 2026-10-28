@@ -416,6 +416,11 @@ impl Peer {
         Ok(with_max_message_size(&gathered))
     }
 
+    /// 是否已经连通：宿主靠它决定什么时候上报设备能力，不必引入 webrtc 的类型。
+    pub fn is_connected(&self) -> bool {
+        matches!(self.pc.connection_state(), RTCPeerConnectionState::Connected)
+    }
+
     /// 当前连接状态：宿主主循环与验收脚本靠它判断会话是否真的通了。
     pub fn connection_state(&self) -> RTCPeerConnectionState {
         self.pc.connection_state()

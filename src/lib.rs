@@ -5,6 +5,7 @@
 //! 决策逻辑与 I/O 分离：gating/content/diff/scan/cursor/wire 是纯逻辑，可确定性单测。
 
 pub mod api;
+pub mod capability;
 pub mod capture;
 pub mod config;
 pub mod content;
