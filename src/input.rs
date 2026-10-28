@@ -195,6 +195,9 @@ pub struct X11Input {
     /// 已注入但客户端还没松开的鼠标按键（X11 按钮序号），会话结束时统一松开。
     held_buttons: Vec<u8>,
     held_keys: Vec<u8>,
+    /// 内核虚拟键盘（/dev/uinput）。GNOME/Wayland 下 XTEST 键盘只进 X 客户端，
+    /// 原生 Wayland 应用收不到——键盘优先走 uinput，打不开才退回 XTEST。
+    keyboard: Option<crate::uinput::Keyboard>,
 }
 
 impl X11Input {
@@ -216,6 +219,16 @@ impl X11Input {
             pointer,
             held_buttons: Vec::new(),
             held_keys: Vec::new(),
+            keyboard: match crate::uinput::Keyboard::open() {
+                Ok(k) => {
+                    println!("   键盘后端：uinput 虚拟键盘（Wayland 原生应用可达）");
+                    Some(k)
+                }
+                Err(e) => {
+                    println!("   键盘后端：XTEST（uinput 打不开：{e}——Wayland 原生应用收不到键盘）");
+                    None
+                }
+            },
         })
     }
 
@@ -226,8 +239,19 @@ impl X11Input {
     /// 处理一条 CONTROL 消息；返回是否注入了东西。
     pub fn apply(&mut self, message: &ControlMessage) -> Result<bool, String> {
         let events = match message {
-            ControlMessage::Input(ControlInput::Keyboard { key, pressed }) => self.key_events(*key, *pressed),
-            ControlMessage::Input(ControlInput::KeyboardClick { key }) => self.click_events(*key),
+            ControlMessage::Input(ControlInput::Keyboard { key, pressed }) => {
+                if self.inject_uinput_key(*key, *pressed)? {
+                    return Ok(true);
+                }
+                self.key_events(*key, *pressed)
+            }
+            ControlMessage::Input(ControlInput::KeyboardClick { key }) => {
+                if self.inject_uinput_key(*key, true)? {
+                    self.inject_uinput_key(*key, false)?;
+                    return Ok(true);
+                }
+                self.click_events(*key)
+            }
             ControlMessage::Input(ControlInput::TextInput { text }) => self.text_events(text),
             ControlMessage::Input(ControlInput::MouseButton { button, pressed }) => {
                 if let Some(b) = mouse_button_to_x11(*button) {
@@ -265,6 +289,9 @@ impl X11Input {
 
     /// 会话结束：把还按着的键和按钮松开，别让本机卡在按住状态。
     pub fn release_all(&mut self) {
+        if let Some(keyboard) = self.keyboard.as_mut() {
+            let _ = keyboard.release_all();
+        }
         for button in std::mem::take(&mut self.held_buttons) {
             let (px, py) = self.pointer;
             let _ = self.conn.xtest_fake_input(BUTTONRELEASE, button, 0, self.root, clamp_i16(px), clamp_i16(py), 0);
@@ -273,6 +300,15 @@ impl X11Input {
             let _ = self.conn.xtest_fake_input(KEYRELEASE, 0, 0, self.root, keycode as i16, 0, 0);
         }
         let _ = self.conn.flush();
+    }
+
+    /// uinput 键盘注入；返回 Ok(true)=已注入，Ok(false)=没有虚拟键盘（走 XTEST 老路）。
+    fn inject_uinput_key(&mut self, vk: i32, pressed: bool) -> Result<bool, String> {
+        let Some(keyboard) = self.keyboard.as_mut() else { return Ok(false) };
+        let Some(keysym) = windows_vk_to_keysym(vk) else { return Ok(false) };
+        let Some(code) = crate::uinput::keysym_to_evdev(keysym) else { return Ok(false) };
+        keyboard.key(code, pressed).map_err(|e| format!("uinput 键盘注入失败：{e}"))?;
+        Ok(true)
     }
 
     fn key_events(&mut self, vk: i32, pressed: bool) -> Vec<XTestEvent> {

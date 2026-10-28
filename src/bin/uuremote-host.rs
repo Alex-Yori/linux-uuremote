@@ -216,6 +216,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 }
                 Some(Signal::BeControlled { header, capture_type }) => {
                     println!("   收到拉流请求（capture_type={capture_type}）");
+                    SOAC_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
                     // 每次拉流新建一条会话：ICE 配置属于这一次会议，不能复用上一条。
                     if let Some(old) = session.take() {
                         stop_session(old).await;
@@ -366,8 +367,15 @@ async fn stop_session(session: Session) {
     }
 }
 
+/// 每次拉流会话只打前 8 条 soac 的完整形状：连接慢时要知道客户端到底发了什么
+/// （实测前三次尝试只有 13 条 candidate、零条 offer，光靠事件名看不出内容）。
+static SOAC_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn forward_soac(sig_tx: &mpsc::UnboundedSender<Signal>, payload: Value) {
     let inner = payload.get("data").cloned().unwrap_or(payload.clone());
+    if SOAC_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        println!("   soac 形状 {}", linux_uuremote::wire::json_shape(&inner, 2));
+    }
     let kind = inner.get("type").and_then(Value::as_str).unwrap_or("");
     let ice_id = inner.get("ice_id").cloned();
     let client_id = payload.get("client_id").and_then(Value::as_str).map(str::to_owned);
@@ -435,6 +443,9 @@ async fn handle_control(
             }
         }
         ControlMessage::Rpc(request) => {
+            if request.case == 0 {
+                println!("   RpcRequest 形状 {}", linux_uuremote::wire::wire_shape(data, 3));
+            }
             apply_rpc(request, &session.peer, settings, reply_label).await;
         }
         ControlMessage::Input(ref input) => {

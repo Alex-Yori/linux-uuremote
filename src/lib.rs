@@ -19,4 +19,5 @@ pub mod initialization;
 pub mod scan;
 pub mod signaling;
 pub mod transport;
+pub mod uinput;
 pub mod wire;
