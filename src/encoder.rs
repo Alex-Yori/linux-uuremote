@@ -265,6 +265,84 @@ impl OpenH264 {
     }
 }
 
+/// RTP 时间戳跟着**帧实际离开编码器的时刻**走，而不是名义 60fps 计数：
+/// 采集饥饿时把 5fps 打成 60fps，接收端 jitter buffer 就会一路攒出几百 ms 的 frm
+/// （参照实现的 RtpTimeline，实测修掉 368 ms frm 这类症状）。webrtc-rs 先用
+/// 当前时间戳给样本盖章、再按样本 duration 推进，所以每个 duration 描述的是
+/// 到**下一帧**的名义间隔；一次卡顿只错一帧，下一帧即被拉回。
+pub struct RtpTimeline {
+    origin: Option<std::time::Instant>,
+    stamp: u64,
+    fps: u64,
+}
+
+const RTP_CLOCK: u64 = 90_000;
+
+impl RtpTimeline {
+    pub fn new(fps: u32) -> Self {
+        Self { origin: None, stamp: 0, fps: u64::from(fps.max(1)) }
+    }
+
+    /// 向上取整（+1ns 浮点保险），让 webrtc 的 floor(duration*90000) 恰好等于 ticks。
+    fn ticks_to_duration(ticks: u64) -> Duration {
+        Duration::from_nanos((ticks * 1_000_000_000 + RTP_CLOCK - 1) / RTP_CLOCK + 1)
+    }
+
+    /// 帧完成时刻 → 该样本的 duration（推进到"下一帧的名义位置"）。
+    pub fn duration_after(&mut self, completed_at: std::time::Instant) -> Duration {
+        let origin = *self.origin.get_or_insert(completed_at);
+        let real = ((completed_at.saturating_duration_since(origin).as_nanos()
+            * u128::from(RTP_CLOCK)
+            + 500_000_000)
+            / 1_000_000_000) as u64;
+        let advance = (real + RTP_CLOCK / self.fps).saturating_sub(self.stamp).max(1);
+        self.stamp += advance;
+        Self::ticks_to_duration(advance)
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::RtpTimeline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn duration_roundtrips_to_exact_ticks() {
+        for ticks in [1u64, 30000, 90000, 1_000_000] {
+            let d = RtpTimeline::ticks_to_duration(ticks);
+            assert_eq!((d.as_secs_f64() * 90_000.0) as u64, ticks);
+        }
+    }
+
+    #[test]
+    fn timestamps_follow_wall_clock_plus_one_frame() {
+        // 10 帧、每 100 ms 一帧（真实 10fps < 名义 30fps）：时间戳必须落在
+        // 真实时刻 + 一帧名义间隔，绝不能按 30fps 攒进度。
+        let base = Instant::now();
+        let mut tl = RtpTimeline::new(30);
+        let mut total = Duration::ZERO;
+        for i in 1..=10u64 {
+            total += tl.duration_after(base + Duration::from_millis(100 * i));
+        }
+        // 原点在第一帧完成时刻：时间戳 = 首帧起算的真实 900 ms + 一帧名义间隔。
+        let expected = Duration::from_millis(900) + Duration::from_nanos(1_000_000_000 / 30);
+        let drift = (total.as_millis() as i64 - expected.as_millis() as i64).abs();
+        assert!(drift < 3, "total {total:?} expected {expected:?} drift {drift}ms");
+    }
+
+    #[test]
+    fn stall_costs_one_frame_then_recover() {
+        let base = Instant::now();
+        let mut tl = RtpTimeline::new(30);
+        tl.duration_after(base);
+        // 1 s 卡顿 → 时间戳被拉回真实位置；随后正常间隔不再补攒。
+        let after_stall = tl.duration_after(base + Duration::from_millis(1000));
+        assert!(after_stall > Duration::from_millis(900));
+        let small = tl.duration_after(base + Duration::from_millis(1033));
+        assert!(small < Duration::from_millis(35));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

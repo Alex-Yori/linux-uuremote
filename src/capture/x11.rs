@@ -302,6 +302,15 @@ impl X11Screen {
         self.width
     }
 
+    /// 实时查询根窗口当前尺寸（不靠 open 时的缓存值）：客户端用 xrandr 改分辨率后
+    /// 根窗口跟着变，采集循环靠它发现重建编码器。查询失败退缓存值，绝不返回 0。
+    pub fn measure(&self) -> (u32, u32) {
+        match self.conn.get_geometry(self.root).map(|c| c.reply()) {
+            Ok(Ok(g)) => (u32::from(g.width), u32::from(g.height)),
+            _ => (u32::from(self.width), u32::from(self.height)),
+        }
+    }
+
     pub fn height(&self) -> u16 {
         self.height
     }

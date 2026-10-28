@@ -7,10 +7,12 @@
 pub mod api;
 pub mod capability;
 pub mod capture;
+pub mod capture_setting;
 pub mod config;
 pub mod content;
 pub mod control;
 pub mod cursor;
+pub mod desktop_mode;
 pub mod encoder;
 pub mod input;
 pub mod diff;

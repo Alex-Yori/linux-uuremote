@@ -104,6 +104,10 @@ pub struct Screen<'a> {
     pub screen_type: i32,
     /// 官方枚举：0 未知、1 内建、2 非内建。
     pub builtin_screen_type: i32,
+    /// 除 `resolution` 外还可选的（缩放）流尺寸，供客户端"其他分辨率"菜单。
+    pub scaled: &'a [(i32, i32)],
+    /// 当前实际推流尺寸（与 `resolution` 不同才填）。
+    pub current: Option<(i32, i32)>,
 }
 
 impl Screen<'_> {
@@ -122,8 +126,27 @@ impl Screen<'_> {
         integer(1, self.id, &mut out);
         integer(2, self.fps, &mut out);
         bytes(3, &rect, &mut out);
-        // 没有实测的缩放档位就不声明（客户端「其他分辨率」列表为空是诚实的）。
-        bytes(4, &rect, &mut out); // current_resolution = 原生
+        // 缩放档与原生同坐标空间：只换宽/高/像素，left/top 照旧；每档一个 repeated field 3。
+        let sized = |(width, height): (i32, i32)| {
+            ScreenGeometry {
+                width,
+                height,
+                pixel_width: width,
+                pixel_height: height,
+                left: self.resolution.left,
+                top: self.resolution.top,
+            }
+            .encode()
+        };
+        for size in self.scaled {
+            bytes(3, &sized(*size)?, &mut out);
+        }
+        // 没实测的缩放档位就不声明（客户端「其他分辨率」列表为空是诚实的）。
+        let current = match self.current {
+            Some(size) => sized(size)?,
+            None => rect.clone(),
+        };
+        bytes(4, &current, &mut out); // current_resolution = 当前推流尺寸（默认原生）
         integer(5, self.screen_type, &mut out);
         bytes(6, &rect, &mut out); // init_resolution
         boolean(7, self.primary, &mut out);
@@ -224,6 +247,8 @@ pub fn initial_messages(width: u32, height: u32, fps: u32) -> Vec<(u32, Vec<u8>)
         video_track_index: 0,
         screen_type: 0,
         builtin_screen_type: 0,
+        scaled: &[],
+        current: None,
     };
     let Ok(encoded) = screen.encode() else { return Vec::new() };
     let mut inventory = Vec::new();
@@ -248,6 +273,39 @@ mod tests {
             .iter()
             .filter_map(|f| match &f.value { crate::wire::WireValue::Varint(v) => Some((f.number, *v)), _ => None })
             .collect()
+    }
+
+    #[test]
+    fn scaled_choices_repeat_field3_and_current_overrides_field4() {
+        let scaled = [(1920i32, 1080i32), (1280, 720)];
+        let screen = Screen {
+            id: 0,
+            fps: 240,
+            resolution: ScreenGeometry { left: 0, top: 0, width: 2560, height: 1440, pixel_width: 2560, pixel_height: 1440 },
+            primary: true,
+            dpr: 1.0,
+            display_name: "",
+            video_track_index: 0,
+            screen_type: 0,
+            builtin_screen_type: 0,
+            scaled: &scaled,
+            current: Some((1280, 720)),
+        };
+        let encoded = screen.encode().unwrap();
+        let fields = decode_wire(&encoded).unwrap();
+        let rects: Vec<&[u8]> = fields
+            .iter()
+            .filter(|f| f.number == 3)
+            .filter_map(|f| match &f.value { crate::wire::WireValue::Bytes(b) => Some(*b), _ => None })
+            .collect();
+        assert_eq!(rects.len(), 3, "原生 + 两个缩放档都上线");
+        let crate::wire::WireValue::Bytes(cur) = &fields.iter().find(|f| f.number == 4).unwrap().value else { panic!() };
+        let nums: Vec<u64> = decode_wire(cur)
+            .unwrap()
+            .iter()
+            .filter_map(|f| match &f.value { crate::wire::WireValue::Varint(v) => Some(*v), _ => None })
+            .collect();
+        assert!(nums.contains(&1280) && nums.contains(&720), "current_resolution 报当前推流尺寸");
     }
 
     #[test]
@@ -281,6 +339,8 @@ mod tests {
             video_track_index: 0,
             screen_type: 0,
             builtin_screen_type: 0,
+            scaled: &[],
+            current: None,
         };
         let message = encode_screen_sources(1, 2, &[screen], 0).unwrap();
         let sources = decode_wire(&message).unwrap();
@@ -314,6 +374,8 @@ mod tests {
             video_track_index: 1,
             screen_type: 0,
             builtin_screen_type: 2,
+            scaled: &[],
+            current: None,
         };
         let message = encode_screen_sources(1, 2, &[screen.clone()], 2).unwrap();
         let which7 = decode_wire(&message).unwrap().into_iter().find(|f| f.number == 7).unwrap();

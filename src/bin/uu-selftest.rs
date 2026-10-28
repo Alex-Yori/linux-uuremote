@@ -244,6 +244,8 @@ async fn run(display: Option<String>, frames: u32) -> Result<(), String> {
                 video_track_index: 0,
                 screen_type: 0,
                 builtin_screen_type: 0,
+                scaled: &[],
+                current: None,
             }],
             0,
         )
