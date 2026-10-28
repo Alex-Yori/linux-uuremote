@@ -177,7 +177,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                     Ok(Received::Ack(id, v)) => {
                         let brief = v.to_string();
-                        println!("   信令 ack id={id}：{}", &brief[..brief.len().min(120)]);
+                        println!("   信令 ack id={id:?}：{}", &brief[..brief.len().min(120)]);
                         let _ = sig_tx.send(Signal::IceServers(v));
                     }
                     Ok(Received::BinaryEvent(name, header, attachments)) => {
@@ -434,7 +434,7 @@ async fn handle_control(
         ControlMessage::Rpc(request) => {
             apply_rpc(request, &session.peer, settings).await;
         }
-        ControlMessage::Input(input) => {
+        ControlMessage::Input(ref input) => {
             // 鼠标移动是洪水（每秒几十条），每 64 条打一条；键盘/按钮/滚轮必须全打——
             // 「键盘不能用」这种问题只有逐条日志才看得到事件到没到。
             if !matches!(input, linux_uuremote::control::ControlInput::MouseAbsolute { .. })
