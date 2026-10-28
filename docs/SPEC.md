@@ -137,3 +137,14 @@ https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd
 - 像素格式护栏必须读 `setup().pixmap_formats`：非 32 bpp packed 会整幅撕裂，宁可报错。
 - MIT-SHM 用 `ShmCreateSegment`（fd 传递，`minor >= 1`）而非 SysV `ShmAttach`，Xorg 与 Xvfb 都工作，且不需要进程持有 SysV 段。
 - 验证用的测试窗必须 `override_redirect`，否则窗口管理器会把它挪走，量出来是假失败。
+**脏区来源（2026-10-28 追加实测，推翻原假设）**
+
+| 场景 | 实测 | 结论 |
+|---|---|---|
+| 合成器桌面（GNOME/mutter `:1`），画面里只有一个 64x48 矩形在动 | `bbox` / `raw` / `nonempty` 三种 XDamage 报告级别的 `bbox_max_share` 全是 1.000 | 合成器每帧重画整个 root，XDamage 脏框永远是整屏，靠它做脏区优化收益为 0 |
+| 非合成服务器（`Xvfb`），画了 172 个矩形 | `damage_ev_s = 0.0`，门控停在 `still` | 子窗口绘画不给 root 产生 damage；无合成器时「XDamage 判动静」会一直判静止 |
+| 合成器桌面，damage 驱动采集 | 采集 45.1 fps，其中 `visual_change_fps` 只有 10.9，`identical_share = 75.9%` | 「damage 报了」≠「画面变了」，四分之三的读回与编码是白做的 |
+
+因此本项目的脏区**由内容比对推导**（`content.rs` 粗格采样 → 变化格合并成脏框 → `grab_rect` 只抓那块），XDamage 只当提示与降级依据。服务端切 tile 的正确性与成本已单独验证：256x256 tile 1.1–5.8 ms，整屏 12.4 ms，`--verify` 的 `painted_tile` / `tile_matches_full` 全通过。
+
+另外要记一条结构性差异：**我们抓的 root 像素里不含光标**（X 光标由服务端单独绘制），而官方画面把光标合成进视频。所以光标位移必须既算脏、又要单独抓光标区域合成——只靠 root 抓取会丢光标。
