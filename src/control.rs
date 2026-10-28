@@ -28,6 +28,31 @@ pub enum ControlInput {
     TextInput { text: String },
 }
 
+/// 输入事件的一行摘要（诊断日志用，不含内容敏感信息）。
+pub fn input_summary(input: &ControlInput) -> &'static str {
+    match input {
+        ControlInput::Keyboard { pressed, .. } => if *pressed { "kbd_press" } else { "kbd_release" },
+        ControlInput::KeyboardClick { .. } => "kbd_click",
+        ControlInput::MouseButton { pressed, .. } => if *pressed { "mouse_press" } else { "mouse_release" },
+        ControlInput::MouseClick { .. } => "mouse_click",
+        ControlInput::MouseAbsolute { .. } => "mouse_move_absolute",
+        ControlInput::MouseRelative { .. } => "mouse_move_relative",
+        ControlInput::MouseScroll { .. } => "mouse_scroll",
+        ControlInput::TextInput { .. } => "text_input",
+    }
+}
+
+/// 整条消息的输入摘要（不解构消息，避免部分移动）。
+pub fn input_summary_of(message: &ControlMessage) -> &'static str {
+    match message {
+        ControlMessage::Input(input) => input_summary(input),
+        ControlMessage::KeyboardHeartbeat => "kbd_heartbeat",
+        ControlMessage::Action(_) => "simple_action",
+        ControlMessage::Rpc(_) => "rpc_request",
+        ControlMessage::Unsupported(_) => "unsupported",
+    }
+}
+
 /// CONTROL 通道一条消息解出来的东西。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlMessage {

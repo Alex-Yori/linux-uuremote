@@ -385,10 +385,14 @@ async fn handle_control(
         }
     };
     match message {
-        ControlMessage::KeyboardHeartbeat => {}
+        ControlMessage::KeyboardHeartbeat => {
+            if session.control_msgs <= 3 {
+                println!("   kbd 心跳");
+            }
+        }
         ControlMessage::Unsupported(v) => println!("   CONTROL 未识别 JSON：{}", linux_uuremote::wire::json_shape(&v, 2)),
         ControlMessage::Action(action) => {
-            println!("   SimpleAction {} seq={}", action_name(action.action).unwrap_or("?"), action.seq);
+            println!("   SimpleAction {} seq={} args={}", action_name(action.action).unwrap_or("?"), action.seq, action.args);
             // echo_request：官方客户端靠它确认宿主活着，args 里的 seq 必须原样回。
             // FeatureFlag（encode_echo_response 里带 ff_capture_setting）决定客户端发不发设置 RPC。
             if action.action == 0 {
@@ -402,11 +406,15 @@ async fn handle_control(
             apply_rpc(request, &session.peer, settings).await;
         }
         ControlMessage::Input(_) => {
+            if session.control_msgs <= 8 {
+                println!("   输入事件：{}", linux_uuremote::control::input_summary_of(&message));
+            }
             let Some(input) = session.input.clone() else {
                 println!("   收到输入但没有注入引擎");
                 return;
             };
             // X 调用是阻塞的，别摁在事件循环里。
+            let message = message.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 let mut engine = input.lock().unwrap();
                 if let Err(e) = engine.apply(&message) {
@@ -641,6 +649,8 @@ fn capture_loop(
     let mut planner = FramePlanner::new(fps, still_fps);
     let mut applied_bitrate = bitrate_kbps;
     let mut last_cursor: Option<(i32, i32)> = None;
+    let mut frames_sent: u64 = 0;
+    let mut last_stat = Instant::now();
     let mut last_reported = measured;
     let mut content = ContentChange::new(width, height, 32, 18);
     let mut emitted = 0u64;
@@ -686,6 +696,15 @@ fn capture_loop(
                 last_cursor = Some(pos);
                 gate.note_activity(now);
             }
+        } else if last_cursor.is_some() {
+            last_cursor = None;
+            println!("   QueryPointer 拿不到指针位置（Xwayland 不报？）");
+        }
+        if now.duration_since(last_stat) >= Duration::from_secs(5) {
+            let secs = now.duration_since(last_stat).as_secs_f64().max(0.1);
+            println!("   出帧速率 {:.1} fps（近 5s 共 {frames_sent} 帧，门控 moving={})", frames_sent as f64 / secs, gate.is_moving());
+            frames_sent = 0;
+            last_stat = now;
         }
         match gate.decide(now) {
             Action::Idle => continue,
