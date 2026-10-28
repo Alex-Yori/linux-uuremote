@@ -303,13 +303,15 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(PeerEvent::ControlData { label, data }) => {
-                    if label != CONTROL_LABEL {
-                        // Windows 客户端的键盘可能走 TEXT_DATA_CHANNEL 而不是 CONTROL：
-                        // 打出前 48 字节，看它到底在哪个通道、什么格式。
+                    // 参照实现把 CONTROL 和 TEXT 两条通道都当控制面（键盘等 JSON 输入
+                    // 实际走 TEXT；只监听 CONTROL 会让键盘无声丢光）。STREAMER 是别的东西，只记日志。
+                    if matches!(label.as_str(), CONTROL_LABEL | "TEXT_DATA_CHANNEL") {
+                        if let Some(session) = session.as_mut() {
+                            handle_control(&data, session, &settings, &label).await;
+                        }
+                    } else if label != "STREAMER_DATA_CHANNEL" || session.as_ref().is_some_and(|s| s.control_msgs % 20 == 0) {
                         let head: String = data.iter().take(48).map(|b| format!("{b:02x}")).collect();
-                        println!("   非 CONTROL 通道（{label}）：{} 字节 head={head}", data.len());
-                    } else if let Some(session) = session.as_mut() {
-                        handle_control(&data, session, &settings).await;
+                        println!("   旁路通道（{label}）：{} 字节 head={head}", data.len());
                     }
                 }
                 Some(PeerEvent::KeyframeRequest) => {
@@ -396,6 +398,7 @@ async fn handle_control(
     data: &[u8],
     session: &mut Session,
     settings: &Arc<RemoteSettings>,
+    reply_label: &str,
 ) {
     let now_secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     session.control_msgs += 1;
@@ -426,13 +429,13 @@ async fn handle_control(
             // FeatureFlag（encode_echo_response 里带 ff_capture_setting）决定客户端发不发设置 RPC。
             if action.action == 0 {
                 let reply = encode_echo_response(action.seq, next_sequence(), now_secs());
-                if let Err(e) = session.peer.send_control(&reply).await {
+                if let Err(e) = session.peer.send_on(reply_label, &reply).await {
                     eprintln!("   echo 回包失败：{e}");
                 }
             }
         }
         ControlMessage::Rpc(request) => {
-            apply_rpc(request, &session.peer, settings).await;
+            apply_rpc(request, &session.peer, settings, reply_label).await;
         }
         ControlMessage::Input(ref input) => {
             // 鼠标移动是洪水（每秒几十条），每 64 条打一条；键盘/按钮/滚轮必须全打——
@@ -477,6 +480,7 @@ async fn apply_rpc(
     request: RpcRequest,
     peer: &linux_uuremote::transport::Peer,
     settings: &Arc<RemoteSettings>,
+    reply_label: &str,
 ) {
     let p = request.patch;
     if request.case == 0 {
@@ -513,10 +517,10 @@ async fn apply_rpc(
         native_w,
         native_h,
     );
-    if let Err(e) = peer.send_control(&reply).await {
+    if let Err(e) = peer.send_on(reply_label, &reply).await {
         eprintln!("   RPC 回包失败：{e}");
     }
-    if let Err(e) = peer.send_control(&sync).await {
+    if let Err(e) = peer.send_on(reply_label, &sync).await {
         eprintln!("   Sync 上报失败：{e}");
     }
 }

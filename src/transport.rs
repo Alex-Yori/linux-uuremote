@@ -283,6 +283,8 @@ pub struct Peer {
     /// 视频轨要等看见 offer 才能建：codec 必须照 offer 里的 fmtp 挑（见 `h264_capability_from_offer`）。
     track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
     control: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    /// 客户端会开多条通道（CONTROL / TEXT / STREAMER…），回包必须回到来的那条。
+    channels: Arc<Mutex<std::collections::HashMap<String, Arc<RTCDataChannel>>>>,
     events: mpsc::UnboundedSender<PeerEvent>,
 }
 
@@ -320,26 +322,31 @@ impl Peer {
         }
 
         let control: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
+        let channels: Arc<Mutex<std::collections::HashMap<String, Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
         pc.on_data_channel(Box::new({
             let control = control.clone();
+            let channels = channels.clone();
             let events = events.clone();
             move |d: Arc<RTCDataChannel>| {
                 let label = d.label().to_owned();
                 let is_control = label == CONTROL_LABEL;
                 // 真正能用是 on_open 之后：那时才存通道、才报 ControlOpen。
                 let control_open = control.clone();
+                let channels_open = channels.clone();
                 let channel_open = d.clone();
                 let events_open = events.clone();
                 let label_open = label.clone();
                 d.on_open(Box::new(move || {
                     let events = events_open.clone();
                     let control = control_open.clone();
+                    let channels = channels_open.clone();
                     let channel = channel_open.clone();
                     let label = label_open.clone();
                     Box::pin(async move {
                         if is_control {
-                            *control.lock().await = Some(channel);
+                            *control.lock().await = Some(channel.clone());
                         }
+                        (*channels.lock().await).insert(label.clone(), channel);
                         let _ = events.send(PeerEvent::ControlOpen { label });
                     })
                 }));
@@ -379,7 +386,7 @@ impl Peer {
                 }
             }
         });
-        Ok(Self { pc, track: Arc::new(Mutex::new(None)), control, events })
+        Ok(Self { pc, track: Arc::new(Mutex::new(None)), control, channels, events })
     }
 
     /// 吃客户端 offer，回我们要用的 answer SDP（已补 max-message-size）。
@@ -470,6 +477,16 @@ impl Peer {
             .as_ref()
             .map(|d| d.ready_state() == RTCDataChannelState::Open)
             .unwrap_or(false)
+    }
+
+    /// 往指定 label 的通道发字节；回包要回到消息来的那条通道。
+    pub async fn send_on(&self, label: &str, data: &[u8]) -> Result<(), String> {
+        let guard = self.channels.lock().await;
+        let channel = guard.get(label).ok_or(format!("{label} 通道还没建立"))?;
+        if channel.ready_state() != RTCDataChannelState::Open {
+            return Err(format!("{label} 通道还没 Open"));
+        }
+        channel.send(&Bytes::from(data.to_vec())).await.map(|_| ()).map_err(|e| format!("{label} 发送失败: {e}"))
     }
 
     /// 往 CONTROL 通道发字节（protobuf 回包、剪贴板等）。
