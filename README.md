@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-第一个能跑的模块是**采集与出帧门控**（`uu-capture-probe`），它已经实测验证了本项目最核心的那条设计——**内容自适应出帧**。其余模块在路线图里，还没写。
+两个能跑的模块：采集与出帧门控（`uu-capture-probe`，验证了核心设计**内容自适应出帧**），以及连接层（`uu-login` + `uu-cloud-probe`，已在真机与网易云信令**全链路联通**）。传输与编码在路线图里，还没写。
 
 | 模块 | 状态 |
 |---|---|
@@ -22,9 +22,11 @@
 | 稀疏采样扫描（`src/scan.rs`，采样格 + 参照帧拼接） | ✅ 已实现，7 个单元测试通过；降级路径 |
 | 批量抓取（`grab_tiles`，一次请求多矩形各写 offset） | ✅ 已实现，`--verify` 的 `batch_painted` / `batch_matches_full` 通过 |
 | 可控测试载荷（`uu-damage-load`，`--fps` 可调） | ✅ 已实现，脏区/内容测量可复现 |
+| 云 API 与登录（`src/api.rs`：签名/设备注册/扫码/JWT csrf） | ✅ 已实现，10 个单元测试；`uu-login` 真机跑通（扫码 + 借用参照实现登录态两条路） |
+| 信令（Engine.IO v4 + Socket.IO v5，`src/signaling.rs`） | ✅ 已实现，6 个单元测试；`uu-cloud-probe` 真机联通：建房 → `X-NRD-AUTH` 握手 → room_info ack → bmsg_push |
+| wire 结构检查（`src/wire.rs`，protobuf/JSON 只报形状不报内容） | ✅ 已实现，5 个单元测试 |
 | 编码（NVENC / VAAPI / x264 软编） | ⬜ 未实现，probe 先量采集侧 |
-| 信令（socket.io / WSS） | ⬜ 未实现 |
-| 传输（ICE/STUN/TURN + RTP/SRTP + 数据通道） | ⬜ 未实现 |
+| 传输（soac offer/answer + ICE + DTLS/SRTP + 数据通道） | ⬜ 未实现，信令侧事件面已摸清（`be-controlled`/`soac`/`bmsg_push`） |
 | 输入注入 / 剪贴板 / 文件传输 / 端口映射 | ⬜ 未实现 |
 
 ## 为什么先做这个
@@ -168,6 +170,48 @@ mutter 的 cursor_serial 每秒换 ~60 次（合成器每帧重建光标对象�
 > 注意：`DISPLAY` 在 agent shell 里是空的，跑之前要
 > `export DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority`（或直接 `--display :1`）。
 
+### 连接层真机联通（2026-10-28）
+
+连接层按参照实现（本机在跑、云端连接可用的 0.2.x 实现）的**线上行为**重写，
+不是按通用 socket.io 文档猜的。三处与直觉不同的事实，全部实测印证：
+
+1. **房间 token 走 HTTP 头 `X-NRD-AUTH`**（裸 token，无 `Bearer` 前缀）。
+   按教科书把 token 放进命名空间 CONNECT payload 实测被 **403** 拒掉。
+2. **URL 是 `?transport=websocket&EIO=4`**（Engine.IO v4），不是 EIO=3。
+3. **握手方向**：服务器发 open `'0'`（带 pingInterval/pingTimeout）后，客户端发
+   `'40'`（不带 payload），服务器回 `'40{}'` 即 CONNECTED；带 ack 的请求帧是
+   `42<ack_id>["event"]`，服务器用 `43<ack_id>[data]` 回。心跳是服务器发 `'2'`、
+   客户端回 `'3'`；`pingInterval+pingTimeout` 窗口内没收到 ping 必须判死
+   （半开 TCP 会让宿主静默离线，参照实现有同样的 watchdog）。
+
+被控端事件面（参照实现源码 + 安卓 Java 包 jadx 双重印证）：服务器推
+`be-controlled`（常为 binary `'45'` + ConnectOptions protobuf 附件）、
+`soac`（WebRTC offer/answer，ICE 走 SDP 交换而不是独立 candidate 事件）、
+`bmsg_push`（房间成员）、`released`/`left`；客户端主动发 `room_info`（带 ack id）
+与 `refresh_reconnect_key`（官方 30 s/300 s/失败 30 s 重试的 token 刷新环）。
+
+真机验收（`uu-cloud-probe`，凭证借用参照实现的登录态）：
+
+```
+1) 建房…
+   signaling_server = wss://sig-3303-e.nrd.nie.163.com/
+2) WSS 握手（X-NRD-AUTH）…
+   CONNECT_ACK ✓（命名空间已连）
+3) room_info…
+   room_info ack ✓：[1x{iceServers:[0],publisher:{9 keys},reconnect_buffer:15,room_id:str(24),…}]
+   —— 信令链路已通 ——
+4) 等客户端拉流（be-controlled / soac，≤20s）…
+   bmsg_push：{data:{alias:str(5),controllable:true,…},type:str(19)}
+   leave: {ice_id:str(0),ntestraceid:str(69)}
+   超时：没有客户端来拉流。信令通、登记就位——拿 App 扫这台设备即会触发 be-controlled。
+```
+
+所有输出只报**形状**（字段名、类型、长度、小整数），token/ticket/SDP 内容永不打印
+（`wire.rs` 的 `json_shape` / `wire_shape`）。`uu-login` 支持两条路：终端半块字符
+二维码扫码（官方 `status_query_ticket` 长轮询、过期按官方策略停），或只读借用
+参照实现的 `~/.config/uuremote/config.json` 登录态；写入永远只进
+`~/.config/linux-uuremote/config.json`（0600）。
+
 ## 设计要点
 
 - **门控与采集分离**：`gating.rs` 与 `content.rs` 是纯决策逻辑（不碰 I/O），可确定性测试；`capture::x11` 只负责「把像素拿回来」。
@@ -179,11 +223,11 @@ mutter 的 cursor_serial 每秒换 ~60 次（合成器每帧重建光标对象�
 ## 路线图
 
 1. **编码层**（脏区与光标都已定型）：NVENC（本机 3080 Ti 主路径）→ VAAPI → x264 兜底；能力探测 + 可配置黑名单 + 失败回退，对齐官方 `GetEncodeCapability()` / `encoder requested fallback`。编码器直接吃 `merge_blocks` 出的脏框 + 光标精灵矩形，并可消费共享内存映射省掉 1.3 ms 拷出。
-2. **信令与传输**：socket.io 信令（这条与参照实现一致）+ ICE/DTLS/SRTP；官方数据通道是 KCP+RS-FEC，参照实现是标准 SCTP——先按标准 SCTP 打通，再评估是否要补 KCP。
+2. **传输**：信令已通（见上），下一步是 `soac` 的 offer/answer（SDP）+ ICE + DTLS/SRTP；官方数据通道是 KCP+RS-FEC，参照实现是标准 SCTP——先按标准 SCTP 打通，再评估是否要补 KCP。
 3. **被控端配置面**：官方可配字段清单见 SPEC；本项目打算先支持 `fps / quality / codec / chroma / cursor`，其余按需。
 4. **无合成器的降级路径**：没有合成器时 root damage 不报子窗口变化（实测 `damage_ev_s=0`），要判动静得走 XComposite overlay 或逐窗口 damage。
 
-已完成：**XShm 快速回读**（`ShmCreateSegment` fd 传递 + mmap，失败按会话降级回 `GetImage`）、**服务端切 tile 与批量多矩形抓取**、**逐块精确比对与脏框合并（`diff.rs`）**、**稀疏采样降级路径（`scan.rs`）**、**内容变化检测**、**光标取回与合成（`cursor.rs`）**、**可控测试载荷 `uu-damage-load`**。
+已完成：**XShm 快速回读**（`ShmCreateSegment` fd 传递 + mmap，失败按会话降级回 `GetImage`）、**服务端切 tile 与批量多矩形抓取**、**逐块精确比对与脏框合并（`diff.rs`）**、**稀疏采样降级路径（`scan.rs`）**、**内容变化检测**、**光标取回与合成（`cursor.rs`）**、**可控测试载荷 `uu-damage-load`**、**连接层（`api.rs`/`signaling.rs`/`config.rs`/`wire.rs`，真机联通）**。
 
 ## 与参照实现的主要差异
 

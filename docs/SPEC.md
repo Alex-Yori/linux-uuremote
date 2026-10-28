@@ -171,3 +171,44 @@ https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd
 | 参考帧 | 保持无光标，光标只合成进发出那份拷贝 | 否则光标像素永远被误判为内容脏区 |
 
 `--verify` 的端到端判据：真实服务端精灵混合到黑画布，变化像素 >0 且 ≤ alpha 掩码份额 +0.05；`:1` `0.245/0.510`、Xvfb `0.234/0.688` 通过（暗半透明像素叠黑仍读 0，故不逐像素相等）。
+
+## 9. 连接层协议事实与真机验收（2026-10-28 补充）
+
+连接层直接继承参照实现（`uuremote-server`，本机在跑、云端可用）的**线上行为**；
+通用 socket.io 文档在这条链上有三处会踩错：
+
+| 事实 | 线上形态 | 按文档猜会怎样 |
+|---|---|---|
+| 房间 token 位置 | HTTP 头 `X-NRD-AUTH`（裸 token） | 放 CONNECT payload → **403**（实测踩坑） |
+| Engine.IO 版本 | `?transport=websocket&EIO=4` | EIO=3 查询串（参照实现不用它） |
+| 握手方向 | 服务器 open `'0'` → 客户端 `'40'`（无 payload）→ 服务器 `'40{}'` = CONNECTED | 客户端先发带 token 的 `40{...}` |
+
+帧格式：事件 `42["event",payload]`；带 ack 的请求 `42<ack_id>["event"]`，服务器
+`43<ack_id>[data]` 回（ack payload 是**数组**）；binary 事件 `45/46` header + 裸
+binary 附件帧。心跳：服务器 `'2'` → 客户端 `'3'`；Engine.IO v4 判死窗口 =
+pingInterval+pingTimeout（半开 TCP 必须判死，否则宿主静默离线）。
+
+被控端事件面（参照实现源码 + 安卓 jadx 双重印证）：
+- 服务器推：`be-controlled`（常为 binary，附件 = ConnectOptions protobuf：
+  capture_type/fps/decoder_cap_list）、`soac`（WebRTC offer/answer JSON，ICE 走
+  SDP 交换，无独立 ice-candidate 事件）、`bmsg_push`（房间成员变更）、
+  `released` / `left` / `leave`（对端离开）。
+- 客户端主动：`room_info`（带 ack id，连上即发）、`refresh_reconnect_key`
+  （官方 RefreshSignalTokenLoop：首 30 s、成功每 300 s、失败 30 s 重试）、
+  `soac` answer。
+
+REST 面（`api.nrd.nie.163.com`）：每请求 `x-param-*` 头组 + `x-param-sign` =
+`hex(HMAC-SHA256(sign_key, METHOD+path+排序后 k=v 用 & 连接+body))`；未登录时
+不存在的 id 不发也不签。扫码链：`qrcode/gen/login`（空 body）→ `status_query_ticket`
+（现行字段，旧服退 `token`）→ `qrcode/login/status` 长轮询 60 s（status 1 等/2 扫/
+0 过期 350 ms 刷新/3 立即刷新/4 确认；HTTP 400 code 1190 = 二维码失效）→
+`login/by_qrcode` → `token`（JWT 含 `csrf`）+ `user_id`。设备注册
+`device/windows/init`（匿名硬件摘要）→ `device_id`。建房 `room/create` →
+`signaling_server` + 房间 token（本环境实测为不透明串，无 JWT exp）。
+
+真机验收（`uu-cloud-probe`）：建房 → `X-NRD-AUTH` 握手 CONNECT_ACK → room_info
+ack（`iceServers/publisher/room_id/subscribers/you`）→ `bmsg_push`（本机设备档案
+`controllable:true`）→ 无客户端时 `leave` + 干净超时退出。64 单测全过。
+机密纪律：token/ticket/SDP 永不打印，错误消息不回显服务器内容；输出只报形状
+（`wire.rs`）。凭证文件 `~/.config/linux-uuremote/config.json` 0600 原子写，
+登录态缺失时只读借用 `~/.config/uuremote/config.json`。
