@@ -251,7 +251,6 @@ mod tests {
 
     #[test]
     fn splicing_tiles_updates_only_the_touched_rectangles() {
-        let g = grid();
         let base = frame(32, 16, None);
         let changed = frame(32, 16, Some((16, 8, 4, 4)));
         let mut reference = base.clone();

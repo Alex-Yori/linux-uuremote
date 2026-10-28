@@ -16,6 +16,7 @@
 | 内容变化检测（`src/content.rs`，粗格采样比对） | ✅ 已实现，7 个单元测试通过；实测能识别出 75.9% 的无效帧 |
 | X11 采集（XDamage 脏区 + XFixes 光标 + MIT-SHM 回读） | ✅ 已实现，实测跑通，失败自动降级 `GetImage` |
 | 脏矩形抓取（服务端切 tile） | ✅ 已实现，`--dirty`；但合成器桌面给的脏框是整屏，见「实测」 |
+| 光标精灵取回与合成（`src/cursor.rs`） | ✅ 已实现，7 个单元测试；`--verify` 端到端判据双服务器 PASS |
 | 读回正确性验证（`--verify`，双服务器 PASS） | ✅ 见下面「实测」 |
 | 脏框合并（`src/diff.rs`，块→矩形，可限条数） | ✅ 已实现，12 个单元测试通过 |
 | 稀疏采样扫描（`src/scan.rs`，采样格 + 参照帧拼接） | ✅ 已实现，7 个单元测试通过；降级路径 |
@@ -36,7 +37,7 @@
 
 ```bash
 cargo build
-cargo test                 # 35 个单元测试：出帧门控 + 内容检测 + 块比对合并 + 采样扫描（都不依赖显示器）
+cargo test                 # 42 个单元测试：出帧门控 + 内容检测 + 块比对合并 + 采样扫描 + 光标合成（都不依赖显示器）
 cargo build --release      # 测量用 release：debug 的回读耗时是 release 的 3–4 倍
 ```
 
@@ -109,6 +110,22 @@ damage 级别 bbox / raw / nonempty 三种都试：
 
 所以脏区应当**由内容比对推导**，而不是由 XDamage 推导。抓取机制本身已经验证是划算的：服务端切出的 256x256 tile 只要 1.1–5.8 ms，整屏是 12.4 ms，而 tile 内容正确性由 `--verify` 的 `painted_tile` / `tile_matches_full` 两项把关（实测 1.000 / true）。
 
+### 光标必须单独抓再合成进画面（本机 :1 与 Xvfb，2026-10-28）
+
+抓 root 像素**不含光标**（X 光标由服务端绘制在画面之上），而官方把光标合成进视频，所以本项目自己抓精灵再合成：`XFixesGetCursorImage` 拿 ARGB 精灵 + `QueryPointer` 拿热点位置，`src/cursor.rs` 做 source-over 混合（纯逻辑，7 个单测）。
+
+实测（`--cpu-diff --cursor`，载荷 = 64x48 矩形 30 fps）：
+
+```
+精灵 24x24（mutter）/ 16x16（Xvfb），取回 0.04–0.06 ms，混合 0.005–0.006 ms/帧
+光标区域编码器输入 0.09–0.11 MB/s（内容脏区是 0.9–1.7 MB/s）—— 代价可忽略
+mutter 的 cursor_serial 每秒换 ~60 次（合成器每帧重建光标对象），按 serial 去重后仍是
+~60 次/s 重取精灵，每次 0.05 ms，接受；不重取会丢动画光标
+参考帧保持「无光标」：光标只合成进发出的那份拷贝，否则光标像素永远被当成内容脏区
+```
+
+`--verify` 新增端到端判据：把**真实服务端精灵**混合到一个黑画布上，变化像素必须 >0 且不超过 alpha 掩码份额（`comp_ratio <= expected + 0.05`）。本机 `:1` 实测 `comp_ratio=0.245/0.510`（暗半透明像素叠在黑上仍读 0，所以判据是「有变化且不超掩码」而不是逐像素相等）；Xvfb 默认光标同样通过。
+
 ### 脏区该怎么算：读回不是瓶颈，编码输入才是（本机 :1，2560x1440）
 
 用 `uu-damage-load`（64x48 矩形以 30 fps 来回扫）当载荷，把两条候选路同机对比（XDamage 那条已在上面证明无效）：
@@ -140,7 +157,7 @@ damage 级别 bbox / raw / nonempty 三种都试：
 
 `--verify` 会证明读回路径确实拿到真实画面，而不是空缓冲：先抓一帧参照、映射一个 override-redirect 纯红测试窗、两条路径各抓一次，然后打判据——`painted_changed`（根窗口抓取确实反映真实画面，合成器下也成立）、`painted_shm` / `painted_tile`（整屏与服务端切出的 tile 里确实是画上去的像素）、`rect_identical`（两条路径逐字节一致）、`tile_matches_full`（tile 与整屏同一区域一致）、`batch_painted`（一次请求抓多条矩形时，画上去的那条必须整条是红的，这才证明每条矩形各写自己的 offset）与 `batch_matches_full`。本机 `:1` 与 `Xvfb` 实测全通过。
 
-`--no-read` 只测决策不读像素（量门控本身的开销）；`--still-after-ms` 控制静止判定滞后；`--secs` 控制时长；`--dirty` 只抓脏框；`--content-gate` 用内容比对而不是 XDamage 驱动门控；`--damage-level bbox|nonempty|raw` 换 XDamage 报告级别；`--cpu-diff --diff-block 16x16` 量「整屏读回 + 精确比对」这条路；`--incremental --sample-grid 16x9 --sample-tile 16x16 --resync-ms 1000 --max-dirty-rects 8` 量稀疏采样这条路。
+`--no-read` 只测决策不读像素（量门控本身的开销）；`--still-after-ms` 控制静止判定滞后；`--secs` 控制时长；`--dirty` 只抓脏框；`--content-gate` 用内容比对而不是 XDamage 驱动门控；`--damage-level bbox|nonempty|raw` 换 XDamage 报告级别；`--cpu-diff --diff-block 16x16` 量「整屏读回 + 精确比对」这条路；`--cpu-diff --cursor` 再叠光标取回与合成；`--incremental --sample-grid 16x9 --sample-tile 16x16 --resync-ms 1000 --max-dirty-rects 8` 量稀疏采样这条路。
 
 `uu-damage-load` 是配套的可控测试载荷：自己开一个 override-redirect 窗口，在里面画一个来回扫动的小矩形，让「脏区多大、画面真变了多少」这类测量可复现，而不是依赖桌面当时在干什么。
 
@@ -155,19 +172,18 @@ damage 级别 bbox / raw / nonempty 三种都试：
 
 - **门控与采集分离**：`gating.rs` 与 `content.rs` 是纯决策逻辑（不碰 I/O），可确定性测试；`capture::x11` 只负责「把像素拿回来」。
 - **脏区有两个来源**：XDamage 报告矩形（对齐官方 `dirty_bbox` 的字面含义）与内容比对推出的变化区域。实测合成器桌面前者永远是整屏，所以脏区应当由后者推导，前者保留当作提示与降级用。
-- **光标单独轮询**：XDamage 不报光标（光标不是窗口内容），而官方端把光标合成进画面（配置面里有 `cursor` 字段），所以光标位移必须也算脏——用 `XFixesGetCursorPosition` 廉价轮询补上。注意我们自己抓的 root 像素里**不含光标**，光标区域要单独抓。
+- **光标单独抓 + 合成**：XDamage 不报光标（光标不是窗口内容），而官方端把光标合成进画面（配置面里有 `cursor` 字段）。位置用 `QueryPointer` 轮询（位移算脏），精灵用 `XFixesGetCursorImage` 取（按 `cursor_serial` 去重），发帧前 source-over 合成进画面拷贝；参考帧保持无光标。
 - **滞后防抖**：`still_after` 给一个滞后窗口，稀疏变化不会在动静两档之间来回抖。
 - **`still_fps = 0`** 表示静止时一个帧都不发，留给「真正零输出」的场景。
 
 ## 路线图
 
-1. **脏区来源定型**（见上面的对比表）：整屏 SHM 读回 + `diff.rs` 逐块精确比对（16x16）+ `merge_blocks` 合并成脏框，把脏框喂编码器；`scan.rs` 稀疏采样作为读回昂贵时的降级路径。剩下要接的是光标：我们抓的 root 像素不含光标，光标区域要单独抓并合成进画面（`grab_tiles` 批量抓取已就绪并验证 offset 生效）。
-2. **编码层**：NVENC（本机 3080 Ti 主路径）→ VAAPI → x264 兜底；能力探测 + 可配置黑名单 + 失败回退，对齐官方的 `GetEncodeCapability()` / `encoder requested fallback`。编码器可直接消费共享内存映射，省掉现在 1.3 ms 的拷出。
-3. **信令与传输**：socket.io 信令（这条与参照实现一致）+ ICE/DTLS/SRTP；官方数据通道是 KCP+RS-FEC，参照实现是标准 SCTP——先按标准 SCTP 打通，再评估是否要补 KCP。
-4. **被控端配置面**：官方可配字段清单见 SPEC；本项目打算先支持 `fps / quality / codec / chroma / cursor`，其余按需。
-5. **无合成器的降级路径**：没有合成器时 root damage 不报子窗口变化（实测 `damage_ev_s=0`），要判动静得走 XComposite overlay 或逐窗口 damage。
+1. **编码层**（脏区与光标都已定型）：NVENC（本机 3080 Ti 主路径）→ VAAPI → x264 兜底；能力探测 + 可配置黑名单 + 失败回退，对齐官方 `GetEncodeCapability()` / `encoder requested fallback`。编码器直接吃 `merge_blocks` 出的脏框 + 光标精灵矩形，并可消费共享内存映射省掉 1.3 ms 拷出。
+2. **信令与传输**：socket.io 信令（这条与参照实现一致）+ ICE/DTLS/SRTP；官方数据通道是 KCP+RS-FEC，参照实现是标准 SCTP——先按标准 SCTP 打通，再评估是否要补 KCP。
+3. **被控端配置面**：官方可配字段清单见 SPEC；本项目打算先支持 `fps / quality / codec / chroma / cursor`，其余按需。
+4. **无合成器的降级路径**：没有合成器时 root damage 不报子窗口变化（实测 `damage_ev_s=0`），要判动静得走 XComposite overlay 或逐窗口 damage。
 
-已完成：**XShm 快速回读**（`ShmCreateSegment` fd 传递 + mmap，失败按会话降级回 `GetImage`）、**服务端切 tile**、**内容变化检测**、**可控测试载荷 `uu-damage-load`**。
+已完成：**XShm 快速回读**（`ShmCreateSegment` fd 传递 + mmap，失败按会话降级回 `GetImage`）、**服务端切 tile 与批量多矩形抓取**、**逐块精确比对与脏框合并（`diff.rs`）**、**稀疏采样降级路径（`scan.rs`）**、**内容变化检测**、**光标取回与合成（`cursor.rs`）**、**可控测试载荷 `uu-damage-load`**。
 
 ## 与参照实现的主要差异
 

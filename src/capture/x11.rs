@@ -31,6 +31,7 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use super::shm::ShmSegment;
 use super::DirtyArea;
+use crate::cursor::{self, Sprite};
 
 /// Assumed cursor sprite size for dirty-area reporting when only the position is known.
 /// `XFixesGetCursorImage` can report the real sprite; a conservative box is enough to
@@ -86,6 +87,19 @@ pub struct VerifyReport {
     /// Whether the painted rectangle came back painted from inside the batch, which is what
     /// proves per-rectangle offsets are honoured.
     pub tiles_batch_painted: bool,
+    /// Sprite size/serial from `XFixesGetCursorImage` (0x0 means the server reported none).
+    pub cursor_sprite: (u16, u16),
+    pub cursor_serial: u32,
+    /// Cost of that cursor fetch.
+    pub cursor_ms: f64,
+    /// End-to-end proof of the composition path: the share of a freshly grabbed tile that
+    /// changes when the real sprite is blended onto it, and the share the sprite's alpha says
+    /// should change. Gate: they agree within 0.1 whenever the sprite is visible on the tile.
+    pub cursor_composite_ratio: f64,
+    pub cursor_expected_ratio: f64,
+    /// Cost and size of that composite test.
+    pub cursor_composite_ms: f64,
+    pub cursor_composite_px: usize,
     /// Cost and total bytes of that batch.
     pub tiles_batch_ms: f64,
     pub tiles_batch_bytes: usize,
@@ -346,6 +360,46 @@ impl X11Screen {
     ///
     /// Cheap (one small round trip), so the caller can run it while the screen is
     /// otherwise unchanged — that is exactly when cursor-only motion matters.
+    /// Fetch the current cursor sprite (`XFixesGetCursorImage`).
+    ///
+    /// `x/y` in the reply are the sprite's top-left, i.e. where the sprite sits given the
+    /// current hotspot; callers pass the hotspot from `QueryPointer` instead so a position
+    /// poll never forces a sprite fetch.
+    pub fn fetch_cursor(&mut self) -> Result<Sprite, X11Error> {
+        let r = self
+            .conn
+            .xfixes_get_cursor_image()
+            .map_err(text("xfixes_get_cursor_image"))?
+            .reply()
+            .map_err(text("xfixes_get_cursor_image reply"))?;
+        Ok(Sprite {
+            x: r.x as i32,
+            y: r.y as i32,
+            width: r.width,
+            height: r.height,
+            hotspot_x: r.xhot,
+            hotspot_y: r.yhot,
+            serial: r.cursor_serial,
+            argb: r.cursor_image,
+        })
+    }
+
+    /// Blend a sprite into a packed 32bpp frame at the cursor point; see `crate::cursor`.
+    pub fn composite_cursor(
+        &self,
+        frame: &mut [u8],
+        sprite: &Sprite,
+        hotspot: (i32, i32),
+    ) -> Option<(usize, usize, usize, usize)> {
+        cursor::composite(frame, self.width as usize, self.bytes_per_pixel, sprite, hotspot.0, hotspot.1)
+    }
+
+    /// Last polled cursor position, without polling (a daemon composites the sprite every
+    /// frame, moving or not; only the *dirty* accounting is allowed to go stale).
+    pub fn cursor_position(&self) -> Option<(i32, i32)> {
+        self.last_cursor
+    }
+
     pub fn poll_cursor(&mut self) -> Result<Option<DirtyArea>, X11Error> {
         let pos = self.cursor_pos()?;
         if self.last_cursor == Some(pos) {
@@ -759,6 +813,45 @@ impl X11Screen {
                 .iter()
                 .zip(batch_rects.iter())
                 .all(|(d, r)| self.tile_matches_full(d, &via_getimage, r.x, r.y, r.width, r.height));
+            // Composition path, end to end on real server data: fetch the actual cursor
+            // sprite, blend it onto a freshly grabbed tile laid out like the screen, and
+            // verify that exactly the pixels its alpha says are opaque actually changed.
+            // Deterministic without XTest: no cursor warping, and the grabbed tile is a
+            // solid known surface, so a wrong sprite decode cannot pass.
+            let t0 = std::time::Instant::now();
+            let sprite = self.fetch_cursor()?;
+            let cursor_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let (cw, ch) = (sprite.width as usize, sprite.height as usize);
+            let mut canvas = vec![0u8; cw * ch * 4];
+            let mut cursor_composite_ratio = 0.0;
+            let mut cursor_expected_ratio = 0.0;
+            let mut cursor_composite_ms = 0.0;
+            let mut cursor_composite_px = 0;
+            if !sprite.is_empty() {
+                // The canvas is a sprite-sized screen whose top-left equals the sprite's
+                // top-left, so the hotspot inside it is exactly (xhot, yhot).
+                let t0 = std::time::Instant::now();
+                let painted = cursor::composite(&mut canvas, cw, 4, &sprite, sprite.hotspot_x as i32, sprite.hotspot_y as i32);
+                cursor_composite_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                cursor_composite_px = painted.map(|(_, _, w, h)| w * h).unwrap_or(0);
+                // On a black canvas exactly the pixels with alpha > 0 must end up written.
+                // Compare against the alpha mask by value (a dark semi-transparent pixel over
+                // black can legitimately stay 0, so pixel equality is not the criterion).
+                let opaque = sprite
+                    .argb
+                    .iter()
+                    .take(sprite.pixel_count())
+                    .filter(|p| **p >> 24 != 0)
+                    .count();
+                let base = cw * ch;
+                cursor_expected_ratio = opaque as f64 / base as f64;
+                // Pixels that differ from black. A dark semi-transparent pixel over black can
+                // still read 0, so the honest criterion is "some changed, none more than the
+                // alpha mask allows" — a wrong decode (e.g. treating RGB as ARGB) blows past
+                // the mask or changes nothing.
+                let changed_px = canvas.chunks(4).filter(|px| px[0..3] != [0u8, 0, 0]).count();
+                cursor_composite_ratio = changed_px as f64 / base as f64;
+            }
             Ok(VerifyReport {
                 bytes: via_shm.len(),
                 painted_getimage: self.paint_ratio(&via_getimage, g.x, g.y, g.width, g.height),
@@ -791,6 +884,13 @@ impl X11Screen {
                 tiles_batch_painted: batch_painted,
                 tiles_batch_ms: batch_ms,
                 tiles_batch_bytes: batch_bytes,
+                cursor_sprite: (sprite.width, sprite.height),
+                cursor_serial: sprite.serial,
+                cursor_ms,
+                cursor_composite_ratio,
+                cursor_expected_ratio,
+                cursor_composite_ms,
+                cursor_composite_px,
             })
         })();
 

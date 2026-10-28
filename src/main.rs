@@ -22,6 +22,7 @@
 
 mod capture;
 mod content;
+mod cursor;
 mod diff;
 mod gating;
 mod scan;
@@ -53,6 +54,9 @@ struct Args {
     /// Full-frame read + exact CPU diff: measure the read+diff cost and the dirty share the
     /// encoder would actually receive.
     cpu_diff: bool,
+    /// Fetch the cursor sprite and blend it into emitted frames (the root grab never contains
+    /// the cursor itself).
+    cursor: bool,
     /// Diff block size for `--cpu-diff`.
     diff_block: (usize, usize),
     /// Sample grid: cells across x down.
@@ -80,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
         content_gate: false,
         incremental: false,
         cpu_diff: false,
+        cursor: false,
         diff_block: (64, 64),
         sample_grid: (32, 18),
         sample_tile: (8, 8),
@@ -117,6 +122,7 @@ fn parse_args() -> Result<Args, String> {
             "--content-gate" => args.content_gate = true,
             "--incremental" => args.incremental = true,
             "--cpu-diff" => args.cpu_diff = true,
+            "--cursor" => args.cursor = true,
             "--diff-block" => args.diff_block = parse_size(&next(), args.diff_block),
             "--sample-grid" => args.sample_grid = parse_size(&next(), args.sample_grid),
             "--sample-tile" => args.sample_tile = parse_size(&next(), args.sample_tile),
@@ -132,7 +138,7 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "usage: uu-capture-probe [--display :1] [--fps 60] [--still-fps 3] \
                      [--still-after-ms 1000] [--secs 20] [--baseline] [--no-read] [--verify] \
-                     [--dirty] [--content-gate] [--incremental] [--cpu-diff] [--diff-block 64x64] \
+                     [--dirty] [--content-gate] [--incremental] [--cursor] [--cpu-diff] [--diff-block 64x64] \
                      [--sample-grid 32x18] \
                      [--sample-tile 8x8] [--resync-ms 1000] [--max-dirty-rects 8] \
                      [--damage-level bbox|nonempty|raw]"
@@ -448,6 +454,15 @@ fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error
         if args.read { "read" } else { "skipped" },
     );
 
+    // Cursor state: the sprite only changes when the server reports a new cursor, so it is
+    // fetched lazily and dropped on any cursor-notify; position comes from QueryPointer.
+    let mut sprite: Option<cursor::Sprite> = None;
+    let mut w_cursor_fetch: u64 = 0;
+    let mut w_cursor_fetch_ms: f64 = 0.0;
+    let mut w_cursor_comp_ms: f64 = 0.0;
+    let mut w_cursor_px: u64 = 0;
+    let mut t_cursor_px: u64 = 0;
+
     let start = Instant::now();
     let mut window_start = start;
 
@@ -466,6 +481,28 @@ fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error
     while start.elapsed() < args.duration {
         for _ in screen.poll_events()? {
             w_damage += 1;
+            if args.cursor {
+                // `poll_events` only reports a cursor-notify after deduping `cursor_serial`,
+                // so this invalidates the sprite only when the server really swapped it. On
+                // this mutter desktop the serial still churns ~60/s (it rebuilds the cursor
+                // object per repaint), which costs the measured ~0.05 ms per frame — cheap
+                // enough to accept rather than guess a slower polling cadence.
+                sprite = None;
+            }
+        }
+        let mut hotspot: Option<(i32, i32)> = None;
+        if args.cursor {
+            // Motion marks the gate dirty; the sprite still has to ride on every frame, so
+            // the position is kept even when nothing moved. `poll_cursor` stores the position
+            // before returning, so polling then reading covers both branches.
+            screen.poll_cursor()?;
+            hotspot = screen.cursor_position();
+            if sprite.is_none() {
+            let t0 = Instant::now();
+            sprite = Some(screen.fetch_cursor()?);
+            w_cursor_fetch += 1;
+            w_cursor_fetch_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            }
         }
 
         let (frame, timing) = screen.grab_rect(None)?;
@@ -473,6 +510,22 @@ fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error
         let blocks = dirty_blocks(&reference, &frame, w, bpp, &grid);
         let rects = merge_blocks(&blocks, &grid, args.max_dirty_rects);
         let diff_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // The cursor lives on top of everything: while it shows, its sprite rectangle rides
+        // on top of the content-diff rectangles and is re-encoded each frame it is visible
+        // (cheap: a sprite is a few hundred pixels, not a screen). It is blended into the
+        // emitted copy only — the diff reference stays cursor-free, otherwise cursor pixels
+        // would register as content dirty forever.
+        if let (Some(s), Some(pos)) = (sprite.as_ref(), hotspot) {
+            let mut out = frame.clone();
+            let t0 = Instant::now();
+            let painted = screen.composite_cursor(&mut out, s, pos);
+            w_cursor_comp_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let px = painted.map(|(_, _, w, h)| (w * h) as u64).unwrap_or(0);
+            w_cursor_px += px;
+            w_bytes += px * bpp as u64;
+        }
+
         w_bytes += frame.len() as u64;
         reference = frame;
 
@@ -488,7 +541,8 @@ fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error
             println!(
                 "t={:5.1}s grab_fps={:6.1} grab_ms={:6.2} diff_ms={:6.2} loop_ms={:6.2} \
                  rects_per_frame={:5.2} dirty_share={:6.4} read_mb_s={:7.1} encode_mb_s={:7.1} \
-                 damage_ev_s={:6.1}",
+                 cursor_fetch_fps={:5.2} cursor_fetch_ms={:6.3} cursor_comp_ms={:6.3} \
+                 cursor_share={:6.4} damage_ev_s={:6.1}",
                 start.elapsed().as_secs_f64(),
                 w_grabs as f64 / dt,
                 w_grab_ms / grabs,
@@ -497,18 +551,27 @@ fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error
                 w_rects as f64 / grabs,
                 w_dirty_px as f64 / grabs / full_px as f64,
                 w_bytes as f64 / dt / (1024.0 * 1024.0),
-                w_dirty_px as f64 / dt * bpp as f64 / (1024.0 * 1024.0),
+                (w_dirty_px + w_cursor_px) as f64 / dt * bpp as f64 / (1024.0 * 1024.0),
+                w_cursor_fetch as f64 / dt,
+                w_cursor_fetch_ms / w_cursor_fetch.max(1) as f64,
+                w_cursor_comp_ms / grabs,
+                w_cursor_px as f64 / grabs / full_px as f64,
                 w_damage as f64 / dt,
             );
             t_grabs += w_grabs;
             t_rects += w_rects;
             t_dirty_px += w_dirty_px;
             t_bytes += w_bytes;
+            t_cursor_px += w_cursor_px;
             w_grabs = 0;
             w_rects = 0;
             w_dirty_px = 0;
             w_bytes = 0;
             w_damage = 0;
+            w_cursor_px = 0;
+            w_cursor_fetch = 0;
+            w_cursor_fetch_ms = 0.0;
+            w_cursor_comp_ms = 0.0;
             w_grab_ms = 0.0;
             w_diff_ms = 0.0;
             window_start = Instant::now();
@@ -521,14 +584,15 @@ fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error
     let grabs = t_grabs.max(1) as f64;
     println!(
         "SUMMARY mode=cpu-diff grabs={} grab_fps={:.2} dirty_share={:.4} rects_total={} \
-         rects_per_frame={:.2} encode_mb_s={:.2} read_mb_s={:.2} \
+         rects_per_frame={:.2} encode_mb_s={:.2} cursor_mb_s={:.2} read_mb_s={:.2} \
          (full-frame encoder input would be {:.0} MB/s)",
         t_grabs,
         t_grabs as f64 / secs,
         t_dirty_px as f64 / grabs / full_px as f64,
         t_rects,
         t_rects as f64 / grabs,
-        t_dirty_px as f64 / secs * bpp as f64 / (1024.0 * 1024.0),
+        (t_dirty_px + t_cursor_px) as f64 / secs * bpp as f64 / (1024.0 * 1024.0),
+        t_cursor_px as f64 / secs * bpp as f64 / (1024.0 * 1024.0),
         t_bytes as f64 / secs / (1024.0 * 1024.0),
         full_px as f64 * bpp as f64 / (1024.0 * 1024.0) * (t_grabs as f64 / secs),
     );
@@ -586,12 +650,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             && v.painted_tile > 0.9
             && v.rect_identical > 0.9
             && v.painted_changed > 0.5
-            && v.tiles_batch_painted;
+            && v.tiles_batch_painted
+            // Cursor composition: when the server reports a sprite, blending it onto a black
+            // canvas must change at least one pixel and never more than its alpha mask allows.
+            && (v.cursor_sprite == (0, 0)
+                || (v.cursor_composite_ratio > 0.0
+                    && v.cursor_composite_ratio <= v.cursor_expected_ratio + 0.05));
         println!(
             "VERIFY bytes={} painted_getimage={:.3} painted_shm={:.3} painted_tile={:.3} \
              tile_matches_full={} rect_identical={:.3} painted_changed={:.3} frame_identical={} \
              batch_painted={} batch_matches_full={} batch_ms={:.2} batch_bytes={} \
-             rect=({},{},{},{}) full_ms={:.1} tile_ms={:.1} tile_bytes={} -> {}",
+             cursor={}x{} serial={} fetch_ms={:.3} comp={} px comp_ms={:.3} \
+             comp_ratio={:.3}/{:.3} rect=({},{},{},{}) full_ms={:.1} tile_ms={:.1} tile_bytes={} -> {}",
             v.bytes,
             v.painted_getimage,
             v.painted_shm,
@@ -604,6 +674,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             v.tiles_batch_matches,
             v.tiles_batch_ms,
             v.tiles_batch_bytes,
+            v.cursor_sprite.0,
+            v.cursor_sprite.1,
+            v.cursor_serial,
+            v.cursor_ms,
+            v.cursor_composite_px,
+            v.cursor_composite_ms,
+            v.cursor_composite_ratio,
+            v.cursor_expected_ratio,
             v.rect.0,
             v.rect.1,
             v.rect.2,
