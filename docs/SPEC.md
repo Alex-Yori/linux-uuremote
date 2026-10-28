@@ -107,3 +107,33 @@ https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd
 
 另外 Windows 被控端靠**虚拟显示器驱动**（Idd）取画面，而 Linux 侧我们用 XDamage 直接抓真实桌面——所以官方那些「分辨率/帧率随时切换」「多显示器」的能力，Linux 要等价就得靠 XRandR（改分辨率）或另开虚拟输出，这是两端结构性差异，不是实现质量问题。
 
+
+## 8. 采集侧本机实测（2026-10-28 补充）
+
+用 `uu-capture-probe` 在本机量出来的数，用来确认「官方行为能不能在 Linux 采集侧复现」。
+
+**空屏对照**（`Xvfb` 1280x1024，无人绘画，各 10 秒，release 构建）：
+
+| 模式 | 出帧 | 回读 |
+|---|---|---|
+| 门控（本项目） | 0 fps 正常帧 + 3 fps keepalive | **0 MB/s** |
+| 恒定帧率（ffmpeg x11grab 式） | 60 fps | **299.9 MB/s** |
+
+也就是「静态桌面只发 3 fps」这条官方行为，靠 XDamage 判动静 + 静止档出帧，在 Linux 上等价成立；差距约回读 100×、出帧 20×。
+
+**读回路径成本**（决定路线图顺序）：
+
+| 路径 | 1280x1024 | 2560x1440 | 真桌面恒定 60 fps 时的抓到率 |
+|---|---|---|---|
+| `GetImage` | 4.4 ms | 15–17 ms | 47.9 fps（被读回卡住） |
+| `XShmGetImage` | 1.2 ms | 7.4 ms | 60.0 fps |
+
+结论：1440p 要跑满官方上限 60 fps，XShm 是必需的；剩余 6.1 ms 是服务端把整屏像素写进共享内存，只能靠**只抓脏矩形**继续降。
+
+**读回正确性**（`--verify`，本机 `:1` GNOME 与 `Xvfb` 各一次，三项判据全 1.000）：
+根窗口抓取在合成器（mutter）下确实反映真实画面（`painted_changed=1.0`）；MIT-SHM 的共享映射里确实是画上去的像素，且与 `GetImage` 逐字节一致。
+
+实现约束（踩过才写下来的）：
+- 像素格式护栏必须读 `setup().pixmap_formats`：非 32 bpp packed 会整幅撕裂，宁可报错。
+- MIT-SHM 用 `ShmCreateSegment`（fd 传递，`minor >= 1`）而非 SysV `ShmAttach`，Xorg 与 Xvfb 都工作，且不需要进程持有 SysV 段。
+- 验证用的测试窗必须 `override_redirect`，否则窗口管理器会把它挪走，量出来是假失败。

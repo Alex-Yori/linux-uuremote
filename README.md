@@ -12,9 +12,11 @@
 
 | 模块 | 状态 |
 |---|---|
-| 内容自适应出帧门控（`src/gating.rs`） | ✅ 已实现，5 个单元测试通过 |
-| X11 采集（XDamage 脏区 + XFixes 光标 + GetImage 回读） | ✅ 已实现，实测跑通 |
-| 实测对照（gating vs 恒定帧率） | ✅ 见下面「实测」 |
+| 内容自适应出帧门控（`src/gating.rs`） | ✅ 已实现，6 个单元测试通过 |
+| X11 采集（XDamage 脏区 + XFixes 光标 + MIT-SHM 回读） | ✅ 已实现，实测跑通，失败自动降级 `GetImage` |
+| 读回正确性验证（`--verify`，双服务器 PASS） | ✅ 见下面「实测」 |
+| 实测对照（gating vs 恒定帧率 + 两条读回路径） | ✅ 见下面「实测」 |
+| 脏区抓取与编码（只抓/只编脏矩形） | ⬜ 未实现，当前每帧整屏抓 |
 | 编码（NVENC / VAAPI / x264 软编） | ⬜ 未实现，probe 先量采集侧 |
 | 信令（socket.io / WSS） | ⬜ 未实现 |
 | 传输（ICE/STUN/TURN + RTP/SRTP + 数据通道） | ⬜ 未实现 |
@@ -73,9 +75,18 @@ damage_ev_s = 30–43 / s   avg_grab_ms = 15–17
 
 两种模式几乎一样，因为这台桌面**一直在重绘**（Hermes 桌面窗口动画 + 光标），门控全程停在 moving 档，从没进入 still——这是正确行为，不是门控失效。真实收益出现在空闲时刻（上一组）。
 
-顺带量到 `GetImage` 同步回读的成本：1280x1024 单次 4.4 ms、2560x1440 单次 15–17 ms，也就是 1440p 下恒定 60 fps 会被回读卡在 ~55 fps。这决定了路线图顺序：**先换 XShm 回读 + 脏区编码**，再谈编码器。
+顺带量到读回路径的成本，以及换 MIT-SHM 后的收益（release，各 6 秒）：
 
-`--no-read` 只测决策不读像素（量门控本身的开销）；`--still-after-ms` 控制静止判定滞后；`--duration` 控制时长。
+| 读回路径 | 1280x1024 (Xvfb) | 2560x1440 (真桌面 `:1`) | 真桌面 baseline 抓到率 |
+|---|---|---|---|
+| `GetImage`（同步大回读） | 4.4 ms/帧 | 15–17 ms/帧 | 47.9 fps |
+| `XShmGetImage`（本项目） | **1.2 ms/帧**（服务端 0.7 + 拷贝 0.5） | **7.4 ms/帧**（服务端 6.1 + 拷贝 1.3） | **60.0 fps** |
+
+也就是 1440p 下省掉 2.2×、Xvfb 下 3.7×，并且 **60 Hz 网格不再被读回卡住**——之前 1440p 恒定 60 fps 只能抓到 48 fps。剩下的 6.1 ms 是 X 服务端把像素写进共享内存的开销，与连接是否走本地无关；下一步「只抓脏矩形」正是砍掉这 6.1 ms 的手段。
+
+`--verify` 会证明读回路径确实拿到真实画面，而不是空缓冲：先抓一帧参照、映射一个 override-redirect 纯红测试窗、两条路径各抓一次，然后打三项判据——`painted_changed`（根窗口抓取确实反映真实画面，合成器下也成立）、`painted_shm`（共享映射里确实是画上去的像素）、`rect_identical`（两条路径逐字节一致）。本机 `:1` 与 `Xvfb` 实测三项全 1.000。
+
+`--no-read` 只测决策不读像素（量门控本身的开销）；`--still-after-ms` 控制静止判定滞后；`--secs` 控制时长。
 
 > 注意：`DISPLAY` 在 agent shell 里是空的，跑之前要
 > `export DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority`（或直接 `--display :1`）。
@@ -90,11 +101,12 @@ damage_ev_s = 30–43 / s   avg_grab_ms = 15–17
 
 ## 路线图
 
-1. **编码层**：NVENC（本机 3080 Ti 主路径）→ VAAPI → x264 兜底；能力探测 + 失败回退，对齐官方的 `GetEncodeCapability()` / `encoder requested fallback`。
-2. **XShm 快速回读**：`GetImage` 是同步大回读，实测单次 4.4 ms（1280x1024）/ 15–17 ms（2560x1440），换 `XShmGetImage` 省掉这段往返。feature 已在 Cargo.toml 里开好。
-3. **脏区编码**：只编脏矩形，而不是每帧全屏。
-4. **信令与传输**：socket.io 信令（这条与参照实现一致）+ ICE/DTLS/SRTP；官方数据通道是 KCP+RS-FEC，参照实现是标准 SCTP——先按标准 SCTP 打通，再评估是否要补 KCP。
-5. **被控端配置面**：官方可配字段清单见 SPEC；本项目打算先支持 `fps / quality / codec / chroma / cursor`，其余按需。
+1. **脏区抓取与编码**：现在每帧整屏抓（服务端写 14.7 MB 进共享内存 = 6.1 ms），改成只抓脏矩形能直接砍掉这段；随后只编脏矩形，而不是每帧全屏。
+2. **编码层**：NVENC（本机 3080 Ti 主路径）→ VAAPI → x264 兜底；能力探测 + 失败回退，对齐官方的 `GetEncodeCapability()` / `encoder requested fallback`。编码器可直接消费共享内存映射，省掉现在 1.3 ms 的拷出。
+3. **信令与传输**：socket.io 信令（这条与参照实现一致）+ ICE/DTLS/SRTP；官方数据通道是 KCP+RS-FEC，参照实现是标准 SCTP——先按标准 SCTP 打通，再评估是否要补 KCP。
+4. **被控端配置面**：官方可配字段清单见 SPEC；本项目打算先支持 `fps / quality / codec / chroma / cursor`，其余按需。
+
+已完成：**XShm 快速回读**（`ShmCreateSegment` fd 传递 + mmap，失败按会话降级回 `GetImage`）。
 
 ## 与参照实现的主要差异
 
