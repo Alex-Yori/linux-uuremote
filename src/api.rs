@@ -252,6 +252,39 @@ impl ApiClient {
         self.post(path, Some(body), Duration::from_secs(12)).await
     }
 
+    /// 签名 GET：设备列表这类只读接口（参照实现的 viewer 用 GET，POST 会 405）。
+    pub async fn get(&self, path: &str, timeout: Duration) -> Result<(u16, Value), String> {
+        let resp = self.http
+            .get(format!("{BASE_URL}{path}"))
+            .timeout(timeout)
+            .headers(self.build_headers("GET", path, ""))
+            .send()
+            .await
+            .map_err(|e| format!("GET {path}: {e}"))?;
+        let status = resp.status().as_u16();
+        let value = resp.json().await.unwrap_or(Value::Null);
+        Ok((status, value))
+    }
+
+    /// `GET /api/v1/device/list`：账号下绑定过的设备原样返回（含在线状态字段）。
+    pub async fn device_list(&self) -> Result<Vec<Value>, String> {
+        let (status, body) = self.get("/api/v1/device/list", Duration::from_secs(12)).await?;
+        let data = api_data("device list", status, &body)?;
+        let mut out = Vec::new();
+        // 参照实现把设备放在 data.my_binded_devices / data.others_shared_devices。
+        for key in ["my_binded_devices", "others_shared_devices"] {
+            if let Some(list) = data.get(key).and_then(Value::as_array) {
+                out.extend(list.iter().cloned());
+            }
+        }
+        if out.is_empty() {
+            if let Some(list) = data.get("devices").and_then(Value::as_array) {
+                out.extend(list.iter().cloned());
+            }
+        }
+        Ok(out)
+    }
+
     /// `POST /api/v1/room/create`：取信令服务器与房间 token。登录过期单独成类。
     pub async fn create_room(&self) -> Result<RoomData, RoomError> {
         let (status, body) = self

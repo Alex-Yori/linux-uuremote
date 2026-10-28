@@ -17,8 +17,20 @@ path = "src/bin/uu-login.rs"
 name = "uu-cloud-probe"
 path = "src/bin/uu-cloud-probe.rs"
 
+[[bin]]
+name = "uuremote-host"
+path = "src/bin/uuremote-host.rs"
+
+[[bin]]
+name = "uu-selftest"
+path = "src/bin/uu-selftest.rs"
+
+[[bin]]
+name = "uu-devices"
+path = "src/bin/uu-devices.rs" 
+
 [dependencies]
-x11rb = { version = "0.14", features = ["damage", "shm", "xfixes"] }
+x11rb = { version = "0.14", features = ["damage", "shm", "xfixes", "xtest"] }
 libc = "0.2"
 # 连接侧协议栈与参照实现同一套（全 rustls，不引系统 OpenSSL）
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util"] }
@@ -31,4 +43,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+bytes = "1"
 qrcode = { version = "0.14", default-features = false }
+flate2 = "1"
+openh264 = "0.9"
+webrtc = "0.10"

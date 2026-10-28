@@ -1,0 +1,546 @@
+//! uuremote-host —— UU 远程 Linux 被控端宿主。
+//!
+//! 一条链路串起来：信令（socket.io）→ 等客户端拉流（`be-controlled`）→ WebRTC offer/answer
+//! （`soac`）→ 采整机画面 → 内容门控 → openh264 → 视频轨；反方向 CONTROL 通道 JSON → XTest 注入。
+//!
+//! 用法：`uuremote-host [--display :1] [--fps 30] [--still-fps 3] [--bitrate 0] [--gop 60]`
+//! 登录态来自 `uu-login`（私有配置 0600）；token 过期直接报出来让人重扫。
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use linux_uuremote::api::{ApiClient, Credentials, RoomError};
+use linux_uuremote::capture::x11::{DamageLevel, X11Screen};
+use linux_uuremote::config;
+use linux_uuremote::content::ContentChange;
+use linux_uuremote::control::{action_name, decode_control, encode_echo_response, ControlMessage};
+use linux_uuremote::encoder::{FrameKind, FramePlanner, OpenH264};
+use linux_uuremote::gating::{Action, FrameDropper, GateConfig};
+use linux_uuremote::initialization::{encode_capture_change, encode_permissions, encode_secure_desktop, encode_screen_sources, Permissions, Screen, ScreenGeometry};
+use linux_uuremote::input::X11Input;
+use linux_uuremote::signaling::{self, Received, Signaling};
+use linux_uuremote::transport::{decode_offer_sdp, ice_configuration, ice_servers_from_json, Peer, PeerEvent, CONTROL_LABEL};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
+
+/// 一条待发送的视频帧（Annex-B 访问单元 + 时长）。
+struct Encoded {
+    data: Vec<u8>,
+    duration: Duration,
+}
+
+/// 信令侧事件（主循环看得懂的形式）。
+enum Signal {
+    IceServers(Value),
+    /// 客户端发起被控：header 里带着这次会议的 ICE 配置与采集目标。
+    BeControlled {
+        header: Value,
+        capture_type: u64,
+    },
+    Offer {
+        sdp: String,
+        ice_id: Option<Value>,
+        client_id: Option<String>,
+        app_control_id: Option<Value>,
+    },
+    Candidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
+    PeerLeft,
+    Closed(String),
+}
+
+/// 一次被控会话：PeerConnection + 注入引擎 + 关键帧请求标志 + 采集线程。
+struct Session {
+    peer: Arc<Peer>,
+    keyframe: Arc<AtomicBool>,
+    input: Option<Arc<std::sync::Mutex<X11Input>>>,
+    capture: Option<std::thread::JoinHandle<()>>,
+    /// 这次 soac 会话的路由字段（ice_id / client_id / app_control_id）：
+    /// trickle candidate 时必须原样带回，否则云端不知道发给哪个客户端。
+    route: Value,
+}
+
+fn main() {
+    let mut display: Option<String> = None;
+    let mut fps: u32 = 30;
+    let mut still_fps: u32 = 3;
+    let mut bitrate_kbps: u32 = 0;
+    let mut gop: u32 = 60;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let mut number = || args.next().and_then(|v| v.parse::<u32>().ok());
+        match arg.as_str() {
+            "--display" => display = args.next(),
+            "--fps" => fps = number().unwrap_or(fps),
+            "--still-fps" => still_fps = number().unwrap_or(still_fps),
+            "--bitrate" => bitrate_kbps = number().unwrap_or(bitrate_kbps),
+            "--gop" => gop = number().unwrap_or(gop),
+            "--help" | "-h" => {
+                println!("用法: uuremote-host [--display :1] [--fps 30] [--still-fps 3] [--bitrate kbps] [--gop 帧数]");
+                return;
+            }
+            other => eprintln!("未知参数 {other}"),
+        }
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    if let Err(e) = rt.block_on(run(display, fps, still_fps, bitrate_kbps, gop)) {
+        eprintln!("宿主退出：{e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u32, gop: u32) -> Result<(), String> {
+    let (file, borrowed) = config::read_with_fallback()?;
+    println!("登录态：{}", if borrowed { "借用参照实现的配置" } else { "本机私有配置" });
+    let creds = Credentials::load(file.as_ref())?;
+    let api = ApiClient::new(creds);
+
+    println!("建房…");
+    let room = api.create_room().await.map_err(|e| match e {
+        RoomError::LoginExpired => "登录 token 已失效：重跑 uu-login 扫码。".to_string(),
+        RoomError::Other(msg) => msg,
+    })?;
+    println!("   signaling_server = {}", room.signaling_server);
+
+    let mut sig = Signaling::connect(&room.signaling_server, &room.token, room.ws_connect_timeout_ms).await?;
+    println!("   CONNECT_ACK ✓");
+    sig.send_with_ack(10, signaling::EVENT_ROOM_INFO, None).await?;
+
+    let (sig_tx, mut sig_rx) = mpsc::unbounded_channel::<Signal>();
+    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
+
+    // 信令 IO 独占 socket：收帧转事件、发帧走队列，心跳必须一直跑（半开 TCP 靠判死窗口断）。
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                out = emit_rx.recv() => match out {
+                    Some((event, payload)) => {
+                        if let Err(e) = sig.send(&event, payload.as_ref()).await {
+                            eprintln!("信令发送失败：{e}");
+                            let _ = sig_tx.send(Signal::Closed(e));
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                got = sig.recv() => match got {
+                    Ok(Received::Event(name, payload)) => {
+                        let v = payload.unwrap_or(Value::Null);
+                        match name.as_str() {
+                            signaling::EVENT_SOAC => forward_soac(&sig_tx, v),
+                            signaling::EVENT_BE_CONTROLLED => { let _ = sig_tx.send(Signal::BeControlled { header: v, capture_type: 0 }); }
+                            signaling::EVENT_RELEASED | signaling::EVENT_LEFT => { let _ = sig_tx.send(Signal::PeerLeft); }
+                            _ => {}
+                        }
+                    }
+                    Ok(Received::Ack(_id, v)) => { let _ = sig_tx.send(Signal::IceServers(v)); }
+                    Ok(Received::BinaryEvent(name, header, attachments)) => {
+                        // be-controlled 的关键信息在附件的 protobuf 里：field 1 = 采集目标
+                        // （0 未知 / 1 桌面 / 2 窗口 / 5 文件 / 8 终端 / 9 端口映射）。
+                        let capture_type = attachments
+                            .iter()
+                            .find_map(|bytes| linux_uuremote::wire::decode_wire(bytes).ok())
+                            .map(|fields| fields.iter().find(|f| f.number == 1).and_then(|f| match &f.value { linux_uuremote::wire::WireValue::Varint(v) => Some(*v), _ => None }))
+                            .flatten()
+                            .unwrap_or(0);
+                        let header = header.unwrap_or(Value::Null);
+                        println!("   {name}(binary)：附件 {} 段 capture_type={capture_type}", attachments.len());
+                        if name == signaling::EVENT_BE_CONTROLLED {
+                            let _ = sig_tx.send(Signal::BeControlled { header, capture_type });
+                        }
+                    }
+                    Ok(Received::Closed) => { let _ = sig_tx.send(Signal::Closed("信令关闭".into())); break; }
+                    Err(e) => { let _ = sig_tx.send(Signal::Closed(e)); break; }
+                }
+            }
+        }
+    });
+
+    let mut session: Option<Session> = None;
+
+    println!("等待客户端拉流（Ctrl-C 退出）…");
+    loop {
+        tokio::select! {
+            signal = sig_rx.recv() => match signal {
+                Some(Signal::IceServers(v)) => {
+                    // room_info 的 iceServers 只是备份：真正的每会议配置在 be-controlled 的 header 里。
+                    println!("   room_info ack ✓：iceServers {} 台", ice_servers_from_json(&v).len());
+                }
+                Some(Signal::BeControlled { header, capture_type }) => {
+                    println!("   收到拉流请求（capture_type={capture_type}）");
+                    // 每次拉流新建一条会话：ICE 配置属于这一次会议，不能复用上一条。
+                    if let Some(old) = session.take() {
+                        stop_session(old).await;
+                    }
+                    let config = match ice_configuration(&header) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            eprintln!("   这次会议连不上：{e}");
+                            continue;
+                        }
+                    };
+                    match Peer::new(config, peer_tx.clone()).await {
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, route: json!({}) }),
+                        Err(e) => eprintln!("   建会话失败：{e}"),
+                    }
+                }
+                Some(Signal::Offer { sdp, ice_id, client_id, app_control_id }) => {
+                    let Some(session) = session.as_mut() else {
+                        println!("   soac offer 在没有会话时到达，忽略");
+                        continue;
+                    };
+                    session.route = json!({ "ice_id": ice_id, "client_id": client_id, "app_control_id": app_control_id });
+                    match session.peer.answer_offer(&sdp).await {
+                        Ok(answer) => {
+                            // fork 把 SoacMessage 的字段摊平在顶层发；顺手带一份 data 副本，两边都认。
+                            let body = json!({ "type": "answer", "sdp": answer, "ice_id": ice_id, "app_control_id": app_control_id });
+                            let payload = json!({
+                                "client_id": client_id,
+                                "data": body,
+                                "type": "answer",
+                                "sdp": answer,
+                                "ice_id": ice_id,
+                                "app_control_id": app_control_id,
+                            });
+                            emit_tx.send(("soac".to_string(), Some(payload))).ok();
+                            println!("   answer 已发出（SDP {} 字节）", answer.len());
+                        }
+                        Err(e) => eprintln!("   answer 失败：{e}"),
+                    }
+                }
+                Some(Signal::Candidate { candidate, sdp_mid, sdp_mline_index }) => {
+                    if let Some(session) = session.as_mut() {
+                        if let Err(e) = session.peer.add_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index).await {
+                            eprintln!("   candidate 失败：{e}");
+                        }
+                    }
+                }
+                Some(Signal::PeerLeft) => {
+                    println!("   对端离开，关会话");
+                    if let Some(session) = session.take() {
+                        stop_session(session).await;
+                    }
+                }
+                Some(Signal::Closed(reason)) => {
+                    if let Some(session) = session.take() {
+                        stop_session(session).await;
+                    }
+                    return Err(reason);
+                }
+                None => break,
+            },
+            event = peer_rx.recv() => match event {
+                Some(PeerEvent::ControlOpen { label }) => {
+                    println!("   数据通道 open：{label}");
+                    if label == CONTROL_LABEL {
+                        if let Some(session) = session.as_mut() {
+                            let keyframe = session.keyframe.clone();
+                            start_video(&display, fps, still_fps, bitrate_kbps, gop, &keyframe, session);
+                        }
+                    }
+                }
+                Some(PeerEvent::ControlData { data, .. }) => {
+                    handle_control(&data, session.as_mut()).await;
+                }
+                Some(PeerEvent::KeyframeRequest) => {
+                    if let Some(session) = session.as_ref() {
+                        session.keyframe.store(true, Ordering::Relaxed);
+                    }
+                }
+                Some(PeerEvent::ConnectionState(state)) => println!("   连接状态：{state}"),
+                Some(PeerEvent::ReceiverReport { fraction_lost, total_lost }) => {
+                    if fraction_lost > 0 {
+                        println!("   视频丢包：fraction_lost={fraction_lost} total_lost={total_lost}");
+                    }
+                }
+                Some(PeerEvent::IceCandidate { candidate, sdp_mid, sdp_mline_index }) => {
+                    // trickle：照 fork 的形状摊平在顶层，再带一份 data 副本。
+                    let route = session.as_ref().map(|s| s.route.clone()).unwrap_or_else(|| json!({}));
+                    let body = json!({
+                        "type": "candidate",
+                        "candidate": { "candidate": candidate, "sdpMid": sdp_mid, "sdpMLineIndex": sdp_mline_index },
+                        "ice_id": route.get("ice_id").cloned().unwrap_or(Value::Null),
+                        "client_id": route.get("client_id").cloned().unwrap_or(Value::Null),
+                        "app_control_id": route.get("app_control_id").cloned().unwrap_or(Value::Null),
+                    });
+                    let mut payload = body.clone();
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("data".to_owned(), body.clone());
+                    }
+                    emit_tx.send(("soac".to_string(), Some(payload))).ok();
+                    println!("   candidate 已 trickle");
+                }
+                Some(PeerEvent::ControlClose { label }) => println!("   数据通道 close：{label}"),
+                None => break,
+            },
+        }
+    }
+    if let Some(session) = session.take() {
+        stop_session(session).await;
+    }
+    Ok(())
+}
+
+/// 关会话：先停采集线程（它在 blocking_send 上等），再关 PeerConnection，最后松开按住的键。
+async fn stop_session(session: Session) {
+    if let Some(handle) = &session.capture {
+        // 采集线程会在 frames_tx 关闭后退出，这里先不等它，避免卡死在 blocking_send。
+        let _ = handle;
+    }
+    session.peer.close().await;
+    if let Some(input) = &session.input {
+        let engine = input.clone();
+        let _ = tokio::task::spawn_blocking(move || engine.lock().unwrap().release_all()).await;
+    }
+}
+
+fn forward_soac(sig_tx: &mpsc::UnboundedSender<Signal>, payload: Value) {
+    let inner = payload.get("data").cloned().unwrap_or(payload.clone());
+    let kind = inner.get("type").and_then(Value::as_str).unwrap_or("");
+    let ice_id = inner.get("ice_id").cloned();
+    let client_id = payload.get("client_id").and_then(Value::as_str).map(str::to_owned);
+    let app_control_id = inner.get("app_control_id").cloned();
+    match kind {
+        "offer" => match decode_offer_sdp(inner.get("sdp").and_then(Value::as_str), inner.get("gzip_sdp").and_then(Value::as_str)) {
+            Some(sdp) => {
+                let _ = sig_tx.send(Signal::Offer { sdp, ice_id, client_id, app_control_id });
+            }
+            None => eprintln!("   soac offer 里没有 SDP"),
+        },
+        "candidate" => {
+            let candidate = match inner.get("candidate") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.get("candidate").and_then(Value::as_str).unwrap_or("").to_string(),
+                None => String::new(),
+            };
+            let sdp_mid = inner.get("sdpMid").and_then(Value::as_str).map(str::to_owned);
+            let mline = inner.get("sdpMLineIndex").and_then(Value::as_u64).map(|i| i as u16);
+            let _ = sig_tx.send(Signal::Candidate { candidate, sdp_mid, sdp_mline_index: mline });
+        }
+        other => println!("   soac {other}（忽略）"),
+    }
+}
+
+/// 处理一条 CONTROL 报文：输入注入 / 保活 / protobuf 回包。
+async fn handle_control(data: &[u8], session: Option<&mut Session>) {
+    let Ok(message) = decode_control(data) else { return };
+    match message {
+        ControlMessage::KeyboardHeartbeat | ControlMessage::Unsupported(_) => {}
+        ControlMessage::Action(action) => {
+            println!("   SimpleAction {} seq={}", action_name(action.action).unwrap_or("?"), action.seq);
+            // echo_request：官方客户端靠它确认宿主活着，args 里的 seq 必须原样回。
+            if action.action == 0 {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let reply = encode_echo_response(action.seq, next_sequence(), now);
+                if let Some(session) = session {
+                    if let Err(e) = session.peer.send_control(&reply).await {
+                        eprintln!("   echo 回包失败：{e}");
+                    }
+                }
+            }
+        }
+        ControlMessage::Input(_) => {
+            let Some(input) = session.and_then(|s| s.input.clone()) else { return };
+            // X 调用是阻塞的，别摁在事件循环里。
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut engine = input.lock().unwrap();
+                if let Err(e) = engine.apply(&message) {
+                    eprintln!("   注入失败：{e}");
+                }
+            })
+            .await;
+        }
+    }
+}
+
+fn next_sequence() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// CONTROL 通道打开后启动采集/编码/送帧，一个会话只启动一次。
+fn start_video(
+    display: &Option<String>,
+    fps: u32,
+    still_fps: u32,
+    bitrate_kbps: u32,
+    gop: u32,
+    keyframe: &Arc<AtomicBool>,
+    session: &mut Session,
+) {
+    if session.capture.is_some() {
+        return;
+    }
+    if session.input.is_none() {
+        match x11rb::connect(display.as_deref()) {
+            Ok((conn, screen_index)) => match X11Input::connect(conn, screen_index) {
+                Ok(engine) => session.input = Some(Arc::new(std::sync::Mutex::new(engine))),
+                Err(e) => eprintln!("   输入注入起不来：{e}（画面照推）"),
+            },
+            Err(e) => eprintln!("   连不上 X11：{e}（没有注入能力）"),
+        }
+    }
+    let (frames_tx, mut frames_rx) = mpsc::channel::<Encoded>(4);
+    // 采集线程一起来就把实测几何报回来：屏幕清单必须用真实尺寸，不能猜。
+    let (geom_tx, geom_rx) = oneshot::channel::<(u32, u32)>();
+    // 客户端收到屏幕清单之前不要往轨道写帧，否则第一帧 IDR 会被丢弃、后面全是坏 P 帧。
+    let (init_done_tx, init_done_rx) = oneshot::channel::<()>();
+    let keyframe = keyframe.clone();
+    let display = display.clone();
+    session.capture = Some(
+        std::thread::Builder::new()
+            .name("uu-capture".into())
+            .spawn(move || capture_loop(display.as_deref(), fps, still_fps, bitrate_kbps, gop, keyframe, geom_tx, frames_tx))
+            .expect("起采集线程"),
+    );
+
+    let peer_init = session.peer.clone();
+    tokio::spawn(async move {
+        let (width, height) = match geom_rx.await {
+            Ok(size) => size,
+            Err(_) => {
+                eprintln!("   采集起不来，没有屏幕可上报");
+                let _ = init_done_tx.send(());
+                return;
+            }
+        };
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // 顺序照参照实现：先声明采集目标，再给屏幕清单，最后报能力与锁屏状态。
+        let messages: Vec<Vec<u8>> = vec![
+            encode_capture_change(next_sequence(), now(), 0, 0, "Linux desktop").unwrap_or_default(),
+            encode_screen_sources(
+                next_sequence(),
+                now(),
+                &[Screen {
+                    id: 0,
+                    fps: fps.max(1) as i32,
+                    resolution: ScreenGeometry { left: 0, top: 0, width: width as i32, height: height as i32, pixel_width: width as i32, pixel_height: height as i32 },
+                    primary: true,
+                    dpr: 1.0,
+                    display_name: "",
+                    video_track_index: 0,
+                    screen_type: 0,
+                    builtin_screen_type: 0,
+                }],
+                0,
+            )
+            .unwrap_or_default(),
+            encode_permissions(next_sequence(), now(), Permissions { assistant: false, video_capture_allowed: true, capture_content_visible: true, audio_capture_allowed: false, floating_ball: false }),
+            encode_secure_desktop(next_sequence(), now(), false, false, false),
+        ];
+        for message in messages.iter().filter(|m| !m.is_empty()) {
+            if let Err(e) = peer_init.send_control(message).await {
+                eprintln!("   初始化报文发送失败：{e}");
+                break;
+            }
+        }
+        println!("   CONTROL 初始化已发送（{width}x{height}，报文 {} 条）", messages.iter().filter(|m| !m.is_empty()).count());
+        let _ = init_done_tx.send(());
+    });
+
+    let peer = session.peer.clone();
+    tokio::spawn(async move {
+        let _ = init_done_rx.await;
+        while let Some(frame) = frames_rx.recv().await {
+            if let Err(e) = peer.write_video(frame.data, frame.duration).await {
+                eprintln!("   写视频样本失败：{e}");
+            }
+        }
+    });
+}
+
+/// 采集 → 门控 → 编码：整机读回，内容比对决定发不发，发的都是整帧。
+fn capture_loop(
+    display: Option<&str>,
+    fps: u32,
+    still_fps: u32,
+    bitrate_kbps: u32,
+    gop: u32,
+    keyframe: Arc<AtomicBool>,
+    geom_tx: oneshot::Sender<(u32, u32)>,
+    frames_tx: mpsc::Sender<Encoded>,
+) {
+    let mut screen = match X11Screen::open(display, DamageLevel::BoundingBox) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("   采集起不来：{}", e.0);
+            return;
+        }
+    };
+    // 编码器要偶数对齐（4:2:0），奇数屏裁掉最后一列/行。
+    let width = (screen.width() as usize) & !1;
+    let height = (screen.height() as usize) & !1;
+    // 上报的是真实屏幕尺寸（编码器只是内部裁 1 像素，坐标空间不变）。
+    let _ = geom_tx.send((u32::from(screen.width()), u32::from(screen.height())));
+    let mut encoder = match OpenH264::new(width, height, fps, bitrate_kbps, gop, 4) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("   编码器起不来：{e}");
+            return;
+        }
+    };
+    let fps = fps.max(1);
+    let mut gate = FrameDropper::new(GateConfig { moving_fps: fps, still_fps, still_after: Duration::from_millis(1000) });
+    let mut planner = FramePlanner::new(fps, still_fps);
+    let mut content = ContentChange::new(width, height, 32, 18);
+    let mut emitted = 0u64;
+    let mut idr_frames = 0u64;
+    let started = Instant::now();
+
+    loop {
+        std::thread::sleep(Duration::from_nanos(1_000_000_000 / (fps as u64 * 2)));
+        let now = Instant::now();
+        match gate.decide(now) {
+            Action::Idle => continue,
+            Action::Keepalive | Action::Capture => {}
+        }
+        if keyframe.swap(false, Ordering::Relaxed) {
+            planner.note_keyframe_request();
+        }
+        let plan = planner.plan(gate.is_moving());
+        if !plan.emit {
+            continue;
+        }
+        let (frame, _) = match screen.grab_rect(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("   抓取失败：{}", e.0);
+                planner.note_failure();
+                continue;
+            }
+        };
+        let diff = content.check(&frame, width, screen.bytes_per_pixel());
+        if diff.first || diff.changed_pixels > 0 {
+            gate.note_change(now);
+        }
+        // 光标只合成进要发出去的那一份，参考帧必须保持无光标。
+        let mut out = frame.clone();
+        if let (Ok(sprite), Some(pos)) = (screen.fetch_cursor(), screen.cursor_position()) {
+            screen.composite_cursor(&mut out, &sprite, pos);
+        }
+        match encoder.encode_bgra(&out, plan.force_idr) {
+            Ok((au, kind)) => {
+                planner.note_success();
+                if kind == FrameKind::Idr {
+                    idr_frames += 1;
+                }
+                emitted += 1;
+                if emitted % 300 == 0 {
+                    println!("   已发 {emitted} 帧（IDR {idr_frames}），{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
+                }
+                if frames_tx.blocking_send(Encoded { data: au, duration: plan.sample_duration }).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("   编码失败：{e}");
+                planner.note_failure();
+            }
+        }
+    }
+}
