@@ -20,7 +20,7 @@ use std::error::Error;
 use std::fmt;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::damage::{self, ConnectionExt as _, ReportLevel};
+use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::{ConnectionExt as _, CursorNotifyMask};
 use x11rb::protocol::xproto::{
@@ -48,6 +48,11 @@ pub struct VerifyReport {
     /// Share of the test window's own rectangle showing the painted color, per path.
     pub painted_getimage: f64,
     pub painted_shm: f64,
+    /// Share of a server-cut tile of that rectangle showing the painted color.
+    pub painted_tile: f64,
+    /// Whether the tile equals the same rectangle sliced out of a full grab. Informational:
+    /// a live desktop can repaint between the two grabs.
+    pub tile_matches_full: bool,
     /// Share of that rectangle whose bytes agree between the two paths.
     pub rect_identical: f64,
     /// Share of that rectangle that changed once the window was mapped — proof that a root
@@ -59,6 +64,9 @@ pub struct VerifyReport {
     pub rect: (i16, i16, u16, u16),
     /// Cost of the shared-memory grab (server write + copy out).
     pub shm_ms: f64,
+    /// Cost and size of the same rectangle grabbed as a tile.
+    pub tile_ms: f64,
+    pub tile_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -90,6 +98,7 @@ pub struct X11Screen {
     /// Bytes per pixel for the root depth, read from the server rather than assumed: a
     /// non-32-bit packed format would shear the whole picture.
     bytes_per_pixel: usize,
+    damage_level: DamageLevel,
     damage: u32,
     /// Last reported cursor position, used to detect cursor-only motion.
     last_cursor: Option<(i32, i32)>,
@@ -127,11 +136,41 @@ impl GrabTiming {
     }
 }
 
+/// Which XDamage report level to register on the root window.
+///
+/// This decides how much geometry the server hands back, and therefore whether a dirty-rect
+/// grab is possible at all: `NonEmpty` only says "something changed", `BoundingBox` reports
+/// the extents of the change, and `RawRectangles` reports each rectangle separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageLevel {
+    NonEmpty,
+    BoundingBox,
+    RawRectangles,
+}
+
+impl DamageLevel {
+    fn report_level(self) -> ReportLevel {
+        match self {
+            DamageLevel::NonEmpty => ReportLevel::NON_EMPTY,
+            DamageLevel::BoundingBox => ReportLevel::BOUNDING_BOX,
+            DamageLevel::RawRectangles => ReportLevel::RAW_RECTANGLES,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DamageLevel::NonEmpty => "nonempty",
+            DamageLevel::BoundingBox => "bbox",
+            DamageLevel::RawRectangles => "raw",
+        }
+    }
+}
+
 impl X11Screen {
     /// Connects to `display` (e.g. `:1`), sets up XDamage on the root window and XFixes
     /// cursor notification. A returned major version of 0 means the extension is not
     /// supported, so the error names exactly which one is missing.
-    pub fn open(display: Option<&str>) -> Result<Self, X11Error> {
+    pub fn open(display: Option<&str>, level: DamageLevel) -> Result<Self, X11Error> {
         let (conn, screen_num) = x11rb::connect(display).map_err(text("connect"))?;
         let screen = &conn.setup().roots[screen_num];
 
@@ -180,8 +219,9 @@ impl X11Screen {
         }
         let bytes_per_pixel = (format.bits_per_pixel / 8) as usize;
         let damage = conn.generate_id().map_err(text("generate_id"))?;
-        // NonEmpty: report once each time the root goes clean -> damaged; re-armed by subtract().
-        conn.damage_create(damage, root, ReportLevel::NON_EMPTY)
+        // The level decides the geometry we get; re-arming happens through `subtract()` in
+        // `poll_events`, which is common to all three levels.
+        conn.damage_create(damage, root, level.report_level())
             .map_err(text("damage_create"))?;
         conn.xfixes_select_cursor_input(root, CursorNotifyMask::DISPLAY_CURSOR)
             .map_err(text("xfixes_select_cursor_input"))?;
@@ -205,6 +245,7 @@ impl X11Screen {
             root_depth,
             root_visual,
             bytes_per_pixel,
+            damage_level: level,
             damage,
             last_cursor: None,
             last_cursor_serial: None,
@@ -314,25 +355,6 @@ impl X11Screen {
         }
     }
 
-    /// Full-frame readback (BGRA/32 bpp for a 24/32 bpp root).
-    ///
-    /// Prefers the MIT-SHM path; any shm failure downgrades to `GetImage` for the rest of
-    /// the session rather than retrying per frame. Returns owned pixel bytes plus a
-    /// breakdown of which path was used and what each stage cost.
-    pub fn grab(&mut self) -> Result<(Vec<u8>, GrabTiming), X11Error> {
-        self.ensure_shm();
-        if self.shm.is_some() {
-            match self.grab_shm() {
-                Ok(frame) => return Ok(frame),
-                Err(e) => {
-                    self.shm_unavailable = Some(format!("shm readback failed: {}", e.0));
-                    self.detach_shm();
-                }
-            }
-        }
-        self.grab_getimage()
-    }
-
     /// Recreate the segment when the root geometry outgrew it (resize).
     fn ensure_shm(&mut self) {
         let want = self.frame_bytes();
@@ -360,7 +382,64 @@ impl X11Screen {
         }
     }
 
-    fn grab_shm(&mut self) -> Result<(Vec<u8>, GrabTiming), X11Error> {
+    /// Take one rectangle of pixel data; `None` is the whole screen.
+    ///
+    /// A dirty-rect grab is what an incremental encoder wants: the server writes the
+    /// rectangle's pixels at the start of the segment with the *rectangle's* stride, so the
+    /// caller gets the tile itself rather than a full-frame buffer to slice. What is saved is
+    /// the server-side pixel copy it no longer performs for the untouched part of the screen.
+    pub fn grab_rect(&mut self, rect: Option<DirtyArea>) -> Result<(Vec<u8>, GrabTiming), X11Error> {
+        // The segment has to be the size of the whole screen: a tile lands inside it too, and
+        // a root resize would otherwise leave it too small.
+        self.ensure_shm();
+        if self.shm.is_some() {
+            match self.grab_shm(rect) {
+                Ok(frame) => return Ok(frame),
+                Err(e) => {
+                    self.detach_shm();
+                    self.shm_unavailable = Some(format!("shm grab failed: {}", e.0));
+                }
+            }
+        }
+        self.grab_getimage(rect)
+    }
+
+    /// Clamp a damage rectangle into the screen, `None` when it covers nothing.
+    ///
+    /// XDamage reports overlap and can extend past the screen edges (the probe has measured
+    /// more than 100% of the screen in one frame), so a raw report is not a safe grab geometry.
+    pub fn clamp_rect(&self, area: DirtyArea) -> Option<DirtyArea> {
+        let x0 = area.x.max(0);
+        let y0 = area.y.max(0);
+        let x1 = (area.x as i32 + area.width as i32).min(self.width as i32);
+        let y1 = (area.y as i32 + area.height as i32).min(self.height as i32);
+        if x1 <= x0 as i32 || y1 <= y0 as i32 {
+            return None;
+        }
+        Some(DirtyArea {
+            x: x0,
+            y: y0,
+            width: (x1 - x0 as i32) as u16,
+            height: (y1 - y0 as i32) as u16,
+        })
+    }
+
+    /// Bytes in a `w` x `h` rectangle of the packed root format.
+    pub fn rect_bytes(&self, w: u16, h: u16) -> usize {
+        w as usize * h as usize * self.bytes_per_pixel
+    }
+
+    /// Bytes per pixel of the root format.
+    pub fn bytes_per_pixel(&self) -> usize {
+        self.bytes_per_pixel
+    }
+
+    /// The XDamage report level registered on the root window.
+    pub fn damage_level(&self) -> DamageLevel {
+        self.damage_level
+    }
+
+    fn grab_shm(&mut self, rect: Option<DirtyArea>) -> Result<(Vec<u8>, GrabTiming), X11Error> {
         let seg = self
             .shm
             .as_ref()
@@ -372,16 +451,18 @@ impl X11Screen {
                 self.frame_bytes()
             )));
         }
+        let (ox, oy, w, h) = self.grab_geometry(rect)?;
+        let want = self.rect_bytes(w, h);
 
         let started = std::time::Instant::now();
         let reply = self
             .conn
             .shm_get_image(
                 self.root,
-                0,
-                0,
-                self.width,
-                self.height,
+                ox,
+                oy,
+                w,
+                h,
                 u32::MAX,
                 ImageFormat::Z_PIXMAP.into(),
                 seg.seg(),
@@ -392,34 +473,34 @@ impl X11Screen {
             .map_err(text("shm_get_image reply"))?;
         let server_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-        if reply.size as usize != self.frame_bytes() {
+        if reply.size as usize != want {
             return Err(X11Error(format!(
-                "server transferred {} bytes, expected {}",
-                reply.size,
-                self.frame_bytes()
+                "server transferred {} bytes, expected {want}",
+                reply.size
             )));
         }
 
         // The copy out is what an encoder that needs owned buffers pays; NVENC can later
         // consume the mapping directly, which removes this stage.
         let copy_started = std::time::Instant::now();
-        let data = seg.bytes().to_vec();
+        let data = seg.bytes()[..want].to_vec();
         let copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
 
         Ok((data, GrabTiming::Shm { server_ms, copy_ms }))
     }
 
-    fn grab_getimage(&self) -> Result<(Vec<u8>, GrabTiming), X11Error> {
+    fn grab_getimage(&self, rect: Option<DirtyArea>) -> Result<(Vec<u8>, GrabTiming), X11Error> {
+        let (ox, oy, w, h) = self.grab_geometry(rect)?;
         let started = std::time::Instant::now();
         let reply = self
             .conn
             .get_image(
                 ImageFormat::Z_PIXMAP,
                 self.root,
-                0,
-                0,
-                self.width,
-                self.height,
+                ox,
+                oy,
+                w,
+                h,
                 u32::MAX,
             )
             .map_err(text("get_image"))?
@@ -431,6 +512,19 @@ impl X11Screen {
                 ms: started.elapsed().as_secs_f64() * 1000.0,
             },
         ))
+    }
+
+    /// Resolve a requested rectangle into `(x, y, width, height)` in screen coordinates.
+    fn grab_geometry(&self, rect: Option<DirtyArea>) -> Result<(i16, i16, u16, u16), X11Error> {
+        match rect {
+            Some(area) => {
+                let r = self
+                    .clamp_rect(area)
+                    .ok_or_else(|| X11Error("dirty rectangle covers no screen pixels".into()))?;
+                Ok((r.x as i16, r.y as i16, r.width, r.height))
+            }
+            None => Ok((0i16, 0i16, self.width, self.height)),
+        }
     }
 
     /// Proof that the shared-memory path really returns framebuffer content.
@@ -475,7 +569,7 @@ impl X11Screen {
             .map_err(text("create_window"))?;
 
         // Reference frame with the window still unmapped.
-        let before = self.grab_getimage()?.0;
+        let before = self.grab_getimage(None)?.0;
 
         self.conn.map_window(wid).map_err(text("map_window"))?;
         self.conn.sync().map_err(text("sync"))?;
@@ -489,12 +583,30 @@ impl X11Screen {
                 .map_err(text("get_geometry"))?
                 .reply()
                 .map_err(text("get_geometry reply"))?;
-            let (via_getimage, _) = self.grab_getimage()?;
-            let (via_shm, timing) = self.grab_shm()?;
+            let (via_getimage, _) = self.grab_getimage(None)?;
+            let (via_shm, timing) = self.grab_shm(None)?;
+            // The same rectangle cut out by the server instead of sliced by us: this is what
+            // an incremental frame would carry, so it has to be correct on its own.
+            let tile_area = DirtyArea {
+                x: g.x,
+                y: g.y,
+                width: g.width,
+                height: g.height,
+            };
+            let (tile, tile_timing) = self.grab_shm(Some(tile_area))?;
             Ok(VerifyReport {
                 bytes: via_shm.len(),
                 painted_getimage: self.paint_ratio(&via_getimage, g.x, g.y, g.width, g.height),
                 painted_shm: self.paint_ratio(&via_shm, g.x, g.y, g.width, g.height),
+                painted_tile: self.tile_paint_ratio(&tile, g.width, g.height),
+                tile_matches_full: self.tile_matches_full(
+                    &tile,
+                    &via_getimage,
+                    g.x,
+                    g.y,
+                    g.width,
+                    g.height,
+                ),
                 rect_identical: self.equal_ratio(
                     &via_getimage,
                     &via_shm,
@@ -508,6 +620,8 @@ impl X11Screen {
                 frame_identical: via_getimage == via_shm,
                 rect: (g.x, g.y, g.width, g.height),
                 shm_ms: timing.total_ms(),
+                tile_ms: tile_timing.total_ms(),
+                tile_bytes: tile.len(),
             })
         })();
 
@@ -539,6 +653,61 @@ impl X11Screen {
             }
             Some((a[off..off + stride] == b[off..off + stride]) as u64)
         })
+    }
+
+    /// Share of a server-cut tile showing the painted red.
+    ///
+    /// A tile has the rectangle's own stride, so this cannot reuse the full-screen walk.
+    fn tile_paint_ratio(&self, tile: &[u8], w: u16, h: u16) -> f64 {
+        let stride = self.bytes_per_pixel;
+        let mut hit = 0u64;
+        let mut total = 0u64;
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let off = (row * w as usize + col) * stride;
+                if off + stride > tile.len() {
+                    continue;
+                }
+                total += 1;
+                if tile[off] == 0 && tile[off + 1] == 0 && tile[off + 2] == 255 {
+                    hit += 1;
+                }
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            hit as f64 / total as f64
+        }
+    }
+
+    /// Whether a tile equals the same rectangle cut out of a full-frame buffer.
+    fn tile_matches_full(
+        &self,
+        tile: &[u8],
+        full: &[u8],
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+    ) -> bool {
+        let stride = self.bytes_per_pixel;
+        let row_len = w as usize * stride;
+        for row in 0..h as usize {
+            let py = y as usize + row;
+            if py >= self.height as usize {
+                return false;
+            }
+            let tile_off = row * row_len;
+            let full_off = (py * self.width as usize + x as usize) * stride;
+            if tile_off + row_len > tile.len() || full_off + row_len > full.len() {
+                return false;
+            }
+            if tile[tile_off..tile_off + row_len] != full[full_off..full_off + row_len] {
+                return false;
+            }
+        }
+        true
     }
 
     /// Walk `rect` clamped to the screen, counting pixels a predicate accepts.
@@ -582,11 +751,3 @@ impl X11Screen {
         }
     }
 }
-
-/// The report levels this backend may switch between later.
-#[allow(dead_code)]
-const _REPORT_LEVELS: [ReportLevel; 3] = [
-    damage::ReportLevel::RAW_RECTANGLES,
-    damage::ReportLevel::BOUNDING_BOX,
-    damage::ReportLevel::NON_EMPTY,
-];
