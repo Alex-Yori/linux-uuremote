@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 x11rb = { version = "0.14", features = ["damage", "shm", "xfixes"] }
+libc = "0.2"

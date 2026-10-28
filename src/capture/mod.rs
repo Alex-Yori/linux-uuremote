@@ -1,3 +1,4 @@
+pub mod shm;
 pub mod x11;
 
 /// A screen change reported by the capture backend.
