@@ -4,6 +4,8 @@
 
 不是 [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) 的 fork——那个项目当**参照物**读，代码一行没搬。设计依据是从 UU 官方安卓被控端引擎里逆向出来的行为规格（见 [docs/SPEC.md](docs/SPEC.md)），目标是让官方 Windows / macOS / 安卓客户端把这台 Linux 当普通被控端连，行为对齐官方端。
 
+> **名字提醒**：本机现在跑着的那个参照实现，可执行文件也叫 `uu-remote-linux`（`uuremote-native.service`）。本项目目录同名，但产物叫 `uu-capture-probe`（后续宿主 daemon 会另起名字），不会互相撞。
+
 ## 当前状态
 
 第一个能跑的模块是**采集与出帧门控**（`uu-capture-probe`），它已经实测验证了本项目最核心的那条设计——**内容自适应出帧**。其余模块在路线图里，还没写。
