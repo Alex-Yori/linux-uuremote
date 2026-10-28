@@ -20,12 +20,7 @@
 //!   uu-capture-probe --display :1 --fps 60 --still-fps 3 --duration 20 \
 //!     [--baseline] [--no-read] [--verify] [--dirty]
 
-mod capture;
-mod content;
-mod cursor;
-mod diff;
-mod gating;
-mod scan;
+use linux_uuremote::{capture, content, cursor, diff, gating, scan};
 
 use std::error::Error;
 use std::time::{Duration, Instant};

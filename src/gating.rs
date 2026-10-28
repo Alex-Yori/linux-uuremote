@@ -3,8 +3,10 @@
 //! Recovered from the official controlled-host engine (`libstreamer.so`, source tree
 //! `nrd-streamer`), which logs:
 //!
-//!     create video frame dropper moving_fps:{} (raw:{}) still_fps:{}
-//!     not requesting refresh frame because of soon happening idle repeat
+//! ```text
+//! create video frame dropper moving_fps:{} (raw:{}) still_fps:{}
+//! not requesting refresh frame because of soon happening idle repeat
+//! ```
 //!
 //! i.e. the official host does NOT encode at the configured frame rate. It captures
 //! continuously ("raw"), then drops to a low keepalive rate (`still_fps`, observed
