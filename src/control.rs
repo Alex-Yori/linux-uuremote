@@ -122,7 +122,9 @@ pub fn decode_action(data: &[u8]) -> Result<SimpleAction, String> {
     Ok(SimpleAction {
         seq,
         timestamp,
-        action: varint(&inner, 1).ok_or("simpleAction 缺 actionType(field 1)")?,
+        // protobuf 不序列化默认值：缺 field 1 就是 actionType=0（echo_request）。
+        // Windows 客户端每 ~500ms 发的保活正是这种"空"包，必须当 echo 回，否则客户端判活失败、不发输入。
+        action: varint(&inner, 1).unwrap_or(0),
         args: string_field(&inner, 2).unwrap_or_default(),
     })
 }
@@ -453,6 +455,16 @@ pub fn mouse_button_to_x11(button: i32) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protobuf_echo_request_omits_default_action_type() {
+        // protobuf never serializes actionType=0; Windows keepalive looks like
+        // Message{ simpleAction{ FeatureFlag } } with no field 1 at all.
+        // Message{3: SimpleAction{4: FeatureFlag{1:6}}}，手拼字节，无 field 1。
+        let msg = [0x1Au8, 4, 0x22, 2, 0x08, 6];
+        let action = decode_action(&msg).expect("缺 actionType 要当 0 解");
+        assert_eq!(action.action, 0);
+    }
 
     #[test]
     fn json_and_binary_carried_json_both_decode() {
