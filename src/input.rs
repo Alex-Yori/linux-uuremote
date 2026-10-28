@@ -336,10 +336,13 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_absolute_drops_without_moving_pointer() {
+    fn pixel_space_absolute_maps_to_screen() {
+        // Windows 客户端发像素：1.4/0.5 混合空间按像素解释并夹到屏内。
         let mut p = (42, 42);
-        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":1.4,"abs_y":0.5}"#), 1920, 1080, &mut p).is_empty());
-        assert_eq!(p, (42, 42));
+        let events = plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":600.0,"abs_y":900.0}"#), 1920, 1080, &mut p);
+        assert_eq!(events.len(), 1);
+        assert_eq!(p, (600, 900));
+        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":-1.0,"abs_y":0.5}"#), 1920, 1080, &mut p).is_empty());
     }
 
     #[test]

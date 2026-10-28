@@ -407,7 +407,12 @@ async fn handle_control(
         }
         ControlMessage::Input(_) => {
             if session.control_msgs <= 8 {
-                println!("   输入事件：{}", linux_uuremote::control::input_summary_of(&message));
+                let detail = match &message {
+                    ControlMessage::Input(linux_uuremote::control::ControlInput::MouseAbsolute { x, y }) =>
+                        format!(" x={x:.3} y={y:.3}"),
+                    _ => String::new(),
+                };
+                println!("   输入事件：{}{detail}", linux_uuremote::control::input_summary_of(&message));
             }
             let Some(input) = session.input.clone() else {
                 println!("   收到输入但没有注入引擎");
@@ -729,10 +734,16 @@ fn capture_loop(
         if diff.first || diff.changed_pixels > 0 {
             gate.note_change(now);
         }
-        // 官方客户端自己在远端画本地光标；再合成一份 X 光标只会重影，也不动客户端的输入坐标。
-        match encoder.encode_bgra(&frame, plan.force_idr) {
+        // 客户端只画它自己的本地光标，画面里必须带上远端指针，否则用户看不到 Linux 光标。
+        // 参考帧与内容比对保持无光标（光标只进发出的这份拷贝）。
+        let mut out = frame.clone();
+        if let (Ok(sprite), Some(pos)) = (screen.fetch_cursor(), screen.cursor_position()) {
+            screen.composite_cursor(&mut out, &sprite, pos);
+        }
+        match encoder.encode_bgra(&out, plan.force_idr) {
             Ok((au, kind)) => {
                 planner.note_success();
+                frames_sent += 1;
                 if kind == FrameKind::Idr {
                     idr_frames += 1;
                 }

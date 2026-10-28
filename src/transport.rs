@@ -406,9 +406,10 @@ impl Peer {
         }
         println!("   视频协商完成：{}", negotiated.join(" / "));
         self.pc.set_local_description(answer.clone()).await.map_err(|e| format!("设置本端描述失败: {e}"))?;
-        if !wait_gathering_complete(&self.pc, Duration::from_secs(8)).await {
-            // 超时也照发：没有本机 candidate 的 answer 至少还有 stun/turn 可以打洞。
-            log_warn("ICE 收集超时，answer 里可能缺本机 candidate");
+        if !wait_gathering_complete(&self.pc, Duration::from_secs(1)).await {
+            // 超时照发：剩余 candidate 走 trickle，客户端照样能打洞。
+            // 等齐 7 台 STUN + TURN 会把 answer 拖后好几秒，连接半分钟的账就在这。
+            log_warn("ICE 收集未齐，剩余 candidate 走 trickle");
         }
         // create_answer 那一刻还没有 candidate（收集在 set_local_description 之后才开始），
         // 拿 current_local_description 才带得上本机 candidate——客户端没有 trickle 通道时只能靠它。

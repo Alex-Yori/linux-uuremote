@@ -456,15 +456,25 @@ pub fn windows_vk_to_keysym(vk: i32) -> Option<u32> {
     Some(keysym)
 }
 
-/// 归一化绝对坐标 → 源屏像素。官方 Mac/移动端把指针归一化到 0..1，映射到 `0..=w-1`。
+/// 绝对坐标 → 源屏像素。Mac/移动端把指针归一化到 0..1；Windows 客户端发的可能
+/// 是屏幕像素（实测：只认 0..1 会把指针永远钉死不动）。两种都认：
+/// 分量都 ≤1 按归一化解释，否则按像素解释并夹到屏内。
 pub fn normalized_pointer(x: f64, y: f64, width: u32, height: u32) -> Option<(i32, i32)> {
     if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
         return None;
     }
-    if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
         return None;
     }
-    Some(((x * (width - 1) as f64).round() as i32, (y * (height - 1) as f64).round() as i32))
+    let mapped = if x <= 1.0 && y <= 1.0 {
+        (x * (width - 1) as f64, y * (height - 1) as f64)
+    } else {
+        (x, y)
+    };
+    Some((
+        mapped.0.clamp(0.0, (width - 1) as f64).round() as i32,
+        mapped.1.clamp(0.0, (height - 1) as f64).round() as i32,
+    ))
 }
 
 /// 鼠标按键位掩码 → X11 按钮序号。bit0 左=1，bit1 右=3，bit2 中=2；组合值不猜。
@@ -624,8 +634,18 @@ mod tests {
         assert_eq!(normalized_pointer(0.6805736636245111, 0.15990730011587487, 1920, 1080), Some((1306, 173)));
         assert_eq!(normalized_pointer(f64::NAN, 0.5, 1920, 1080), None);
         assert_eq!(normalized_pointer(-0.1, 0.5, 1920, 1080), None);
-        assert_eq!(normalized_pointer(0.5, 1.1, 1920, 1080), None);
+        // 1.1 现在按像素解释（Windows 客户端发像素），夹到屏内而不是丢弃。
+        assert_eq!(normalized_pointer(0.5, 1.1, 1920, 1080), Some((1, 1)));
         assert_eq!(normalized_pointer(0.5, 0.5, 0, 1080), None);
+    }
+
+    #[test]
+    fn absolute_coordinates_accept_windows_pixel_space() {
+        // >1 的分量按像素解释（夹到屏内），≤1 仍是归一化。
+        assert_eq!(normalized_pointer(1200.0, 900.0, 2560, 1440), Some((1200, 900)));
+        assert_eq!(normalized_pointer(9999.0, 9999.0, 2560, 1440), Some((2559, 1439)));
+        assert_eq!(normalized_pointer(0.5, 0.5, 1920, 1080), Some((960, 540)));
+        assert_eq!(normalized_pointer(-1.0, 0.5, 1920, 1080), None);
     }
 
     #[test]
