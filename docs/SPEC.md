@@ -61,3 +61,49 @@
 2. **动态验证**（需手机 + adb/frida；或 Windows 客户端 + 本机宿主）：hook `SendSignalData` / `onReceiveControlData` / `onReceiveRpcRequest`，拿真实 JSON。宿主与被控在同一局域网时协议两侧都能抓。
 3. RPC 字段号对齐：参照实现已知「field 1 = fps 选项索引（1=30, 2=60）、field 18 = fpsCount」，官方对应结构从 RPC 报文确认。
 4. 若确认官方客户端连非官方宿主时用的是标准 SCTP，则 KCP 差异不阻塞；否则考虑补 KCP 数据道。
+
+## 7. Windows 包证据（2026-10-28 补充）
+
+官方 Windows 包已下载并**在 Linux 上解包**（不需要 Windows 机器）：
+
+```
+https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd
+→ 92,252,208 B，PE32 NSIS 自解压，sha256 4f1b86d768478ddb…
+7z x 直接解开（解出的载荷在 ~/rea-work/uuremote/win/）
+```
+
+被控端侧载荷（按用途分类）：
+
+| 载荷 | 作用 |
+|---|---|
+| `GameViewerServer.exe` 7.4 MB | 被控端宿主进程 |
+| `GameViewerService.exe` 2.2 MB | 系统服务（常驻、提权） |
+| `GameViewer.exe` 29 MB | 主程序（控制端 + 被控端 UI，Qt5） |
+| `streamer.dll` 5.9 MB | 与安卓 `libstreamer.so` 同族的引擎（`nrd-streamer`） |
+| `StreamerCodecDetector.exe` 1.4 MB | 独立进程做**编码器能力探测** |
+| `drivers/GameViewerIddDriver` | **虚拟显示器**（Windows Indirect Display Driver） |
+| `drivers/uuycinput` + `uuycinputmf` | 虚拟输入注入 |
+| `drivers/nevaudio` + `Nevaudiosdk.dll` | 虚拟音频（被控端把声音送进链路） |
+| `drivers/ViGEmBus` | 虚拟手柄（把远端输入变成 XInput 设备） |
+| `nrd_renderer_ipc.dll` | 渲染进程间通信 |
+| `nemu-api.dll` / `remote-nemu-api.dll` | 模拟器（MuMu）侧集成 |
+| `uuyc-mux.exe` / `uuyc-cli.exe` / `Upgrade.exe` / `PsExec64.exe` | 多路复用、CLI、升级、提权执行 |
+
+`streamer-config.json`（解出来只有 763 B，是一条**按设备能力开关**的策略）：
+
+```json
+{
+  "disable_h265_codec": [{
+    "enable": true, "roles": ["controller"], "platforms": ["windows"],
+    "graphic_cards": ["GTX\\s*6","GT\\s*6","GTX\\s*7","GT\\s*7","GTX\\s*8","GT\\s*8","GTX\\s*9","GT\\s*9","NVIDIA\\s*QUADRO"]
+  }],
+  "set_max_decoder_cap": [{
+    "enable": true, "platforms": ["android"], "brands": ["Lenovo"], "models": ["TB371FC"]
+  }]
+}
+```
+
+含义：官方把「哪些设备不许用 H.265 / 要限解码能力」写成随包下发的正则黑名单，而不是硬编码。本项目的编码能力声明应当走同一条路：**探测 + 可配置黑名单 + 回退**，而不是假定 NVENC 永远可用。
+
+另外 Windows 被控端靠**虚拟显示器驱动**（Idd）取画面，而 Linux 侧我们用 XDamage 直接抓真实桌面——所以官方那些「分辨率/帧率随时切换」「多显示器」的能力，Linux 要等价就得靠 XRandR（改分辨率）或另开虚拟输出，这是两端结构性差异，不是实现质量问题。
+
