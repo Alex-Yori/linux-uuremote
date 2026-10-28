@@ -71,6 +71,88 @@ impl Sprite {
 ///
 /// Returns the painted screen rectangle `(x, y, w, h)`, or `None` when nothing was visible.
 /// This is the region an encoder has to re-encode because of the cursor — with a full-screen
+/// XFixes 给的是预乘 ARGB32；PNG 要直通 alpha 的 RGBA。
+pub fn argb_premultiplied_to_rgba(pixels: &[u32]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len() * 4);
+    for &pixel in pixels {
+        let a = pixel >> 24;
+        let straight = |shift: u32| -> u8 {
+            let c = (pixel >> shift) & 0xff;
+            if a == 0 {
+                0
+            } else {
+                ((c * 255 + a / 2) / a).min(255) as u8
+            }
+        };
+        rgba.extend_from_slice(&[straight(16), straight(8), straight(0), a as u8]);
+    }
+    rgba
+}
+
+/// 极简 8-bit RGBA PNG（filter 0），只用 flate2，不引图像库。
+pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(kind);
+        crc.update(data);
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc.sum().to_be_bytes());
+    }
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    let mut scanlines = Vec::with_capacity(rgba.len() + height as usize);
+    for row in rgba.chunks(width as usize * 4) {
+        scanlines.push(0);
+        scanlines.extend_from_slice(row);
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&scanlines).expect("内存 zlib 不会失败");
+    let compressed = encoder.finish().expect("内存 zlib 不会失败");
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &header);
+    chunk(&mut png, b"IDAT", &compressed);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// `Message{15: SystemStateChange{2: CursorShape{…}}}`，照官方 Mac host sendCursorShape：
+/// 1/2 热点，3/4 宽高，5 PNG 字节，6 cursor_type=0（默认省略），7/8 缩放 double=1.0，
+/// 9 screen_id=0（默认省略）。客户端拿它替换自己画的本地光标。
+pub fn encode_cursor_shape(seq: u64, timestamp: u64, sprite: &Sprite) -> Vec<u8> {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 128 {
+            out.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    let png = encode_png(sprite.width as u32, sprite.height as u32, &argb_premultiplied_to_rgba(&sprite.argb[..sprite.pixel_count()]));
+    let mut shape = Vec::new();
+    for (field, value) in [(1i32, sprite.hotspot_x as i32), (2, sprite.hotspot_y as i32), (3, sprite.width as i32), (4, sprite.height as i32)] {
+        if value != 0 {
+            varint((field as u64) << 3, &mut shape);
+            varint(value as i64 as u64, &mut shape);
+        }
+    }
+    varint(5 << 3 | 2, &mut shape);
+    varint(png.len() as u64, &mut shape);
+    shape.extend_from_slice(&png);
+    for field in [7u64, 8] {
+        varint(field << 3 | 1, &mut shape);
+        shape.extend_from_slice(&1.0f64.to_le_bytes());
+    }
+    let mut change = Vec::new();
+    varint(2 << 3 | 2, &mut change);
+    varint(shape.len() as u64, &mut change);
+    change.extend_from_slice(&shape);
+    crate::initialization::envelope(seq, timestamp, 15, &change)
+}
+
 /// readback it is *not* part of the content-diff dirty set, since the grabbed pixels never
 /// contain the cursor.
 pub fn composite(
@@ -222,6 +304,23 @@ mod tests {
         let s = sprite(vec![], 0, 0, (0, 0));
         let mut f = frame(0, 0, 0);
         assert_eq!(composite(&mut f, W, 4, &s, 3, 2), None);
+    }
+
+    #[test]
+    fn cursor_shape_matches_official_field_layout() {
+        let s = sprite(vec![0xFF80_4020; 9], 3, 3, (1, 2));
+        let message = encode_cursor_shape(7, 9, &s);
+        assert_eq!(message[0], 8); // Message.field1 = seq
+        let at = message.iter().position(|&b| b == (15 << 3 | 2)).expect("Message.field15");
+        let change = &message[at + 2..];
+        assert_eq!(change[0], 2 << 3 | 2); // SystemStateChange.field2 = CursorShape
+        let shape_len = change[1] as usize;
+        let shape = &change[2..2 + shape_len];
+        assert_eq!(shape[0], 1 << 3); // hotspot_x
+        assert_eq!(shape[1], 1);
+        assert!(message.windows(4).any(|w| w == b"\x89PNG"));
+        // 7/8 缩放 double = 1.0（客户端按它换算屏幕点）。
+        assert!(message.windows(8).any(|w| w == 1.0f64.to_le_bytes()));
     }
 
     #[test]

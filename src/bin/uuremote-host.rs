@@ -555,6 +555,7 @@ fn start_video(
         }
     }
     let (frames_tx, mut frames_rx) = mpsc::channel::<Encoded>(4);
+    let (shapes_tx, mut shapes_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // 采集线程一起来就把实测几何报回来：屏幕清单必须用真实尺寸，不能猜。
     let (geom_tx, geom_rx) = oneshot::channel::<(u32, u32)>();
     // 客户端收到屏幕清单之前不要往轨道写帧，否则第一帧 IDR 会被丢弃、后面全是坏 P 帧。
@@ -565,7 +566,7 @@ fn start_video(
     session.capture = Some(
         std::thread::Builder::new()
             .name("uu-capture".into())
-            .spawn(move || capture_loop(display.as_deref(), fps, still_fps, bitrate_kbps, gop, keyframe, geom_tx, thread_settings, frames_tx))
+            .spawn(move || capture_loop(display.as_deref(), fps, still_fps, bitrate_kbps, gop, keyframe, geom_tx, thread_settings, frames_tx, shapes_tx))
             .expect("起采集线程"),
     );
 
@@ -658,6 +659,18 @@ fn start_video(
             }
         }
     });
+    // 光标形状镜像：Message{15: SystemStateChange{2: CursorShape}} 走 CONTROL 通道，
+    // 客户端拿它替换自己画的本地贴图（不发的话用户永远看到 Windows 箭头）。
+    let peer_shape = session.peer.clone();
+    tokio::spawn(async move {
+        while let Some(shape) = shapes_rx.recv().await {
+            if let Err(e) = peer_shape.send_control(&shape).await {
+                eprintln!("   光标形状发送失败：{e}");
+            } else {
+                println!("   光标形状已发（{} 字节）", shape.len());
+            }
+        }
+    });
 }
 
 /// 采集 → 门控 → 编码：整机读回，内容比对决定发不发，发的都是整帧。
@@ -671,6 +684,7 @@ fn capture_loop(
     geom_tx: oneshot::Sender<(u32, u32)>,
     settings: Arc<RemoteSettings>,
     frames_tx: mpsc::Sender<Encoded>,
+    shapes_tx: mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let mut screen = match X11Screen::open(display, DamageLevel::BoundingBox) {
         Ok(s) => s,
@@ -700,6 +714,8 @@ fn capture_loop(
     let mut last_cursor: Option<(i32, i32)> = None;
     let mut frames_sent: u64 = 0;
     let mut last_stat = Instant::now();
+    let composite_cursor = std::env::var("UU_COMPOSITE_CURSOR").is_ok();
+    let mut last_shape_hash: u64 = 0;
     // 分阶段计时：帧率低时要知道慢在抓取、比对、编码还是发送背压。
     let mut acc_grab = Duration::ZERO;
     let mut acc_diff = Duration::ZERO;
@@ -796,11 +812,33 @@ fn capture_loop(
             gate.note_change(now);
         }
         acc_diff += d0.elapsed();
-        // 客户端只画它自己的本地光标，画面里必须带上远端指针，否则用户看不到 Linux 光标。
-        // 参考帧与内容比对保持无光标（光标只进发出的这份拷贝）。
+        // 官方被控端把光标形状单独上报，画面不带指针；客户端用形状贴图替换自己的箭头。
+        // UU_COMPOSITE_CURSOR=1 切回旧行为（把光标合成进画面）。
+        let sprite = screen.fetch_cursor().ok();
+        if let Some(sprite) = &sprite {
+            if !sprite.is_empty() {
+                let mut sig: u64 = 0xcbf29ce484222325;
+                let mix = |h: &mut u64, v: u64| {
+                    *h ^= v;
+                    *h = h.wrapping_mul(0x100000001b3);
+                };
+                mix(&mut sig, (u64::from(sprite.width) << 32) | u64::from(sprite.height));
+                mix(&mut sig, (u64::from(sprite.hotspot_x) << 32) | u64::from(sprite.hotspot_y));
+                for &px in &sprite.argb[..sprite.pixel_count()] {
+                    mix(&mut sig, u64::from(px));
+                }
+                if sig != last_shape_hash {
+                    last_shape_hash = sig;
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let _ = shapes_tx.send(linux_uuremote::cursor::encode_cursor_shape(next_sequence(), ts, sprite));
+                }
+            }
+        }
         let mut out = frame.clone();
-        if let (Ok(sprite), Some(pos)) = (screen.fetch_cursor(), screen.cursor_position()) {
-            screen.composite_cursor(&mut out, &sprite, pos);
+        if composite_cursor {
+            if let (Some(sprite), Some(pos)) = (sprite.as_ref(), screen.cursor_position()) {
+                screen.composite_cursor(&mut out, sprite, pos);
+            }
         }
         let e0 = Instant::now();
         match encoder.encode_bgra(&out, plan.force_idr) {
