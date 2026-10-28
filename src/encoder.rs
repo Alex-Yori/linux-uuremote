@@ -206,14 +206,21 @@ impl OpenH264 {
         }
         let threads = threads.max(1);
         let kbps = if bitrate_kbps > 0 { bitrate_kbps } else { default_bitrate_kbps(width, height, fps, 0.10) };
+        // 1440p 软编实测：屏幕内容档 50 ms/帧（20fps 封顶），camera 档 12 ms/帧（80fps）。
+        // 目标 30fps 只有 camera 档跑得动，文字质量靠码率补；要屏幕内容档用 UU_ENC_USAGE=screen。
+        let usage = match std::env::var("UU_ENC_USAGE").as_deref() {
+            Ok("screen") => openh264::encoder::UsageType::ScreenContentRealTime,
+            _ => openh264::encoder::UsageType::CameraVideoRealTime,
+        };
         let cfg = openh264::encoder::EncoderConfig::new()
             .bitrate(openh264::encoder::BitRate::from_bps(kbps * 1000))
             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate)
             .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps.max(1) as f32))
-            // 屏幕内容模式：文字与边缘优先，配自适应量化。
-            .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
-            .complexity(openh264::encoder::Complexity::Medium)
-            .adaptive_quantization(true)
+            .usage_type(usage)
+            // 1440p 软编是瓶颈：Medium 实测 50 ms/帧（20fps 封顶），Low 明显更快而
+            // 桌面文字内容几乎看不出差别。30fps 目标必须走 Low。
+            .complexity(openh264::encoder::Complexity::Low)
+            .adaptive_quantization(std::env::var("UU_ENC_AQ").as_deref() != Ok("0"))
             // WebRTC 的时长连续性不能容忍编码器自行丢帧。
             .skip_frames(false)
             // 桌面内容没有「镜头切换」；开着会毫无理由地插 IDR。

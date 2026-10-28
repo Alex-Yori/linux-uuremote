@@ -48,3 +48,12 @@ qrcode = { version = "0.14", default-features = false }
 flate2 = "1"
 openh264 = "0.9"
 webrtc = "0.10"
+
+[[bin]]
+name = "uu-input-probe"
+path = "src/bin/uu-input-probe.rs"
+
+[[bin]]
+name = "uu-encode-bench"
+path = "src/bin/uu-encode-bench.rs"
+

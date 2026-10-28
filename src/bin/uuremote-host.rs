@@ -68,6 +68,8 @@ struct Session {
     route: Value,
     /// 诊断用：本会话收到过几条 CONTROL 报文（前几条打形状，查"鼠标没反应"）。
     control_msgs: u32,
+    /// 是否已发出 answer（远端描述已设）：早到 candidate 要等它才能 add。
+    answered: bool,
 }
 
 /// 远程可调的采集参数。码率变化触发编码器重建 + IDR；分辨率只支持原生，降档显式拒绝。
@@ -194,6 +196,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
 
     let settings = Arc::new(RemoteSettings::new(fps, still_fps));
     let mut session: Option<Session> = None;
+    let mut early_candidates: Vec<(String, Option<String>, Option<u16>)> = Vec::new();
 
     println!("等待客户端拉流（Ctrl-C 退出）…");
     loop {
@@ -217,7 +220,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     };
                     match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, route: json!({}), control_msgs: 0 }),
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, route: json!({}), control_msgs: 0, answered: false }),
                         Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
@@ -240,16 +243,31 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                                 "app_control_id": app_control_id,
                             });
                             emit_tx.send(("soac".to_string(), Some(payload))).ok();
+                            session.answered = true;
                             println!("   answer 已发出（SDP {} 字节）", answer.len());
+                            // 补上早到的 candidate（客户端可能靠它们打洞）。
+                            for (c, mid, mline) in std::mem::take(&mut early_candidates) {
+                                if let Err(e) = session.peer.add_candidate(&c, mid.as_deref(), mline).await {
+                                    eprintln!("   补 candidate 失败：{e}");
+                                }
+                            }
+                            if !early_candidates.is_empty() { println!("   早到 candidate 已补发"); }
                         }
                         Err(e) => eprintln!("   answer 失败：{e}"),
                     }
                 }
                 Some(Signal::Candidate { candidate, sdp_mid, sdp_mline_index }) => {
-                    if let Some(session) = session.as_mut() {
-                        if let Err(e) = session.peer.add_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index).await {
-                            eprintln!("   candidate 失败：{e}");
+                    // 客户端的 trickle candidate 常常比 offer 先到；这时 add 会报
+                    // "remote description is not set"，白丢一批，连接就慢一步。先攒着。
+                    if session.as_ref().is_some_and(|s| s.answered) {
+                        if let Some(session) = session.as_mut() {
+                            if let Err(e) = session.peer.add_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index).await {
+                                eprintln!("   candidate 失败：{e}");
+                            }
                         }
+                    } else {
+                        early_candidates.push((candidate, sdp_mid, sdp_mline_index));
+                        println!("   candidate 先于 offer 到达，暂存 {} 条", early_candidates.len());
                     }
                 }
                 Some(Signal::PeerLeft) => {

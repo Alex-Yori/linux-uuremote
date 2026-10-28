@@ -247,9 +247,17 @@ impl X11Input {
             return Ok(false);
         }
         for e in &events {
-            self.conn
-                .xtest_fake_input(e.type_, e.detail, 0, self.root, e.x, e.y, 0)
-                .map_err(|err| format!("XTest FakeInput 失败: {err}"))?;
+            if e.type_ == MOTIONNOTIFY {
+                // Xwayland 把 XTEST 的 MotionNotify 连 detail=1 当**相对位移**处理
+                // （实测：abs(1000,300) 从 (200,900) 落点 (1200,1200)，再加码到
+                // 屏角就永远钉死右下角）。WarpPointer 才精确，且会给窗口发 MotionNotify。
+                let (px, py) = self.pointer;
+                warp_pointer(&self.conn, self.root, px, py)?;
+            } else {
+                self.conn
+                    .xtest_fake_input(e.type_, e.detail, 0, self.root, e.x, e.y, 0)
+                    .map_err(|err| format!("XTest FakeInput 失败: {err}"))?;
+            }
         }
         self.conn.flush().map_err(|e| format!("X flush 失败: {e}"))?;
         Ok(true)
