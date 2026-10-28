@@ -344,12 +344,31 @@ pub fn random_uuid() -> String {
 }
 
 /// /etc/machine-id 转 GUID——Windows MachineGuid 的最近 Linux 等价物。
+///
+/// `UU_MACHINE_GUID` 覆盖：同一台机器想把本项目注册成**独立设备**时必须有别的 GUID，
+/// 否则云端按 GUID 去重，会和参照实现（uuremote-server）认成同一台，
+/// 客户端列表里就只看到一个在线设备。
 pub fn machine_guid() -> String {
+    if let Ok(guid) = std::env::var("UU_MACHINE_GUID") {
+        if !guid.is_empty() {
+            return guid;
+        }
+    }
     let id = read_file("/etc/machine-id");
     if id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()) {
         format!("{}-{}-{}-{}-{}", &id[..8], &id[8..12], &id[12..16], &id[16..20], &id[20..])
     } else {
         random_uuid()
+    }
+}
+
+/// 主板标识：云端 device/windows/init 把它列为必填（少了直接 422 "Field required"）。
+pub fn base_board() -> String {
+    let v = [read_file("/sys/class/dmi/id/board_vendor"), read_file("/sys/class/dmi/id/board_name")].join(" ");
+    if v.trim().is_empty() {
+        "Unknown".to_owned()
+    } else {
+        v.trim().to_owned()
     }
 }
 
@@ -446,6 +465,7 @@ pub async fn register_device(client: &ApiClient, screen: &str) -> Result<String,
         "system_id": client.creds.system_id,
         "machine_guid": machine_guid(),
         "os": os_name(),
+        "base_board": base_board(),
         "cpu": cpu_name(),
         "video": video(),
         "mac": mac(),
@@ -453,7 +473,7 @@ pub async fn register_device(client: &ApiClient, screen: &str) -> Result<String,
         "screen": screen,
     });
     let (status, resp) = client.post_json("/api/v1/device/windows/init", &body).await?;
-    let data = api_data("device init", status, &resp)?;
+    let data = api_data("device init", status, &resp).map_err(|e| format!("{e} · 响应 {}", resp))?;
     data.get("device_id").and_then(Value::as_str).map(str::to_owned).ok_or("device init returned no device_id".into())
 }
 

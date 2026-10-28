@@ -18,18 +18,31 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() {
     let force = std::env::args().any(|a| a == "--force");
-    if let Err(e) = run(force).await {
+    let new_device = std::env::args().any(|a| a == "--new-device");
+    if let Err(e) = run(force, new_device).await {
         eprintln!("错误：{e}");
         std::process::exit(1);
     }
 }
 
-async fn run(force: bool) -> Result<(), String> {
+async fn run(force: bool, new_device: bool) -> Result<(), String> {
     let (file, borrowed) = config::read_with_fallback()?;
     if borrowed {
         println!("借用参照实现的登录态（{}）；写入只进 {}。", config::fallback_path().display(), config::path().display());
     }
     let mut creds = Credentials::load(file.as_ref()).unwrap_or_default();
+    // --new-device：账号凭证照用，身份全部换新，注册成第二台设备。
+    // 不这么做的话云端按 machine_guid 去重，本项目和 uuremote-server 会认成同一台，
+    // Windows 端就永远只看到参照实现那个设备。
+    let mut guid = std::env::var("UU_MACHINE_GUID").unwrap_or_default();
+    if new_device {
+        creds.device_id = String::new();
+        creds.client_id = api::random_uuid();
+        creds.system_id = api::random_uuid().to_ascii_uppercase();
+        guid = api::random_uuid();
+        std::env::set_var("UU_MACHINE_GUID", guid.clone());
+        println!("新设备身份：client_id/system_id/machine_guid 全部重新生成。");
+    }
     if creds.client_id.is_empty() {
         creds.client_id = api::random_uuid();
     }
@@ -61,7 +74,10 @@ async fn run(force: bool) -> Result<(), String> {
         }
     }
 
-    let merged = merge_into_config(file.as_ref(), &creds.to_json());
+    let mut merged = merge_into_config(file.as_ref(), &creds.to_json());
+    if !guid.is_empty() {
+        merged["machine_guid"] = json!(guid);
+    }
     let p = config::write(&merged)?;
     println!("凭证已保存到 {}（0600）：user_id/device_id/client_id/system_id/token/csrf 齐备。", p.display());
     Ok(())
