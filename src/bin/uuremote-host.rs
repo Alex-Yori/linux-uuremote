@@ -423,10 +423,14 @@ async fn handle_control(
         ControlMessage::Rpc(request) => {
             apply_rpc(request, &session.peer, settings).await;
         }
-        ControlMessage::Input(_) => {
-            if session.control_msgs <= 8 {
-                let detail = match &message {
-                    ControlMessage::Input(linux_uuremote::control::ControlInput::MouseAbsolute { x, y }) =>
+        ControlMessage::Input(input) => {
+            // 鼠标移动是洪水（每秒几十条），每 64 条打一条；键盘/按钮/滚轮必须全打——
+            // 「键盘不能用」这种问题只有逐条日志才看得到事件到没到。
+            if !matches!(input, linux_uuremote::control::ControlInput::MouseAbsolute { .. })
+                || session.control_msgs % 64 == 1
+            {
+                let detail = match input {
+                    linux_uuremote::control::ControlInput::MouseAbsolute { x, y } =>
                         format!(" x={x:.3} y={y:.3}"),
                     _ => String::new(),
                 };
@@ -674,6 +678,11 @@ fn capture_loop(
     let mut last_cursor: Option<(i32, i32)> = None;
     let mut frames_sent: u64 = 0;
     let mut last_stat = Instant::now();
+    // 分阶段计时：帧率低时要知道慢在抓取、比对、编码还是发送背压。
+    let mut acc_grab = Duration::ZERO;
+    let mut acc_diff = Duration::ZERO;
+    let mut acc_encode = Duration::ZERO;
+    let mut acc_send = Duration::ZERO;
     let mut last_reported = measured;
     let mut content = ContentChange::new(width, height, 32, 18);
     let mut emitted = 0u64;
@@ -726,7 +735,16 @@ fn capture_loop(
         if now.duration_since(last_stat) >= Duration::from_secs(5) {
             let secs = now.duration_since(last_stat).as_secs_f64().max(0.1);
             println!("   出帧速率 {:.1} fps（近 5s 共 {frames_sent} 帧，门控 moving={})", frames_sent as f64 / secs, gate.is_moving());
+            let ms = |d: Duration| d.as_millis() as f64 / frames_sent.max(1) as f64;
+            println!(
+                "   每帧耗时：抓取 {:.1} + 比对 {:.1} + 编码 {:.1} + 发送 {:.1} ms",
+                ms(acc_grab), ms(acc_diff), ms(acc_encode), ms(acc_send)
+            );
             frames_sent = 0;
+            acc_grab = Duration::ZERO;
+            acc_diff = Duration::ZERO;
+            acc_encode = Duration::ZERO;
+            acc_send = Duration::ZERO;
             last_stat = now;
         }
         match gate.decide(now) {
@@ -740,6 +758,7 @@ fn capture_loop(
         if !plan.emit {
             continue;
         }
+        let g0 = Instant::now();
         let (frame, _) = match screen.grab_rect(None) {
             Ok(g) => g,
             Err(e) => {
@@ -748,18 +767,23 @@ fn capture_loop(
                 continue;
             }
         };
+        acc_grab += g0.elapsed();
+        let d0 = Instant::now();
         let diff = content.check(&frame, width, screen.bytes_per_pixel());
         if diff.first || diff.changed_pixels > 0 {
             gate.note_change(now);
         }
+        acc_diff += d0.elapsed();
         // 客户端只画它自己的本地光标，画面里必须带上远端指针，否则用户看不到 Linux 光标。
         // 参考帧与内容比对保持无光标（光标只进发出的这份拷贝）。
         let mut out = frame.clone();
         if let (Ok(sprite), Some(pos)) = (screen.fetch_cursor(), screen.cursor_position()) {
             screen.composite_cursor(&mut out, &sprite, pos);
         }
+        let e0 = Instant::now();
         match encoder.encode_bgra(&out, plan.force_idr) {
             Ok((au, kind)) => {
+                acc_encode += e0.elapsed();
                 planner.note_success();
                 frames_sent += 1;
                 if kind == FrameKind::Idr {
@@ -769,9 +793,11 @@ fn capture_loop(
                 if emitted % 300 == 0 {
                     println!("   已发 {emitted} 帧（IDR {idr_frames}），{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
                 }
+                let s0 = Instant::now();
                 if frames_tx.blocking_send(Encoded { data: au, duration: plan.sample_duration }).is_err() {
                     return;
                 }
+                acc_send += s0.elapsed();
             }
             Err(e) => {
                 eprintln!("   编码失败：{e}");
