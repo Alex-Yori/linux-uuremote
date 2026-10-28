@@ -40,6 +40,20 @@ const CURSOR_BOX: u16 = 32;
 /// Side length of the test window `verify_readback` paints.
 const VERIFY_SIDE: u16 = 256;
 
+/// A batch of dirty rectangles grabbed in one exchange.
+#[derive(Debug)]
+pub struct TileGrab {
+    /// Pixel bytes per rectangle, in the order the rectangles were given, each with the
+    /// rectangle's own stride.
+    pub data: Vec<Vec<u8>>,
+    /// Total pixel bytes transferred.
+    pub bytes: usize,
+    /// Wall time for the whole batch.
+    pub ms: f64,
+    /// Whether MIT-SHM served the batch.
+    pub via_shm: bool,
+}
+
 /// What `verify_readback` measured.
 #[derive(Debug)]
 pub struct VerifyReport {
@@ -67,6 +81,14 @@ pub struct VerifyReport {
     /// Cost and size of the same rectangle grabbed as a tile.
     pub tile_ms: f64,
     pub tile_bytes: usize,
+    /// Whether a batched multi-rectangle grab matches a full grab at the same positions.
+    pub tiles_batch_matches: bool,
+    /// Whether the painted rectangle came back painted from inside the batch, which is what
+    /// proves per-rectangle offsets are honoured.
+    pub tiles_batch_painted: bool,
+    /// Cost and total bytes of that batch.
+    pub tiles_batch_ms: f64,
+    pub tiles_batch_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -355,6 +377,115 @@ impl X11Screen {
         }
     }
 
+    /// One round trip for many rectangles: the server writes each one's pixels into its own
+    /// region of the shared segment, so a dirty-rect frame costs a single exchange rather
+    /// than one per rectangle.
+    ///
+    /// Offsets are spaced to the pixel size so every tile starts on a pixel boundary, and the
+    /// batch is refused (falling back to per-rectangle `GetImage`) when the rectangles together
+    /// would not fit in the segment.
+    pub fn grab_tiles(&mut self, rects: &[DirtyArea]) -> Result<TileGrab, X11Error> {
+        if rects.is_empty() {
+            return Ok(TileGrab {
+                data: Vec::new(),
+                bytes: 0,
+                ms: 0.0,
+                via_shm: false,
+            });
+        }
+        self.ensure_shm();
+
+        if self.shm.is_some() {
+            match self.grab_tiles_shm(rects) {
+                Ok(grab) => return Ok(grab),
+                Err(e) => {
+                    self.detach_shm();
+                    self.shm_unavailable = Some(format!("shm tile grab failed: {}", e.0));
+                }
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let mut data = Vec::with_capacity(rects.len());
+        let mut bytes = 0usize;
+        for r in rects {
+            let (d, _) = self.grab_getimage(Some(*r))?;
+            bytes += d.len();
+            data.push(d);
+        }
+        Ok(TileGrab {
+            data,
+            bytes,
+            ms: started.elapsed().as_secs_f64() * 1000.0,
+            via_shm: false,
+        })
+    }
+
+    fn grab_tiles_shm(&mut self, rects: &[DirtyArea]) -> Result<TileGrab, X11Error> {
+        // Spacing on the pixel size keeps every tile start on a pixel boundary, which the
+        // protocol requires for `dstOffset`.
+        let align = self.bytes_per_pixel.max(4);
+        let mut offsets = Vec::with_capacity(rects.len());
+        let mut sizes = Vec::with_capacity(rects.len());
+        let mut cursor = 0usize;
+        for r in rects {
+            let n = self.rect_bytes(r.width, r.height);
+            offsets.push(cursor);
+            sizes.push(n);
+            cursor += (n + align - 1) / align * align;
+        }
+
+        let seg = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| X11Error("no shared memory segment".into()))?;
+        if cursor > seg.len() {
+            return Err(X11Error(format!(
+                "{} bytes of tiles do not fit in a {} byte segment",
+                cursor,
+                seg.len()
+            )));
+        }
+
+        let started = std::time::Instant::now();
+        for (r, off) in rects.iter().zip(offsets.iter()) {
+            self.conn
+                .shm_get_image(
+                    self.root,
+                    r.x,
+                    r.y,
+                    r.width,
+                    r.height,
+                    u32::MAX,
+                    ImageFormat::Z_PIXMAP.into(),
+                    seg.seg(),
+                    *off as u32,
+                )
+                .map_err(text("shm_get_image"))?;
+        }
+        // Every request is a void reply; waiting for the connection to catch up means all the
+        // pixel writes have landed.
+        self.conn.sync().map_err(text("sync after tile batch"))?;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mapped = seg.bytes();
+        let mut data = Vec::with_capacity(rects.len());
+        let mut bytes = 0usize;
+        for (off, n) in offsets.iter().zip(sizes.iter()) {
+            if off + n > mapped.len() {
+                return Err(X11Error("tile ran past the end of the shared segment".into()));
+            }
+            bytes += n;
+            data.push(mapped[*off..*off + n].to_vec());
+        }
+        Ok(TileGrab {
+            data,
+            bytes,
+            ms,
+            via_shm: true,
+        })
+    }
+
     /// Recreate the segment when the root geometry outgrew it (resize).
     fn ensure_shm(&mut self) {
         let want = self.frame_bytes();
@@ -594,6 +725,40 @@ impl X11Screen {
                 height: g.height,
             };
             let (tile, tile_timing) = self.grab_shm(Some(tile_area))?;
+
+            // Batch path: the painted window plus two arbitrary rectangles in one exchange.
+            // The painted rectangle is the deterministic proof that offsets are honoured (it
+            // has to be pure red); byte equality against a full grab is reported but cannot
+            // gate, since a live desktop repaints between the two grabs.
+            let batch_rects = [
+                tile_area,
+                DirtyArea {
+                    x: 0,
+                    y: 0,
+                    width: 96u16.min(self.width),
+                    height: 96u16.min(self.height),
+                },
+                self.clamp_rect(DirtyArea {
+                    x: (self.width as i32 / 2) as i16,
+                    y: (self.height as i32 / 3) as i16,
+                    width: 64,
+                    height: 32,
+                })
+                .unwrap_or(tile_area),
+            ];
+            let batch = self.grab_tiles(&batch_rects)?;
+            let batch_ms = batch.ms;
+            let batch_bytes = batch.bytes;
+            let batch_painted = batch
+                .data
+                .first()
+                .map(|d| self.tile_paint_ratio(d, tile_area.width, tile_area.height) > 0.9)
+                .unwrap_or(false);
+            let batch_matches = batch
+                .data
+                .iter()
+                .zip(batch_rects.iter())
+                .all(|(d, r)| self.tile_matches_full(d, &via_getimage, r.x, r.y, r.width, r.height));
             Ok(VerifyReport {
                 bytes: via_shm.len(),
                 painted_getimage: self.paint_ratio(&via_getimage, g.x, g.y, g.width, g.height),
@@ -622,6 +787,10 @@ impl X11Screen {
                 shm_ms: timing.total_ms(),
                 tile_ms: tile_timing.total_ms(),
                 tile_bytes: tile.len(),
+                tiles_batch_matches: batch_matches,
+                tiles_batch_painted: batch_painted,
+                tiles_batch_ms: batch_ms,
+                tiles_batch_bytes: batch_bytes,
             })
         })();
 

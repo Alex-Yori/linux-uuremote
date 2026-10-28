@@ -22,7 +22,9 @@
 
 mod capture;
 mod content;
+mod diff;
 mod gating;
+mod scan;
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -30,7 +32,9 @@ use std::time::{Duration, Instant};
 use capture::DirtyArea;
 use capture::x11::{DamageLevel, GrabTiming, X11Screen};
 use content::ContentChange;
+use diff::{BlockGrid, dirty_blocks, merge_blocks};
 use gating::{Action, FrameDropper, GateConfig};
+use scan::{SampleGrid, changed_cells, splice_reference};
 
 struct Args {
     display: Option<String>,
@@ -44,6 +48,21 @@ struct Args {
     dirty: bool,
     /// Drive the gate from the content check instead of XDamage reports.
     content_gate: bool,
+    /// Incremental capture: cheap sample scan, then grab only the changed rectangles.
+    incremental: bool,
+    /// Full-frame read + exact CPU diff: measure the read+diff cost and the dirty share the
+    /// encoder would actually receive.
+    cpu_diff: bool,
+    /// Diff block size for `--cpu-diff`.
+    diff_block: (usize, usize),
+    /// Sample grid: cells across x down.
+    sample_grid: (usize, usize),
+    /// Pixels sampled per cell.
+    sample_tile: (usize, usize),
+    /// Full-frame resync interval, which bounds what a missed sample can cost.
+    resync: Duration,
+    /// Upper bound on rectangles grabbed per frame.
+    max_dirty_rects: usize,
     damage_level: DamageLevel,
     duration: Duration,
 }
@@ -59,6 +78,13 @@ fn parse_args() -> Result<Args, String> {
         verify: false,
         dirty: false,
         content_gate: false,
+        incremental: false,
+        cpu_diff: false,
+        diff_block: (64, 64),
+        sample_grid: (32, 18),
+        sample_tile: (8, 8),
+        resync: Duration::from_millis(1000),
+        max_dirty_rects: 8,
         // Bounding-box reports are what a dirty-rect grab needs; the reference implementation
         // uses NonEmpty, so `--damage-level nonempty` compares against that.
         damage_level: DamageLevel::BoundingBox,
@@ -89,6 +115,13 @@ fn parse_args() -> Result<Args, String> {
             "--verify" => args.verify = true,
             "--dirty" => args.dirty = true,
             "--content-gate" => args.content_gate = true,
+            "--incremental" => args.incremental = true,
+            "--cpu-diff" => args.cpu_diff = true,
+            "--diff-block" => args.diff_block = parse_size(&next(), args.diff_block),
+            "--sample-grid" => args.sample_grid = parse_size(&next(), args.sample_grid),
+            "--sample-tile" => args.sample_tile = parse_size(&next(), args.sample_tile),
+            "--resync-ms" => args.resync = Duration::from_millis(next().parse().unwrap_or(1000)),
+            "--max-dirty-rects" => args.max_dirty_rects = next().parse().unwrap_or(8),
             "--damage-level" => match next().as_str() {
                 "nonempty" => args.damage_level = DamageLevel::NonEmpty,
                 "bbox" => args.damage_level = DamageLevel::BoundingBox,
@@ -99,7 +132,10 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "usage: uu-capture-probe [--display :1] [--fps 60] [--still-fps 3] \
                      [--still-after-ms 1000] [--secs 20] [--baseline] [--no-read] [--verify] \
-                     [--dirty] [--content-gate] [--damage-level bbox|nonempty|raw]"
+                     [--dirty] [--content-gate] [--incremental] [--cpu-diff] [--diff-block 64x64] \
+                     [--sample-grid 32x18] \
+                     [--sample-tile 8x8] [--resync-ms 1000] [--max-dirty-rects 8] \
+                     [--damage-level bbox|nonempty|raw]"
                 );
                 std::process::exit(0);
             }
@@ -111,6 +147,17 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
     Ok(args)
+}
+
+/// Parse `WxH` into a pair, keeping `default` when the text is malformed.
+fn parse_size(text: &str, default: (usize, usize)) -> (usize, usize) {
+    let Some((w, h)) = text.split_once('x') else {
+        return default;
+    };
+    match (w.trim().parse::<usize>(), h.trim().parse::<usize>()) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h),
+        _ => default,
+    }
 }
 
 /// Union bounding box of the dirty reports seen in one round — the `dirty_bbox` the
@@ -128,6 +175,364 @@ fn merge_bbox(current: Option<DirtyArea>, area: DirtyArea) -> DirtyArea {
         width: (right - x) as u16,
         height: (bottom - y) as u16,
     }
+}
+
+/// Incremental capture: a cheap sample scan decides which rectangles to grab.
+///
+/// A full grab makes the X server write the whole screen (14.7 MB / ~6 ms here). Instead this
+/// samples a few hundred small tiles — a fraction of that — compares them against the frame we
+/// already hold, and grabs only the merged rectangles around cells that differ, then splices
+/// them back into the reference.
+///
+/// A periodic full resync does two jobs: it refreshes the reference so drift cannot
+/// accumulate, and its block diff against the spliced reference measures what the sparse
+/// samples missed. That missed share is the number to watch when tuning `--sample-grid`: it is
+/// the cost of sampling cheaply, expressed in stale pixels per second.
+fn run_incremental(args: &Args, screen: &mut X11Screen, cfg: GateConfig) -> Result<(), Box<dyn Error>> {
+    let (w, h) = (screen.width() as usize, screen.height() as usize);
+    let bpp = screen.bytes_per_pixel();
+    let full_px = (w * h) as u64;
+
+    let grid = SampleGrid::new(w, h, args.sample_grid.0, args.sample_grid.1, args.sample_tile.0, args.sample_tile.1);
+    let sample_rects: Vec<DirtyArea> = (0..grid.count())
+        .filter_map(|i| grid.sample_rect(i))
+        .map(|(x, y, rw, rh)| DirtyArea {
+            x: x as i16,
+            y: y as i16,
+            width: rw as u16,
+            height: rh as u16,
+        })
+        .collect();
+    let sample_px: u64 = sample_rects.iter().map(|r| r.pixels()).sum();
+    // The resync diff uses the same cell size, so misses are counted in cells too.
+    let cell_grid = BlockGrid::for_screen(w, h, grid.cells.block_w, grid.cells.block_h);
+
+    println!(
+        "incremental cells={}x{} sample_tile={}x{} scan={} px ({:.2}% of a frame) resync_ms={} \
+         max_rects={}",
+        grid.cells.cols,
+        grid.cells.rows,
+        grid.sample_w,
+        grid.sample_h,
+        sample_px,
+        100.0 * sample_px as f64 / full_px as f64,
+        args.resync.as_millis(),
+        args.max_dirty_rects,
+    );
+
+    // The reference frame is what samples and tiles are compared against; the first frame has
+    // to be complete, so it is a full grab.
+    let (mut reference, first) = screen.grab_rect(None)?;
+    println!(
+        "first full frame: {} px in {:.1} ms ({})",
+        reference.len() / bpp,
+        first.total_ms(),
+        if args.read { "read" } else { "skipped" },
+    );
+
+    let mut dropper = FrameDropper::new(cfg);
+    let start = Instant::now();
+    let mut window_start = start;
+    let mut last_resync = start;
+
+    let mut total_emits: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_dirty_px: u64 = 0;
+    let mut total_resync: u64 = 0;
+    let mut total_missed_px: u64 = 0;
+    let mut total_scans: u64 = 0;
+    let mut total_scan_px: u64 = 0;
+    let mut total_keep: u64 = 0;
+    let mut w_scans: u64 = 0;
+    let mut w_scan_ms: f64 = 0.0;
+    let mut w_scan_px: u64 = 0;
+    let mut w_emits: u64 = 0;
+    let mut w_rects: u64 = 0;
+    let mut w_dirty_px: u64 = 0;
+    let mut w_tiles_ms: f64 = 0.0;
+    let mut w_bytes: u64 = 0;
+    let mut w_keep: u64 = 0;
+    let mut w_damage: u64 = 0;
+    let mut w_cursor: u64 = 0;
+    let mut w_resync: u64 = 0;
+    let mut w_resync_ms: f64 = 0.0;
+    let mut w_missed_px: u64 = 0;
+    let mut scan_via_shm = false;
+
+    while start.elapsed() < args.duration {
+        let now = Instant::now();
+
+        // Damage and cursor reports are still drained: damage is a hint we no longer trust for
+        // geometry, and cursor motion has to keep the gate in its moving regime even though our
+        // grabbed pixels do not contain the cursor.
+        for _ in screen.poll_events()? {
+            w_damage += 1;
+        }
+        let cursor_moved = screen.poll_cursor()?.is_some();
+        if cursor_moved {
+            w_cursor += 1;
+        }
+
+        let mut changed: Vec<usize> = Vec::new();
+        if args.read {
+            let scan = screen.grab_tiles(&sample_rects)?;
+            scan_via_shm = scan.via_shm;
+            w_scans += 1;
+            w_scan_ms += scan.ms;
+            w_scan_px += scan.bytes as u64 / bpp as u64;
+            changed = changed_cells(&reference, &scan.data, &grid, w, bpp);
+        }
+        if !changed.is_empty() || cursor_moved || args.baseline {
+            dropper.note_change(now);
+        }
+
+        match dropper.decide(now) {
+            Action::Capture => {
+                let rects = merge_blocks(&changed, &grid.cells, args.max_dirty_rects);
+                if rects.is_empty() {
+                    // Nothing visible changed; a cursor-only motion produces no pixel work here
+                    // because the cursor is drawn by the server, not part of the grabbed image.
+                    continue;
+                }
+                let areas: Vec<DirtyArea> = rects
+                    .iter()
+                    .map(|&(x, y, rw, rh)| DirtyArea {
+                        x: x as i16,
+                        y: y as i16,
+                        width: rw as u16,
+                        height: rh as u16,
+                    })
+                    .collect();
+                let grab = screen.grab_tiles(&areas)?;
+                let written = splice_reference(&mut reference, w, bpp, &rects, &grab.data);
+                if written != grab.bytes {
+                    return Err(format!(
+                        "spliced {written} of {} tile bytes into the reference",
+                        grab.bytes
+                    )
+                    .into());
+                }
+                w_emits += 1;
+                w_rects += rects.len() as u64;
+                w_dirty_px += rects.iter().map(|(_, _, rw, rh)| (rw * rh) as u64).sum::<u64>();
+                w_tiles_ms += grab.ms;
+                w_bytes += grab.bytes as u64;
+            }
+            Action::Keepalive => w_keep += 1,
+            Action::Idle => {}
+        }
+
+        // Periodic full frame: refreshes the reference and measures what the samples missed.
+        if args.read && now.duration_since(last_resync) >= args.resync {
+            let (frame, timing) = screen.grab_rect(None)?;
+            let missed = dirty_blocks(&reference, &frame, w, bpp, &cell_grid);
+            w_resync += 1;
+            w_resync_ms += timing.total_ms();
+            w_missed_px += missed
+                .iter()
+                .filter_map(|i| cell_grid.rect(*i))
+                .map(|(_, _, rw, rh)| (rw * rh) as u64)
+                .sum::<u64>();
+            w_bytes += frame.len() as u64;
+            reference = frame;
+            last_resync = now;
+        }
+
+        if now.duration_since(window_start) >= Duration::from_secs(2) {
+            let dt = now.duration_since(window_start).as_secs_f64().max(1e-6);
+            let scans = w_scans.max(1) as f64;
+            let emits = w_emits.max(1) as f64;
+            let resyncs = w_resync.max(1) as f64;
+            println!(
+                "t={:5.1}s state={:<7} scan_shm={} scan_fps={:6.1} scan_ms={:6.2} scan_share={:6.4} \
+                 emit_fps={:6.1} rects_per_frame={:5.2} dirty_share={:6.4} tiles_ms={:6.2} \
+                 read_mb_s={:7.1} resync_fps={:5.2} resync_ms={:6.1} missed_share={:6.4} \
+                 damage_ev_s={:6.1} cursor_ev_s={:6.1} keepalive_fps={:6.1}",
+                now.duration_since(start).as_secs_f64(),
+                if dropper.is_moving() { "moving" } else { "still" },
+                scan_via_shm,
+                w_scans as f64 / dt,
+                w_scan_ms / scans,
+                w_scan_px as f64 / scans / full_px as f64,
+                w_emits as f64 / dt,
+                w_rects as f64 / emits,
+                w_dirty_px as f64 / emits / full_px as f64,
+                w_tiles_ms / emits,
+                w_bytes as f64 / dt / (1024.0 * 1024.0),
+                w_resync as f64 / dt,
+                w_resync_ms / resyncs,
+                w_missed_px as f64 / resyncs / full_px as f64,
+                w_damage as f64 / dt,
+                w_cursor as f64 / dt,
+                w_keep as f64 / dt,
+            );
+            total_emits += w_emits;
+            total_bytes += w_bytes;
+            total_dirty_px += w_dirty_px;
+            total_resync += w_resync;
+            total_missed_px += w_missed_px;
+            total_scans += w_scans;
+            total_scan_px += w_scan_px;
+            total_keep += w_keep;
+            for c in [
+                &mut w_scans,
+                &mut w_scan_px,
+                &mut w_emits,
+                &mut w_rects,
+                &mut w_dirty_px,
+                &mut w_bytes,
+                &mut w_keep,
+                &mut w_damage,
+                &mut w_cursor,
+                &mut w_resync,
+                &mut w_missed_px,
+            ] {
+                *c = 0;
+            }
+            w_scan_ms = 0.0;
+            w_tiles_ms = 0.0;
+            w_resync_ms = 0.0;
+            window_start = now;
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let secs = start.elapsed().as_secs_f64().max(1e-6);
+    println!(
+        "SUMMARY mode=incremental emits={} emit_fps={:.2} dirty_share={:.4} scans={} \
+         scan_fps={:.2} scan_share={:.4} resyncs={} resync_fps={:.2} missed_share={:.4} \
+         keepalives={} read_mb_s={:.2} (full-screen capture measured ~840 MB/s at 60 fps)",
+        total_emits,
+        total_emits as f64 / secs,
+        total_dirty_px as f64 / total_emits.max(1) as f64 / full_px as f64,
+        total_scans,
+        total_scans as f64 / secs,
+        total_scan_px as f64 / total_scans.max(1) as f64 / full_px as f64,
+        total_resync,
+        total_resync as f64 / secs,
+        total_missed_px as f64 / total_resync.max(1) as f64 / full_px as f64,
+        total_keep,
+        total_bytes as f64 / secs / (1024.0 * 1024.0),
+    );
+    Ok(())
+}
+
+/// Full-frame read plus an exact CPU diff, to decide where the work actually belongs.
+///
+/// A 2560x1440 SHM grab costs ~7 ms and a whole-frame byte diff costs a few more, so reading
+/// the entire screen fits a 60 fps budget without any hunting for dirty areas. What dirty
+/// rectangles buy is not the read but the *encoder* input, so this mode reports the pixel share
+/// the encoder would receive. If that share is small, dirty rects are worth their complexity;
+/// if it is large, they are not.
+fn run_cpu_diff(args: &Args, screen: &mut X11Screen) -> Result<(), Box<dyn Error>> {
+    let (w, h) = (screen.width() as usize, screen.height() as usize);
+    let bpp = screen.bytes_per_pixel();
+    let full_px = (w * h) as u64;
+    let grid = BlockGrid::for_screen(w, h, args.diff_block.0, args.diff_block.1);
+    println!(
+        "cpu-diff blocks={}x{} cells={}x{}={} cap_rects={}",
+        args.diff_block.0,
+        args.diff_block.1,
+        grid.cols,
+        grid.rows,
+        grid.count(),
+        args.max_dirty_rects,
+    );
+
+    let (mut reference, first) = screen.grab_rect(None)?;
+    println!(
+        "first frame {} px in {:.1} ms ({})",
+        reference.len() / bpp,
+        first.total_ms(),
+        if args.read { "read" } else { "skipped" },
+    );
+
+    let start = Instant::now();
+    let mut window_start = start;
+
+    let mut w_grabs: u64 = 0;
+    let mut w_grab_ms: f64 = 0.0;
+    let mut w_diff_ms: f64 = 0.0;
+    let mut w_rects: u64 = 0;
+    let mut w_dirty_px: u64 = 0;
+    let mut w_bytes: u64 = 0;
+    let mut w_damage: u64 = 0;
+    let mut t_grabs: u64 = 0;
+    let mut t_rects: u64 = 0;
+    let mut t_dirty_px: u64 = 0;
+    let mut t_bytes: u64 = 0;
+
+    while start.elapsed() < args.duration {
+        for _ in screen.poll_events()? {
+            w_damage += 1;
+        }
+
+        let (frame, timing) = screen.grab_rect(None)?;
+        let t0 = Instant::now();
+        let blocks = dirty_blocks(&reference, &frame, w, bpp, &grid);
+        let rects = merge_blocks(&blocks, &grid, args.max_dirty_rects);
+        let diff_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        w_bytes += frame.len() as u64;
+        reference = frame;
+
+        w_grabs += 1;
+        w_grab_ms += timing.total_ms();
+        w_diff_ms += diff_ms;
+        w_rects += rects.len() as u64;
+        w_dirty_px += rects.iter().map(|(_, _, rw, rh)| (rw * rh) as u64).sum::<u64>();
+
+        if window_start.elapsed() >= Duration::from_secs(2) {
+            let dt = window_start.elapsed().as_secs_f64().max(1e-6);
+            let grabs = w_grabs.max(1) as f64;
+            println!(
+                "t={:5.1}s grab_fps={:6.1} grab_ms={:6.2} diff_ms={:6.2} loop_ms={:6.2} \
+                 rects_per_frame={:5.2} dirty_share={:6.4} read_mb_s={:7.1} encode_mb_s={:7.1} \
+                 damage_ev_s={:6.1}",
+                start.elapsed().as_secs_f64(),
+                w_grabs as f64 / dt,
+                w_grab_ms / grabs,
+                w_diff_ms / grabs,
+                (w_grab_ms + w_diff_ms) / grabs,
+                w_rects as f64 / grabs,
+                w_dirty_px as f64 / grabs / full_px as f64,
+                w_bytes as f64 / dt / (1024.0 * 1024.0),
+                w_dirty_px as f64 / dt * bpp as f64 / (1024.0 * 1024.0),
+                w_damage as f64 / dt,
+            );
+            t_grabs += w_grabs;
+            t_rects += w_rects;
+            t_dirty_px += w_dirty_px;
+            t_bytes += w_bytes;
+            w_grabs = 0;
+            w_rects = 0;
+            w_dirty_px = 0;
+            w_bytes = 0;
+            w_damage = 0;
+            w_grab_ms = 0.0;
+            w_diff_ms = 0.0;
+            window_start = Instant::now();
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let secs = start.elapsed().as_secs_f64().max(1e-6);
+    let grabs = t_grabs.max(1) as f64;
+    println!(
+        "SUMMARY mode=cpu-diff grabs={} grab_fps={:.2} dirty_share={:.4} rects_total={} \
+         rects_per_frame={:.2} encode_mb_s={:.2} read_mb_s={:.2} \
+         (full-frame encoder input would be {:.0} MB/s)",
+        t_grabs,
+        t_grabs as f64 / secs,
+        t_dirty_px as f64 / grabs / full_px as f64,
+        t_rects,
+        t_rects as f64 / grabs,
+        t_dirty_px as f64 / secs * bpp as f64 / (1024.0 * 1024.0),
+        t_bytes as f64 / secs / (1024.0 * 1024.0),
+        full_px as f64 * bpp as f64 / (1024.0 * 1024.0) * (t_grabs as f64 / secs),
+    );
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -180,10 +585,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         verify_ok = v.painted_shm > 0.9
             && v.painted_tile > 0.9
             && v.rect_identical > 0.9
-            && v.painted_changed > 0.5;
+            && v.painted_changed > 0.5
+            && v.tiles_batch_painted;
         println!(
             "VERIFY bytes={} painted_getimage={:.3} painted_shm={:.3} painted_tile={:.3} \
              tile_matches_full={} rect_identical={:.3} painted_changed={:.3} frame_identical={} \
+             batch_painted={} batch_matches_full={} batch_ms={:.2} batch_bytes={} \
              rect=({},{},{},{}) full_ms={:.1} tile_ms={:.1} tile_bytes={} -> {}",
             v.bytes,
             v.painted_getimage,
@@ -193,6 +600,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             v.rect_identical,
             v.painted_changed,
             v.frame_identical,
+            v.tiles_batch_painted,
+            v.tiles_batch_matches,
+            v.tiles_batch_ms,
+            v.tiles_batch_bytes,
             v.rect.0,
             v.rect.1,
             v.rect.2,
@@ -202,6 +613,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             v.tile_bytes,
             if verify_ok { "PASS" } else { "FAIL" },
         );
+    }
+
+    if args.cpu_diff && args.read {
+        return run_cpu_diff(&args, &mut screen);
+    }
+
+    // Incremental mode replaces the capture loop entirely: it needs its own reference frame,
+    // sample scan and resync accounting, so it is kept separate rather than bolted onto this
+    // loop's branches. It runs after verification so the batch path is proven first.
+    if args.incremental && args.read {
+        return run_incremental(&args, &mut screen, cfg);
     }
 
     let start = Instant::now();

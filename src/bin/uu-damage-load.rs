@@ -6,7 +6,7 @@
 //! dirty-rect vs full-screen comparison unreproducible.
 //!
 //! Usage:
-//!   uu-damage-load [--display :1] [--secs 20] [--window 320x240] [--rect 64x48]
+//!   uu-damage-load [--display :1] [--secs 20] [--window 320x240] [--rect 64x48] [--fps 30]
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut secs = 20u64;
     let mut window = (320u16, 240u16);
     let mut rect = (64u16, 48u16);
+    let mut fps = 30f64;
 
     let mut i = 1usize;
     while i < argv.len() {
@@ -46,9 +47,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--secs" => secs = next().parse().unwrap_or(20),
             "--window" => window = parse_size(&next(), window),
             "--rect" => rect = parse_size(&next(), rect),
+            "--fps" => fps = next().parse().unwrap_or(30.0),
             "--help" | "-h" => {
                 println!(
-                    "usage: uu-damage-load [--display :1] [--secs 20] [--window 320x240] [--rect 64x48]"
+                    "usage: uu-damage-load [--display :1] [--secs 20] [--window 320x240] [--rect 64x48] \
+                     [--fps 30]"
                 );
                 return Ok(());
             }
@@ -94,7 +97,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // in different places rather than redrawing one fixed spot.
     let step_x = 8u16;
     let columns = ((window.0 - rect.0) / step_x).max(1) as u64;
-    let period = Duration::from_millis(30);
+    let period = Duration::from_secs_f64(1.0 / fps.max(1.0));
     let started = Instant::now();
     let mut frame = 0u64;
 
