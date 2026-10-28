@@ -164,6 +164,10 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 got = sig.recv() => match got {
                     Ok(Received::Event(name, payload)) => {
                         let v = payload.unwrap_or(Value::Null);
+                        // 全量信令事件日志：第一次点连不上、要连十多秒这类问题的根因就在
+                        // 「客户端到底发了什么」——未知事件不能静默吞掉。
+                        let kind = v.get("type").and_then(Value::as_str).unwrap_or("-");
+                        println!("   信令事件：{name} type={kind}");
                         match name.as_str() {
                             signaling::EVENT_SOAC => forward_soac(&sig_tx, v),
                             signaling::EVENT_BE_CONTROLLED => { let _ = sig_tx.send(Signal::BeControlled { header: v, capture_type: 0 }); }
@@ -171,7 +175,11 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             _ => {}
                         }
                     }
-                    Ok(Received::Ack(_id, v)) => { let _ = sig_tx.send(Signal::IceServers(v)); }
+                    Ok(Received::Ack(id, v)) => {
+                        let brief = v.to_string();
+                        println!("   信令 ack id={id}：{}", &brief[..brief.len().min(120)]);
+                        let _ = sig_tx.send(Signal::IceServers(v));
+                    }
                     Ok(Received::BinaryEvent(name, header, attachments)) => {
                         // be-controlled 的关键信息在附件的 protobuf 里：field 1 = 采集目标
                         // （0 未知 / 1 桌面 / 2 窗口 / 5 文件 / 8 终端 / 9 端口映射）。
@@ -296,7 +304,10 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 }
                 Some(PeerEvent::ControlData { label, data }) => {
                     if label != CONTROL_LABEL {
-                        println!("   非 CONTROL 通道消息（{label}）：{} 字节", data.len());
+                        // Windows 客户端的键盘可能走 TEXT_DATA_CHANNEL 而不是 CONTROL：
+                        // 打出前 48 字节，看它到底在哪个通道、什么格式。
+                        let head: String = data.iter().take(48).map(|b| format!("{b:02x}")).collect();
+                        println!("   非 CONTROL 通道（{label}）：{} 字节 head={head}", data.len());
                     } else if let Some(session) = session.as_mut() {
                         handle_control(&data, session, &settings).await;
                     }
@@ -442,13 +453,20 @@ async fn handle_control(
             };
             // X 调用是阻塞的，别摁在事件循环里。
             let message = message.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let summary = linux_uuremote::control::input_summary_of(&message);
+            let result = tokio::task::spawn_blocking(move || {
                 let mut engine = input.lock().unwrap();
-                if let Err(e) = engine.apply(&message) {
-                    eprintln!("   注入失败：{e}");
-                }
+                engine.apply(&message)
             })
             .await;
+            match result {
+                // Ok(false) = 这条事件一个 X 事件都没产生（最常见：VK 码映射不到 keycode）。
+                // 键盘「按了没反应」就是这个，必须打出来。
+                Ok(Ok(false)) => println!("   注入空结果：{summary}（映射不到键位？）"),
+                Ok(Err(e)) => eprintln!("   注入失败：{e}"),
+                Err(e) => eprintln!("   注入任务崩了：{e}"),
+                Ok(Ok(true)) => {}
+            }
         }
     }
 }
