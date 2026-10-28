@@ -1,10 +1,10 @@
-# uu-remote-linux（重写版）
+# linux-uuremote
 
 网易 **UU 远程** 的 Linux **被控端**，从零写的独立实现。
 
 不是 [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) 的 fork——那个项目当**参照物**读，代码一行没搬。设计依据是从 UU 官方安卓被控端引擎里逆向出来的行为规格（见 [docs/SPEC.md](docs/SPEC.md)），目标是让官方 Windows / macOS / 安卓客户端把这台 Linux 当普通被控端连，行为对齐官方端。
 
-> **名字提醒**：本机现在跑着的那个参照实现，可执行文件也叫 `uu-remote-linux`（`uuremote-native.service`）。本项目目录同名，但产物叫 `uu-capture-probe`（后续宿主 daemon 会另起名字），不会互相撞。
+> **命名**：`linux-uuremote` 刻意区别于本机正在跑的参照实现（其可执行文件也叫 `uu-remote-linux`，由 `uuremote-native.service` 拉起），避免目录、包名、进程名三者混淆。本项目当前产物叫 `uu-capture-probe`，宿主 daemon 将来叫 `uuremote-host`。
 
 ## 当前状态
 

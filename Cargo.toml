@@ -1,5 +1,5 @@
 [package]
-name = "uu-remote-linux"
+name = "linux-uuremote"
 version = "0.1.0"
 edition = "2021"
 description = "独立的 UU 远程 Linux 被控端：按逆向得到的行为重写，不是别人的 fork 分支"
