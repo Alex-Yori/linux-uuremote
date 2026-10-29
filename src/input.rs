@@ -142,7 +142,13 @@ pub fn keysym_for_char(ch: char) -> Keysym {
 ///
 /// `pointer` 是当前指针位置（绝对事件会更新它）。认不出的按钮返回空序列——
 /// 丢事件比注入错键好。
-pub fn plan_pointer_events(message: &ControlMessage, width: u32, height: u32, pointer: &mut (i32, i32)) -> Vec<XTestEvent> {
+pub fn plan_pointer_events(
+    message: &ControlMessage,
+    width: u32,
+    height: u32,
+    pointer: &mut (i32, i32),
+    scroll_remainder: &mut [i32; 2],
+) -> Vec<XTestEvent> {
     let (px, py) = *pointer;
     let ControlMessage::Input(input) = message else { return Vec::new() };
     match input {
@@ -169,9 +175,23 @@ pub fn plan_pointer_events(message: &ControlMessage, width: u32, height: u32, po
             None => Vec::new(),
         },
         crate::control::ControlInput::MouseScroll { dx, dy } => {
+            // delta 单位是 Windows wheel notch = 120（官方 Mac 客户端同一单位；
+            // 触控板的小 delta 靠累加攒满一格才发）。曾经把 delta 当"点击格数"直接
+            // 循环，一格 120 被放大成 20 次按钮事件 → 用户「滚一格滑一大屏」。
             let mut out = Vec::new();
-            for (delta, button) in [(*dy, WHEEL_UP), (-*dy, WHEEL_DOWN), (*dx, WHEEL_RIGHT), (-*dx, WHEEL_LEFT)] {
-                for _ in 0..delta.min(SCROLL_REPEAT_CAP).max(0) {
+            for (axis, delta, positive, negative) in [(0, *dy, WHEEL_UP, WHEEL_DOWN), (1, *dx, WHEEL_RIGHT, WHEEL_LEFT)] {
+                let rem = scroll_remainder[axis];
+                let total = rem + delta;
+                let mut notches = (total / 120).clamp(-SCROLL_REPEAT_CAP, SCROLL_REPEAT_CAP);
+                if notches == 0 && delta != 0 && total * rem < 0 && delta.abs() >= rem.abs() {
+                    // 反向 delta 攒过零点：立刻发一格反向事件（触控板来回滚不憋方向）。
+                    notches = delta.signum();
+                }
+                // 余量只保留不满一格的部分：限流砍掉的量直接丢弃，否则一次快速滚动
+                // 会把几千点欠账攒着，之后每帧都补发一格，一直滑个不停。
+                scroll_remainder[axis] = (total % 120).clamp(-119, 119);
+                let button = if notches > 0 { positive } else { negative };
+                for _ in 0..notches.unsigned_abs() {
                     out.push(XTestEvent::button(BUTTONPRESS, button, px, py));
                     out.push(XTestEvent::button(BUTTONRELEASE, button, px, py));
                 }
@@ -192,6 +212,10 @@ pub struct X11Input {
     height: u32,
     keymap: Keymap,
     pointer: (i32, i32),
+    /// 不满一格的滚动余量（单位 120/notch）。触控板小 delta 攒满 120 才发一次按钮，
+    /// 大 delta 按整格换算——方向翻转时余量自然抵消。
+    /// 两轴各自的滚动余量 [竖直, 水平]（单位 120/notch）。
+    scroll_remainder: [i32; 2],
     /// 已注入但客户端还没松开的鼠标按键（X11 按钮序号），会话结束时统一松开。
     held_buttons: Vec<u8>,
     held_keys: Vec<u8>,
@@ -217,6 +241,7 @@ impl X11Input {
             height: u32::from(screen.height_in_pixels),
             keymap,
             pointer,
+            scroll_remainder: [0, 0],
             held_buttons: Vec::new(),
             held_keys: Vec::new(),
             keyboard: match crate::uinput::Keyboard::open() {
@@ -263,9 +288,9 @@ impl X11Input {
                         self.held_buttons.retain(|&c| c != b);
                     }
                 }
-                plan_pointer_events(message, self.width, self.height, &mut self.pointer)
+                plan_pointer_events(message, self.width, self.height, &mut self.pointer, &mut self.scroll_remainder)
             }
-            other => plan_pointer_events(other, self.width, self.height, &mut self.pointer),
+            other => plan_pointer_events(other, self.width, self.height, &mut self.pointer, &mut self.scroll_remainder),
         };
         if events.is_empty() {
             return Ok(false);
@@ -366,7 +391,8 @@ mod tests {
     #[test]
     fn absolute_move_updates_pointer_and_is_absolute() {
         let mut p = (10, 10);
-        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":1.0,"abs_y":1.0}"#), 1920, 1080, &mut p);
+        let mut rem = [0i32; 2];
+        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":1.0,"abs_y":1.0}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(ev, vec![XTestEvent { type_: MOTIONNOTIFY, detail: POINTER_MOVE_ABSOLUTE, x: 1919, y: 1079 }]);
         assert_eq!(p, (1919, 1079));
     }
@@ -374,7 +400,8 @@ mod tests {
     #[test]
     fn relative_move_is_relative_delta() {
         let mut p = (100, 200);
-        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_move_relative","delta_x":-30,"delta_y":7}"#), 1920, 1080, &mut p);
+        let mut rem = [0i32; 2];
+        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_move_relative","delta_x":-30,"delta_y":7}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(ev, vec![XTestEvent { type_: MOTIONNOTIFY, detail: POINTER_MOVE_RELATIVE, x: -30, y: 7 }]);
         assert_eq!(p, (70, 207));
     }
@@ -383,26 +410,29 @@ mod tests {
     fn pixel_space_absolute_maps_to_screen() {
         // Windows 客户端发像素：1.4/0.5 混合空间按像素解释并夹到屏内。
         let mut p = (42, 42);
-        let events = plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":600.0,"abs_y":900.0}"#), 1920, 1080, &mut p);
+        let mut rem = [0i32; 2];
+        let events = plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":600.0,"abs_y":900.0}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(events.len(), 1);
         assert_eq!(p, (600, 900));
-        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":-1.0,"abs_y":0.5}"#), 1920, 1080, &mut p).is_empty());
+        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_move_absolute","abs_x":-1.0,"abs_y":0.5}"#), 1920, 1080, &mut p, &mut rem).is_empty());
     }
 
     #[test]
     fn button_bitmask_press_release_use_current_position() {
         let mut p = (300, 400);
-        let press = plan_pointer_events(&msg(r#"{"action":"mouse_press","button":2}"#), 1920, 1080, &mut p);
+        let mut rem = [0i32; 2];
+        let press = plan_pointer_events(&msg(r#"{"action":"mouse_press","button":2}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(press, vec![XTestEvent { type_: BUTTONPRESS, detail: 3, x: 300, y: 400 }]);
-        let release = plan_pointer_events(&msg(r#"{"action":"mouse_release","button":2}"#), 1920, 1080, &mut p);
+        let release = plan_pointer_events(&msg(r#"{"action":"mouse_release","button":2}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(release, vec![XTestEvent { type_: BUTTONRELEASE, detail: 3, x: 300, y: 400 }]);
-        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_press","button":9}"#), 1920, 1080, &mut p).is_empty());
+        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_press","button":9}"#), 1920, 1080, &mut p, &mut rem).is_empty());
     }
 
     #[test]
     fn click_is_press_then_release() {
         let mut p = (0, 0);
-        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_click","button":1}"#), 1920, 1080, &mut p);
+        let mut rem = [0i32; 2];
+        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_click","button":1}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(ev, vec![
             XTestEvent { type_: BUTTONPRESS, detail: 1, x: 0, y: 0 },
             XTestEvent { type_: BUTTONRELEASE, detail: 1, x: 0, y: 0 },
@@ -410,32 +440,42 @@ mod tests {
     }
 
     #[test]
-    fn scroll_becomes_wheel_button_pairs_and_is_capped() {
+    fn wheel_delta_is_windows_notches_of_120_with_accumulating_remainder() {
+        // 官方客户端一格里 = 120；直接当"格数"会把一格放大成几十次按钮（滚一格滑一大屏）。
         let mut p = (5, 5);
-        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":2}"#), 1920, 1080, &mut p);
-        assert_eq!(ev.len(), 4);
-        assert_eq!(ev[0], XTestEvent { type_: BUTTONPRESS, detail: WHEEL_UP, x: 5, y: 5 });
-        assert_eq!(ev[1], XTestEvent { type_: BUTTONRELEASE, detail: WHEEL_UP, x: 5, y: 5 });
-        assert_eq!(ev[2], XTestEvent { type_: BUTTONPRESS, detail: WHEEL_UP, x: 5, y: 5 });
-        let down = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":-1}"#), 1920, 1080, &mut p);
-        assert_eq!(down[0].detail, WHEEL_DOWN);
-        let capped = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":1000}"#), 1920, 1080, &mut p);
-        assert_eq!(capped.len(), 2 * SCROLL_REPEAT_CAP as usize);
-        let zero = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":0}"#), 1920, 1080, &mut p);
-        assert!(zero.is_empty());
+        let mut rem = [0i32; 2];
+        let one = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":120}"#), 1920, 1080, &mut p, &mut rem);
+        assert_eq!(one.len(), 2, "一格 = 一次 press+release");
+        assert_eq!(one[0], XTestEvent { type_: BUTTONPRESS, detail: WHEEL_UP, x: 5, y: 5 });
+        assert_eq!(rem, [0, 0]);
+        // 触控板小 delta：攒不满一格不发，攒满即发。
+        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":2}"#), 1920, 1080, &mut p, &mut rem).is_empty());
+        assert_eq!(rem, [2, 0]);
+        let filled = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":118}"#), 1920, 1080, &mut p, &mut rem);
+        assert_eq!(filled.len(), 2, "2 + 118 = 120 → 恰好一格");
+        assert_eq!(rem, [0, 0]);
+        // 方向翻转：余量抵消，不会两个方向都抖。
+        assert!(plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":40}"#), 1920, 1080, &mut p, &mut rem).is_empty());
+        let back = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":-70}"#), 1920, 1080, &mut p, &mut rem);
+        assert_eq!(back[0].detail, WHEEL_DOWN);
+        assert_eq!(rem, [-30, 0]);
+        let capped = plan_pointer_events(&msg(r#"{"action":"mouse_scroll","delta_x":0,"delta_y":8400}"#), 1920, 1080, &mut p, &mut rem);
+        assert_eq!(capped.len(), 2 * SCROLL_REPEAT_CAP as usize, "快速滚动有上限");
     }
 
     #[test]
     fn heartbeat_and_unknown_inject_nothing() {
         let mut p = (1, 1);
-        assert!(plan_pointer_events(&msg(r#"{"heartbeat":"kbd_heartbeat"}"#), 1920, 1080, &mut p).is_empty());
-        assert!(plan_pointer_events(&msg(r#"{"action":"whatever"}"#), 1920, 1080, &mut p).is_empty());
+        let mut rem = [0i32; 2];
+        assert!(plan_pointer_events(&msg(r#"{"heartbeat":"kbd_heartbeat"}"#), 1920, 1080, &mut p, &mut rem).is_empty());
+        assert!(plan_pointer_events(&msg(r#"{"action":"whatever"}"#), 1920, 1080, &mut p, &mut rem).is_empty());
     }
 
     #[test]
     fn coordinates_are_clamped_into_i16_not_wrapped() {
         let mut p = (0, 0);
-        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_move_relative","delta_x":100000,"delta_y":-70000}"#), 1920, 1080, &mut p);
+        let mut rem = [0i32; 2];
+        let ev = plan_pointer_events(&msg(r#"{"action":"mouse_move_relative","delta_x":100000,"delta_y":-70000}"#), 1920, 1080, &mut p, &mut rem);
         assert_eq!(ev[0].x, i16::MAX);
         assert_eq!(ev[0].y, i16::MIN);
     }
@@ -454,8 +494,9 @@ mod tests {
     #[test]
     fn keyboard_actions_delegate_to_the_keymap_path() {
         let mut p = (1, 1);
-        assert!(plan_pointer_events(&msg(r#"{"action":"kbd_press","key":65}"#), 1920, 1080, &mut p).is_empty());
-        assert!(plan_pointer_events(&msg(r#"{"action":"text_input","content":"ab"}"#), 1920, 1080, &mut p).is_empty());
+        let mut rem = [0i32; 2];
+        assert!(plan_pointer_events(&msg(r#"{"action":"kbd_press","key":65}"#), 1920, 1080, &mut p, &mut rem).is_empty());
+        assert!(plan_pointer_events(&msg(r#"{"action":"text_input","content":"ab"}"#), 1920, 1080, &mut p, &mut rem).is_empty());
     }
 
     #[test]

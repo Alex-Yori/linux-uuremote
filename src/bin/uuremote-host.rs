@@ -1006,6 +1006,15 @@ fn capture_loop(
     let mut emitted = 0u64;
     let mut idr_frames = 0u64;
     let mut last_chroma = settings.chroma.load(Ordering::Relaxed);
+    // 发送端配速（官方靠 libwebrtc pacer，webrtc-rs 没有等价物）：算好的 AU 按设定
+    // 码率摊平发出。原画档 IDR 一坨几百 KB 直接灌 UDP = 瞬间几百 Mbps 微突发 →
+    // 丢包 → NACK 重传风暴 → 客户端拖窗巨卡、帧率腰斩。
+    let mut send_time = Instant::now();
+    let mut win_start = Instant::now();
+    let mut win_frames: u64 = 0;
+    let mut win_bytes: u64 = 0;
+    let mut downgraded = false;
+    let mut last_stat_frames = 0u64;
     // 软编兜底后多久允许再试 NVENC（0 = 现在就可以试）。
     let mut last_feed = Instant::now();
     let mut nvenc_retry_at = Instant::now();
@@ -1029,6 +1038,10 @@ fn capture_loop(
                 Err(e) => eprintln!("   重开采集失败：{}", e.0),
             }
             rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
+                send_time = Instant::now();
             content = ContentChange::new(width, height, 32, 18);
             timeline = RtpTimeline::new(fps);
             println!("   屏幕尺寸变化 → {}x{}（已重建编码后端，首帧 IDR）", geometry.0, geometry.1);
@@ -1037,12 +1050,18 @@ fn capture_loop(
         let want_fps = (settings.moving_fps.load(Ordering::Relaxed) as u32).max(1);
         if want_fps != fps {
             fps = want_fps;
+            // 用户重新选了档位 → 允许再做一次自适应降帧。
+            downgraded = false;
             let still = settings.still_fps.load(Ordering::Relaxed) as u32;
             gate.set_config(GateConfig { moving_fps: fps, still_fps: still, still_after: Duration::from_millis(1000) });
             planner = FramePlanner::new(fps, still);
             timeline = RtpTimeline::new(fps);
             if backend_nvenc {
                 rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
+                send_time = Instant::now();
             }
             println!("   远程改帧率 → {fps} fps");
         }
@@ -1071,6 +1090,10 @@ fn capture_loop(
             nvenc_retry_at = Instant::now() + Duration::from_secs(30);
             backend_nvenc = true;
             rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
+                send_time = Instant::now();
             if backend_nvenc {
                 println!("   重试 NVENC 成功，切回硬编");
             }
@@ -1088,9 +1111,12 @@ fn capture_loop(
         }
         if now.duration_since(last_stat) >= Duration::from_secs(5) {
             let secs = now.duration_since(last_stat).as_secs_f64().max(0.1);
+            let since_last = frames_sent - last_stat_frames;
+            last_stat_frames = frames_sent;
             println!(
-                "   出帧速率 {:.1} fps（近 5s 共 {frames_sent} 帧，后端 {}，门控 moving={}）",
-                frames_sent as f64 / secs,
+                "   出帧速率 {:.1} fps（近 {secs:.0}s 共 {since_last} 帧 ≈ {} kbps，后端 {}，门控 moving={}）",
+                since_last as f64 / secs,
+                win_bytes as f64 * 8.0 / win_start.elapsed().as_secs_f64().max(0.1) / 1000.0,
                 if backend_nvenc { "NVENC" } else { "软编" },
                 gate.is_moving()
             );
@@ -1139,12 +1165,19 @@ fn capture_loop(
                 println!("   NVENC 进程已退出（本次会话改用软编兜底，30 s 后再试硬编）");
                 planner.note_failure();
                 fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
                 nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 continue;
             }
             if keyframe.swap(false, Ordering::Relaxed) {
                 // zerolatency + 无 lookahead 的 NVENC 没法从外部塞 IDR，重启进程即首帧 IDR。
                 rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
+                send_time = Instant::now();
                 println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
             }
             // 先把已经编完的帧取走：取帧间隔直接决定端到端延迟，不能等下一次喂帧。
@@ -1154,6 +1187,7 @@ fn capture_loop(
                     Some(unit) => unit,
                     None => break,
                 };
+                let unit_len = unit.len() as u64;
                 let s0 = Instant::now();
                 if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()) }).is_err() {
                     return;
@@ -1162,6 +1196,15 @@ fn capture_loop(
                 frames_sent += 1;
                 emitted += 1;
                 drained += 1;
+                win_frames += 1;
+                win_bytes += unit_len;
+                // 配速：把这坨 AU 的传输时间摊平（官方 pacer 的等价物）。
+                let transmit = Duration::from_micros(unit_len * 8 * 1_000 / applied_bitrate.max(1_000) as u64);
+                let due = send_time + transmit;
+                if due > Instant::now() {
+                    std::thread::sleep(due - Instant::now());
+                }
+                send_time = Instant::now();
                 if emitted % 300 == 0 {
                     println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
                 }
@@ -1203,13 +1246,41 @@ fn capture_loop(
                     eprintln!("   NVENC 喂帧失败：{e}（本次会话退回软编，30 s 后再试硬编）");
                     planner.note_failure();
                     fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
                     nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 }
                 None => {
                     println!("   NVENC 管道没了（切软编）");
                     fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
                     nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 }
+            }
+            // 自适应降帧（官方二进制有同款 "adjust fps to" 逻辑）：编码器吃不下设定
+            // 帧率时，喂帧配速会按名义 fps 把帧灌进 stdin 排队——队列就是延迟和卡顿。
+            // 连续 3 s 出帧率低于设定 85% 就把配速降到实测值并重建（一次到位，不来回跳）。
+            if !downgraded && fps > 15 && win_start.elapsed() >= Duration::from_secs(3) {
+                let sustained = win_frames as f64 / win_start.elapsed().as_secs_f64().max(0.001);
+                if sustained < f64::from(fps) * 0.85 {
+                    let target = (sustained.floor() as u32).max(15).min(fps - 1);
+                    println!("   编码器出帧率 {sustained:.1} fps < 设定 {fps} fps → 配速降到 {target} fps（官方同款自适应）");
+                    fps = target;
+                    downgraded = true;
+                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
+                send_time = Instant::now();
+                }
+            }
+            if win_start.elapsed() >= Duration::from_secs(3) {
+                win_start = Instant::now();
+                win_frames = 0;
+                win_bytes = 0;
             }
             continue;
         }
