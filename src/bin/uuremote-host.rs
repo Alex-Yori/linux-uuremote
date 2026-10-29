@@ -1014,7 +1014,8 @@ fn capture_loop(
     let mut win_frames: u64 = 0;
     let mut win_bytes: u64 = 0;
     let mut downgraded = false;
-    let mut last_stat_frames = 0u64;
+    let mut downgrade_from = 0u32;
+    let mut paced = Duration::ZERO;
     // 软编兜底后多久允许再试 NVENC（0 = 现在就可以试）。
     let mut last_feed = Instant::now();
     let mut nvenc_retry_at = Instant::now();
@@ -1041,17 +1042,23 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                 send_time = Instant::now();
+                paced = Duration::ZERO;
             content = ContentChange::new(width, height, 32, 18);
             timeline = RtpTimeline::new(fps);
             println!("   屏幕尺寸变化 → {}x{}（已重建编码后端，首帧 IDR）", geometry.0, geometry.1);
         }
         // 远程改帧率立刻生效（档位 + 睡眠节奏；NVENC 连进程一起重建，framerate 参数在建进程时定）。
         let want_fps = (settings.moving_fps.load(Ordering::Relaxed) as u32).max(1);
-        if want_fps != fps {
+        // 客户端会按菜单值反复重发同一个帧率请求：自适应降速后若照单全收，
+        // 每 3 s 就「改回 60 → 又降下来」来回重建编码器（IDR 风暴 → frm 横跳、帧率腰斩）。
+        // 只有用户选了新档位（与降速来源不同的值）才真正接受。
+        if want_fps != fps && !(downgraded && want_fps == downgrade_from) {
             fps = want_fps;
             // 用户重新选了档位 → 允许再做一次自适应降帧。
             downgraded = false;
+            downgrade_from = 0;
             let still = settings.still_fps.load(Ordering::Relaxed) as u32;
             gate.set_config(GateConfig { moving_fps: fps, still_fps: still, still_after: Duration::from_millis(1000) });
             planner = FramePlanner::new(fps, still);
@@ -1061,7 +1068,9 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                 send_time = Instant::now();
+                paced = Duration::ZERO;
             }
             println!("   远程改帧率 → {fps} fps");
         }
@@ -1093,7 +1102,9 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                 send_time = Instant::now();
+                paced = Duration::ZERO;
             if backend_nvenc {
                 println!("   重试 NVENC 成功，切回硬编");
             }
@@ -1111,8 +1122,7 @@ fn capture_loop(
         }
         if now.duration_since(last_stat) >= Duration::from_secs(5) {
             let secs = now.duration_since(last_stat).as_secs_f64().max(0.1);
-            let since_last = frames_sent - last_stat_frames;
-            last_stat_frames = frames_sent;
+            let since_last = frames_sent;
             println!(
                 "   出帧速率 {:.1} fps（近 {secs:.0}s 共 {since_last} 帧 ≈ {} kbps，后端 {}，门控 moving={}）",
                 since_last as f64 / secs,
@@ -1168,6 +1178,7 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                 nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 continue;
             }
@@ -1177,7 +1188,9 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                 send_time = Instant::now();
+                paced = Duration::ZERO;
                 println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
             }
             // 先把已经编完的帧取走：取帧间隔直接决定端到端延迟，不能等下一次喂帧。
@@ -1198,13 +1211,20 @@ fn capture_loop(
                 drained += 1;
                 win_frames += 1;
                 win_bytes += unit_len;
-                // 配速：把这坨 AU 的传输时间摊平（官方 pacer 的等价物）。
-                let transmit = Duration::from_micros(unit_len * 8 * 1_000 / applied_bitrate.max(1_000) as u64);
-                let due = send_time + transmit;
-                if due > Instant::now() {
-                    std::thread::sleep(due - Instant::now());
+                // 配速（官方 pacer 等价物）：速率 = libwebrtc 默认的 2.5× 带宽估计、
+                // 下限 10 Mbps。按编码器名义码率串行化曾把大帧一次憋出 166 ms 的发送
+                // 间隔（客户端 frm 变红的直接来源），而 LAN UDP 零丢包根本不需要串行化。
+                let pace_kbps = (applied_bitrate as u64 * 5 / 2).max(10_000);
+                send_time += Duration::from_micros(unit_len * 8 * 1_000 / pace_kbps);
+                let pace_now = Instant::now();
+                if send_time > pace_now {
+                    let gap = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
+                    let wait = (send_time - pace_now).min(gap);
+                    std::thread::sleep(wait);
+                    paced += wait;
+                    // 欠账封顶两个帧间隔：突发最多摊到两帧，不会一直憋着清账。
+                    send_time = send_time.min(Instant::now() + gap * 2);
                 }
-                send_time = Instant::now();
                 if emitted % 300 == 0 {
                     println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
                 }
@@ -1249,6 +1269,7 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                     nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 }
                 None => {
@@ -1257,6 +1278,7 @@ fn capture_loop(
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                     nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 }
             }
@@ -1264,23 +1286,28 @@ fn capture_loop(
             // 帧率时，喂帧配速会按名义 fps 把帧灌进 stdin 排队——队列就是延迟和卡顿。
             // 连续 3 s 出帧率低于设定 85% 就把配速降到实测值并重建（一次到位，不来回跳）。
             if !downgraded && fps > 15 && win_start.elapsed() >= Duration::from_secs(3) {
-                let sustained = win_frames as f64 / win_start.elapsed().as_secs_f64().max(0.001);
+                // 编码器吞吐必须剔除配速睡眠：配速是发送策略，不是编码器吃不下。
+                let sustained = win_frames as f64 / win_start.elapsed().saturating_sub(paced).as_secs_f64().max(0.001);
                 if sustained < f64::from(fps) * 0.85 {
                     let target = (sustained.floor() as u32).max(15).min(fps - 1);
                     println!("   编码器出帧率 {sustained:.1} fps < 设定 {fps} fps → 配速降到 {target} fps（官方同款自适应）");
+                    downgrade_from = fps;
                     fps = target;
                     downgraded = true;
                     rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
                 send_time = Instant::now();
+                paced = Duration::ZERO;
                 }
             }
             if win_start.elapsed() >= Duration::from_secs(3) {
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
+                paced = Duration::ZERO;
             }
             continue;
         }
