@@ -530,7 +530,19 @@ async fn handle_control(
     match message {
         ControlMessage::KeyboardHeartbeat => {
             if session.control_msgs <= 3 {
-                println!("   kbd 心跳");
+                println!("   kbd 心跳（转发为长按重复按下）");
+            }
+            // 心跳 = 客户端声明"某个键还按着"。转发给注入引擎：repeater 里按住的键
+            // 各补一次按下（不等 500ms 延迟——心跳本身就是节奏）。
+            if let Some(input) = session.input.clone() {
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut engine = input.lock().unwrap();
+                    engine.apply(&ControlMessage::KeyboardHeartbeat)
+                })
+                .await;
+                if let Err(e) = result {
+                    eprintln!("   心跳注入任务崩了：{e}");
+                }
             }
         }
         ControlMessage::Unsupported(v) => println!("   CONTROL 未识别 JSON：{}", linux_uuremote::wire::json_shape(&v, 2)),

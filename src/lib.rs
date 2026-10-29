@@ -15,6 +15,7 @@ pub mod cursor;
 pub mod desktop_mode;
 pub mod encoder;
 pub mod input;
+pub mod keyrepeat;
 pub mod diff;
 pub mod gating;
 pub mod initialization;

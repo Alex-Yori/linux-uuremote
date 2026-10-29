@@ -19,6 +19,10 @@ const SYN_REPORT: u16 = 0;
 
 const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
+const UI_SET_PROPBIT: libc::c_ulong = 0x4004_5568;
+/// EV_REP：声明设备有自动重复能力（内核代劳对 uinput 实测无效——重复由宿主
+/// keyrepeat 状态机做——但读取方如 libinput 会因此按系统节奏理解长按）。
+const EV_REP: u16 = 0x0004;
 const UI_DEV_CREATE: libc::c_ulong = 0x5501;
 const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
 const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
@@ -110,6 +114,7 @@ impl Keyboard {
     pub fn open() -> std::io::Result<Self> {
         let device = Device::create("linux-uuremote keyboard", |d| {
             d.ioctl(UI_SET_EVBIT, EV_KEY.into())?;
+            let _ = d.ioctl(UI_SET_PROPBIT, EV_REP.into()); // 声明重复能力（宿主自己做重复）
             for code in 1..=248u16 {
                 d.ioctl(UI_SET_KEYBIT, code.into())?;
             }

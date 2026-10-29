@@ -11,6 +11,8 @@
 //! - `MotionNotify`：`detail = 1`（XPointerMove）= 绝对根坐标；`detail = 0` = 相对位移。
 //! - 滚轮不是轴事件，是按钮 4/5（上下）与 6/7（左右）的按下+松开。
 
+use std::time::Duration;
+
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, Keysym};
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -222,6 +224,9 @@ pub struct X11Input {
     /// 内核虚拟键盘（/dev/uinput）。GNOME/Wayland 下 XTEST 键盘只进 X 客户端，
     /// 原生 Wayland 应用收不到——键盘优先走 uinput，打不开才退回 XTEST。
     keyboard: Option<crate::uinput::Keyboard>,
+    /// 长按重复账本：uinput 注入的键内核不自动重复（实测 EV_REP 无效），
+    /// 按住不放必须宿主按系统节奏（默认 500ms 后每 33ms）重发按下。
+    repeater: crate::keyrepeat::KeyRepeater,
 }
 
 impl X11Input {
@@ -234,6 +239,9 @@ impl X11Input {
             .reply()
             .map(|r| (i32::from(r.root_x), i32::from(r.root_y)))
             .unwrap_or((0, 0));
+        // 长按节奏照系统键盘默认（500ms 首延迟 / 33ms 周期），env 可调。
+        let repeat_delay = std::env::var("UU_KEY_REPEAT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500u64);
+        let repeat_period = std::env::var("UU_KEY_REPEAT_PERIOD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(33u64);
         Ok(Self {
             conn,
             root: screen.root,
@@ -244,6 +252,7 @@ impl X11Input {
             scroll_remainder: [0, 0],
             held_buttons: Vec::new(),
             held_keys: Vec::new(),
+            repeater: crate::keyrepeat::KeyRepeater::new(Duration::from_millis(repeat_delay), Duration::from_millis(repeat_period.max(1))),
             keyboard: match crate::uinput::Keyboard::open() {
                 Ok(k) => {
                     println!("   键盘后端：uinput 虚拟键盘（Wayland 原生应用可达）");
@@ -263,8 +272,31 @@ impl X11Input {
 
     /// 处理一条 CONTROL 消息；返回是否注入了东西。
     pub fn apply(&mut self, message: &ControlMessage) -> Result<bool, String> {
+        // 每条 CONTROL（包括鼠标移动洪水）都排空一次到期重复——重复节奏不依赖
+        // 键盘消息到达，按住期间任意消息流都会驱动重发。
+        let now = std::time::Instant::now();
+        let mut injected = false;
+        for vk in self.repeater.due(now) {
+            if self.inject_vk_press(vk)? {
+                injected = true;
+            }
+        }
+        if matches!(message, ControlMessage::KeyboardHeartbeat) {
+            // 客户端说"还按着"：立刻补一次按下（心跳本身就是节奏，不等延迟）。
+            for vk in self.repeater.held_codes() {
+                if self.inject_vk_press(vk)? {
+                    injected = true;
+                }
+            }
+            return Ok(injected);
+        }
         let events = match message {
             ControlMessage::Input(ControlInput::Keyboard { key, pressed }) => {
+                if *pressed {
+                    self.repeater.press(*key, now);
+                } else {
+                    self.repeater.release(*key);
+                }
                 if self.inject_uinput_key(*key, *pressed)? {
                     return Ok(true);
                 }
@@ -293,7 +325,7 @@ impl X11Input {
             other => plan_pointer_events(other, self.width, self.height, &mut self.pointer, &mut self.scroll_remainder),
         };
         if events.is_empty() {
-            return Ok(false);
+            return Ok(injected);
         }
         for e in &events {
             if e.type_ == MOTIONNOTIFY {
@@ -314,6 +346,7 @@ impl X11Input {
 
     /// 会话结束：把还按着的键和按钮松开，别让本机卡在按住状态。
     pub fn release_all(&mut self) {
+        self.repeater.clear();
         if let Some(keyboard) = self.keyboard.as_mut() {
             let _ = keyboard.release_all();
         }
@@ -333,6 +366,27 @@ impl X11Input {
         let Some(keysym) = windows_vk_to_keysym(vk) else { return Ok(false) };
         let Some(code) = crate::uinput::keysym_to_evdev(keysym) else { return Ok(false) };
         keyboard.key(code, pressed).map_err(|e| format!("uinput 键盘注入失败：{e}"))?;
+        Ok(true)
+    }
+
+    /// 长按重复的注入：uinput 优先（Wayland 原生可达），退回 XTEST。
+    /// 返回 Ok(false) = 这个 VK 映射不到本机键位（不报错——重复是锦上添花）。
+    fn inject_vk_press(&mut self, vk: i32) -> Result<bool, String> {
+        if let Some(keyboard) = self.keyboard.as_mut() {
+            let Some(code) = windows_vk_to_keysym(vk).and_then(crate::uinput::keysym_to_evdev) else {
+                return Ok(false);
+            };
+            keyboard.key(code, true).map_err(|e| format!("uinput 重复按下失败：{e}"))?;
+            return Ok(true);
+        }
+        let Some(keycode) = self.keycode_for_vk(vk) else { return Ok(false) };
+        self.conn
+            .xtest_fake_input(KEYPRESS, 0, 0, self.root, keycode as i16, 0, 0)
+            .map_err(|e| format!("XTest 重复按下失败: {e}"))?;
+        self.conn
+            .xtest_fake_input(KEYRELEASE, 0, 0, self.root, keycode as i16, 0, 0)
+            .map_err(|e| format!("XTest 重复松开失败: {e}"))?;
+        self.conn.flush().map_err(|e| format!("X flush 失败: {e}"))?;
         Ok(true)
     }
 
