@@ -15,21 +15,14 @@ target="${1:-${UU_VIEWER_DEVICE:-}}"
 self="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.config/uuremote/config.json"))).get("device_id",""))' 2>/dev/null || true)"
 
 if [ -z "$target" ]; then
-  # 设备列表里第一台在线且不是本机的设备。
-  target="$("$BIN" --list 2>/dev/null | UU_SELF="$self" python3 -c '
-import os, re, sys
-self = os.environ.get("UU_SELF", "")
-for line in sys.stdin:
-    m = re.search(r"id=([a-z0-9]+)", line)
-    # DISCONNECTED 里含 "CONNECTED" 子串，必须排除。
-    if m and re.search(r"\bCONNECTED\b", line) and "DISCONNECTED" not in line and m.group(1) != self:
-        print(m.group(1)); break
-')"
-fi
-
-if [ -z "$target" ]; then
-  notify-send -u critical "UU 远程控制端" "没有可连接的在线设备（用 uu-viewer --list 查看）"
-  exit 1
+  # 没指定目标：打开主页（仿原版"我的设备"页），由用户在界面上选设备进入桌面。
+  echo "=== $(date -Is) 打开主页 ===" >> "$LOG"
+  "$BIN" 2>&1 | tee -a "$LOG"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    notify-send -u normal "UU 远程控制端" "启动失败，详见 $LOG"
+  fi
+  exit $rc
 fi
 
 echo "=== $(date -Is) 连接 $target ===" >> "$LOG"
