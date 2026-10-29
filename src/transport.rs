@@ -364,8 +364,12 @@ impl Peer {
             pc.on_ice_candidate(Box::new(move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
                 let ev = ev.clone();
                 Box::pin(async move {
-                    let Some(candidate) = candidate else { return };
+                    let Some(candidate) = candidate else {
+                        println!("   本机 candidate 收集完成");
+                        return;
+                    };
                     if let Ok(init) = candidate.to_json() {
+                        println!("   本机 candidate 收集：{}", init.candidate);
                         let _ = ev.send(PeerEvent::IceCandidate {
                             candidate: init.candidate,
                             sdp_mid: init.sdp_mid,
@@ -497,8 +501,9 @@ impl Peer {
             println!("   ⚠ offer 没提出这些 RTP 头扩展，写不进包：{:?}", missing);
         }
         self.pc.set_local_description(answer.clone()).await.map_err(|e| format!("设置本端描述失败: {e}"))?;
-        if !wait_gathering_complete(&self.pc, Duration::from_secs(1)).await {
-            // 超时照发：剩余 candidate 走 trickle，客户端照样能打洞。
+        if !wait_gathering_complete(&self.pc, Duration::from_millis(300)).await {
+            // 超时照发：本机 candidate 百毫秒内必齐（answer 里带上），STUN/TURN 慢的
+            // 走 trickle——客户端拿到本机 candidate 就能 LAN 直连，不必等relay。
             // 等齐 7 台 STUN + TURN 会把 answer 拖后好几秒，连接半分钟的账就在这。
             log_warn("ICE 收集未齐，剩余 candidate 走 trickle");
         }

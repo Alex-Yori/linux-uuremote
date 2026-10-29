@@ -77,6 +77,10 @@ struct Session {
     control_msgs: u32,
     /// 是否已发出 answer（远端描述已设）：早到 candidate 要等它才能 add。
     answered: bool,
+    /// 连接阶段计时（"连接半分钟"的账要能算）：be-controlled 到达的时刻。
+    t_be_controlled: std::time::Instant,
+    /// answer 发出的时刻（None = 还没收到 offer）。
+    t_answer: Option<std::time::Instant>,
 }
 
 /// 远程可调的采集参数。码率变化触发编码器重建 + IDR；分辨率只支持原生，降档显式拒绝。
@@ -316,7 +320,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     };
                     match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, answered: false }),
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, answered: false, t_be_controlled: std::time::Instant::now(), t_answer: None }),
                         Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
@@ -340,7 +344,12 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             });
                             emit_tx.send(("soac".to_string(), Some(payload))).ok();
                             session.answered = true;
-                            println!("   answer 已发出（SDP {} 字节）", answer.len());
+                            session.t_answer = Some(std::time::Instant::now());
+                            println!(
+                                "   answer 已发出（SDP {} 字节；be-controlled→answer {} ms）",
+                                answer.len(),
+                                std::time::Instant::now().duration_since(session.t_be_controlled).as_millis()
+                            );
                             // 补上早到的 candidate（客户端可能靠它们打洞）。
                             for (c, mid, mline) in std::mem::take(&mut early_candidates) {
                                 if let Err(e) = session.peer.add_candidate(&c, mid.as_deref(), mline).await {
@@ -387,6 +396,13 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     println!("   数据通道 open：{label}");
                     if label == CONTROL_LABEL {
                         if let Some(session) = session.as_mut() {
+                            if let Some(t) = session.t_answer {
+                                println!(
+                                    "   阶段耗时：answer→control_open {} ms（be-controlled 起累计 {} ms）",
+                                    std::time::Instant::now().duration_since(t).as_millis(),
+                                    std::time::Instant::now().duration_since(session.t_be_controlled).as_millis()
+                                );
+                            }
                             let keyframe = session.keyframe.clone();
                             start_video(&display, fps, still_fps, bitrate_kbps, gop, &keyframe, &settings, session, emit_tx.clone());
                         }
@@ -414,6 +430,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     // Connected = DTLS 完成，可以开始推桌面声音（opus 轨在 answer 里谈定过才有）。
                     if state == "connected" {
                         settings.connected.store(true, Ordering::Relaxed);
+                        if let Some(t) = session.as_ref().and_then(|s| s.t_answer) {
+                            println!("   阶段耗时：answer→DTLS connected {} ms", std::time::Instant::now().duration_since(t).as_millis());
+                        }
                         if let Some(session) = session.as_ref() {
                             if let Some(track) = session.peer.audio_track().await {
                                 // 本地默认输出静音时开虚拟路由：远端有声、本地不出声。
@@ -883,12 +902,10 @@ fn start_video(
             println!("   没有 client_id/ice_id，跳过能力上报");
             return;
         }
-        let waited = Instant::now();
-        while !peer_init.is_connected() && waited.elapsed() < Duration::from_secs(15) {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        // ControlOpen 晚于 DTLS connected（SCTP 在 DTLS 之上），到这里必然已连通——
+        // 照官方时机（Connected 即报）直接发，不再等 15 s。真没连通就跳过这条上报。
         if !peer_init.is_connected() {
-            println!("   15 s 内没连通，跳过能力上报");
+            println!("   还没连通，跳过能力上报");
             return;
         }
         emit_tx
