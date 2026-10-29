@@ -227,6 +227,8 @@ pub struct X11Input {
     /// 长按重复账本：uinput 注入的键内核不自动重复（实测 EV_REP 无效），
     /// 按住不放必须宿主按系统节奏（默认 500ms 后每 33ms）重发按下。
     repeater: crate::keyrepeat::KeyRepeater,
+    /// 长按重复注入计数（日志节流用）。
+    repeat_hits: u32,
 }
 
 impl X11Input {
@@ -253,6 +255,7 @@ impl X11Input {
             held_buttons: Vec::new(),
             held_keys: Vec::new(),
             repeater: crate::keyrepeat::KeyRepeater::new(Duration::from_millis(repeat_delay), Duration::from_millis(repeat_period.max(1))),
+            repeat_hits: 0,
             keyboard: match crate::uinput::Keyboard::open() {
                 Ok(k) => {
                     println!("   键盘后端：uinput 虚拟键盘（Wayland 原生应用可达）");
@@ -342,6 +345,25 @@ impl X11Input {
         }
         self.conn.flush().map_err(|e| format!("X flush 失败: {e}"))?;
         Ok(true)
+    }
+
+    /// 宿主自驱动的重发排空（不依赖 CONTROL 消息到达）：主循环 50ms tick 调它。
+    /// 返回是否有注入；没有按住键时是纯内存操作，开销可忽略。
+    pub fn tick_repeats(&mut self) -> Result<bool, String> {
+        let mut injected = false;
+        for vk in self.repeater.due(std::time::Instant::now()) {
+            if self.inject_vk_press(vk)? {
+                injected = true;
+            }
+        }
+        if injected {
+            // 验收/排障用：长按期间的重复注入必须看得见（uinput 写入不进日志）。
+            self.repeat_hits += 1;
+            if self.repeat_hits % 10 == 1 {
+                println!("   长按重复注入：累计 {} 次（每 10 次报一条）", self.repeat_hits);
+            }
+        }
+        Ok(injected)
     }
 
     /// 会话结束：把还按着的键和按钮松开，别让本机卡在按住状态。

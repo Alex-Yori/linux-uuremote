@@ -265,8 +265,19 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
     let mut early_candidates: Vec<(String, Option<String>, Option<u16>)> = Vec::new();
 
     println!("等待客户端拉流（Ctrl-C 退出）…");
+    // 长按重复的宿主自驱动节拍：50ms 粒度排空到期键（周期 33ms），不等 CONTROL
+    // 消息到达——长按时鼠标是静止的，靠消息驱动会断流。
+    let mut repeat_tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         tokio::select! {
+            _ = repeat_tick.tick() => {
+                if let Some(input) = session.as_ref().and_then(|s| s.input.clone()) {
+                    tokio::task::spawn_blocking(move || {
+                        let mut engine = input.lock().unwrap();
+                        let _ = engine.tick_repeats();
+                    });
+                }
+            }
             signal = sig_rx.recv() => match signal {
                 Some(Signal::IceServers(v)) => {
                     // room_info 的 iceServers 只是备份：真正的每会议配置在 be-controlled 的 header 里。
