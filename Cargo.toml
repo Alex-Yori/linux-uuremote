@@ -48,6 +48,10 @@ qrcode = { version = "0.14", default-features = false }
 flate2 = "1"
 openh264 = "0.9"
 webrtc = "0.10"
+# 控制端（uu-viewer）：SDL 窗口渲染/音频，opus 解码
+sdl2 = { version = "0.37", features = ["ttf"] }
+opus = "0.2"
+rand = "0.8"
 
 [[bin]]
 name = "uu-input-probe"
@@ -60,4 +64,8 @@ path = "src/bin/uu-encode-bench.rs"
 [[bin]]
 name = "uu-audio-probe"
 path = "src/bin/uu-audio-probe.rs"
+
+[[bin]]
+name = "uu-viewer"
+path = "src/bin/uu-viewer.rs"
 

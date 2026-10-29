@@ -459,11 +459,17 @@ pub fn hostname() -> String {
 
 /// 设备注册（匿名）：硬件摘要 → device_id。屏尺寸无显示时按参照实现退回 1920x1080。
 pub async fn register_device(client: &ApiClient, screen: &str) -> Result<String, String> {
+    register_device_with(client, screen, None, None, None).await
+}
+
+/// 同一账号下的"第二台机器"注册（控制端身份用）：client_id/system_id/machine_guid 可换，
+/// 否则云端按 machine_guid 去重会退回本机已有的 device_id。
+pub async fn register_device_with(client: &ApiClient, screen: &str, client_id: Option<&str>, system_id: Option<&str>, guid: Option<&str>) -> Result<String, String> {
     let body = json!({
         "name": hostname(),
-        "client_id": client.creds.client_id,
-        "system_id": client.creds.system_id,
-        "machine_guid": machine_guid(),
+        "client_id": client_id.unwrap_or(&client.creds.client_id),
+        "system_id": system_id.unwrap_or(&client.creds.system_id),
+        "machine_guid": guid.unwrap_or(&machine_guid()),
         "os": os_name(),
         "base_board": base_board(),
         "cpu": cpu_name(),

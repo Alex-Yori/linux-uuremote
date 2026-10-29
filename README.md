@@ -8,26 +8,22 @@
 
 ## 当前状态
 
-两个能跑的模块：采集与出帧门控（`uu-capture-probe`，验证了核心设计**内容自适应出帧**），以及连接层（`uu-login` + `uu-cloud-probe`，已在真机与网易云信令**全链路联通**）。传输与编码在路线图里，还没写。
+被控端整链路已经端到端跑通并用官方 Windows 客户端实测（采集 → 编码 → WebRTC 传输 → 输入注入 → 画质/帧率/分辨率控制面 → 音频）。另附一个自研**控制端** `uu-viewer`（SDL 窗口，界面按原版客户端构成做），用于自测与脱离官方客户端使用。
 
 | 模块 | 状态 |
 |---|---|
-| 内容自适应出帧门控（`src/gating.rs`） | ✅ 已实现，6 个单元测试通过 |
-| 内容变化检测（`src/content.rs`，粗格采样比对） | ✅ 已实现，7 个单元测试通过；实测能识别出 75.9% 的无效帧 |
-| X11 采集（XDamage 脏区 + XFixes 光标 + MIT-SHM 回读） | ✅ 已实现，实测跑通，失败自动降级 `GetImage` |
-| 脏矩形抓取（服务端切 tile） | ✅ 已实现，`--dirty`；但合成器桌面给的脏框是整屏，见「实测」 |
-| 光标精灵取回与合成（`src/cursor.rs`） | ✅ 已实现，7 个单元测试；`--verify` 端到端判据双服务器 PASS |
-| 读回正确性验证（`--verify`，双服务器 PASS） | ✅ 见下面「实测」 |
-| 脏框合并（`src/diff.rs`，块→矩形，可限条数） | ✅ 已实现，12 个单元测试通过 |
-| 稀疏采样扫描（`src/scan.rs`，采样格 + 参照帧拼接） | ✅ 已实现，7 个单元测试通过；降级路径 |
-| 批量抓取（`grab_tiles`，一次请求多矩形各写 offset） | ✅ 已实现，`--verify` 的 `batch_painted` / `batch_matches_full` 通过 |
-| 可控测试载荷（`uu-damage-load`，`--fps` 可调） | ✅ 已实现，脏区/内容测量可复现 |
-| 云 API 与登录（`src/api.rs`：签名/设备注册/扫码/JWT csrf） | ✅ 已实现，10 个单元测试；`uu-login` 真机跑通（扫码 + 借用参照实现登录态两条路） |
-| 信令（Engine.IO v4 + Socket.IO v5，`src/signaling.rs`） | ✅ 已实现，6 个单元测试；`uu-cloud-probe` 真机联通：建房 → `X-NRD-AUTH` 握手 → room_info ack → bmsg_push |
-| wire 结构检查（`src/wire.rs`，protobuf/JSON 只报形状不报内容） | ✅ 已实现，5 个单元测试 |
-| 编码（NVENC / VAAPI / x264 软编） | ⬜ 未实现，probe 先量采集侧 |
-| 传输（soac offer/answer + ICE + DTLS/SRTP + 数据通道） | ⬜ 未实现，信令侧事件面已摸清（`be-controlled`/`soac`/`bmsg_push`） |
-| 输入注入 / 剪贴板 / 文件传输 / 端口映射 | ⬜ 未实现 |
+| 内容自适应出帧门控（`src/gating.rs`） | ✅ 已实现；合成器桌面脏框恒整屏 → 脏区由内容比对推导，XDamage 仅作提示 |
+| X11 采集（XDamage + XFixes 光标 + MIT-SHM） | ✅ 已实现，失败自动降级 `GetImage` |
+| 云 API 与登录（签名/设备注册/扫码/JWT csrf，`src/api.rs`） | ✅ `uu-login` 真机跑通 |
+| 信令（Engine.IO v4 + Socket.IO v5，`src/signaling.rs`） | ✅ 真机联通；旧版 0x04 附件前缀自动剥离 |
+| 传输（`webrtc` crate：DTLS/SRTP/SCTP + 数据通道） | ✅ 已实现；UU 私有 RTP 扩展已注册并谈定 |
+| 编码 | ✅ NVENC 主路径（ffmpeg 自抓 x11grab，实测 2K@76fps）+ openh264 软编兜底；VBR+CQ 质量优先，画质档映射 CQP |
+| 输入注入 | ✅ XTEST 鼠标 + uinput 虚拟键盘；滚轮按 Windows notch=120 换算，每轴余量 |
+| 画质/帧率/分辨率/真彩控制面（Message 21/22/25 RPC） | ✅ 官方客户端菜单实测可调；帧率解锁到 144；发送端配速 + 自适应降帧 |
+| 光标形状上报（Message 15） | ✅ 官方客户端正确替换光标 |
+| 音频 | ✅ ffmpeg pulse → libopus → RTP 轨 + PipeWire 虚拟路由（本地有声 + 远端有声） |
+| 回环自检（`uu-selftest`） | ✅ PASS |
+| 控制端 `uu-viewer`（SDL 窗口 + 原版式菜单 + 状态条 + opus 播放） | ✅ 新建，按逆向的官方客户端行为对接 |
 
 ## 为什么先做这个
 
@@ -43,7 +39,21 @@ cargo test                 # 42 个单元测试：出帧门控 + 内容检测 + 
 cargo build --release      # 测量用 release：debug 的回读耗时是 release 的 3–4 倍
 ```
 
-依赖只有 `x11rb`（`damage` / `shm` / `xfixes` 三个 feature），本机 rustc 1.99 实测可编译。
+系统依赖：`libsdl2-dev`、`libsdl2-ttf-dev`、`fonts-noto-cjk`（控制端），`ffmpeg`（NVENC 编码与音频抓取），NVIDIA 驱动（NVENC）。Rust 侧全 rustls，不引系统 OpenSSL；本机 rustc 1.99 实测可编译。
+
+## 用法
+
+```bash
+# 被控端（systemd user 服务常驻）
+systemctl --user enable --now uuremote-host
+
+# 控制端
+./target/release/uu-viewer --list            # 列出账号下的设备
+./target/release/uu-viewer --device <id或别名> # 连接
+./target/release/uu-viewer                   # 交互选择
+```
+
+窗口按键：`F1` 菜单（画质/帧率/分辨率/真彩/声音/全屏/断开）、`F11` 全屏、关窗即断开；右下角实时显示 fps / 码率 / frm / ping / 远程分辨率。
 
 ## 实测探针
 
