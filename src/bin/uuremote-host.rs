@@ -280,6 +280,10 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             settings.quality.store(quality, Ordering::Relaxed);
                             settings.custom_bps.store(custom, Ordering::Relaxed);
                             let kbps = preset_bitrate_kbps(quality, custom);
+                            println!(
+                                "   画质档原始值：quality={quality} custom_bps={custom} → {kbps} kbps / CQP {}",
+                                linux_uuremote::nvenc::preset_cq(quality)
+                            );
                             if kbps > 0 {
                                 settings.bitrate_kbps.store(kbps as u64, Ordering::Relaxed);
                             }
@@ -636,6 +640,11 @@ async fn apply_rpc(
     if let Some(quality) = p.quality {
         settings.quality.store(quality, Ordering::Relaxed);
         let kbps = preset_bitrate_kbps(quality, p.custom_bps.unwrap_or(0));
+        println!(
+            "   画质档原始值：quality={quality} custom_bps={:?} → {kbps} kbps / CQP {}",
+            p.custom_bps,
+            linux_uuremote::nvenc::preset_cq(quality)
+        );
         settings.custom_bps.store(p.custom_bps.unwrap_or(0), Ordering::Relaxed);
         settings.bitrate_kbps.store(kbps as u64, Ordering::Relaxed);
     }

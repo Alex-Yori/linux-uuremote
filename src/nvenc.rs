@@ -63,16 +63,10 @@ fn timing_args(fps: u32) -> Vec<String> {
     }
 }
 
-/// 画质档 → NVENC 常量质量 CQP（照参照实现：原画 17 / 超清 21 / 高清 26 / 流畅 30，
-/// 自动与自定义 18）。质量优先时这才是"画质可调"的正解——码率只是天花板。
+/// 画质档 → NVENC 常量质量 CQP。映射表在 control.rs（与码率天花板同一真源），
+/// 这里只是转发，保持 nvenc 对外 API 不变。
 pub fn preset_cq(quality: u64) -> u32 {
-    match quality {
-        4 => 17,
-        3 => 21,
-        2 => 26,
-        1 => 30,
-        _ => 18,
-    }
+    crate::control::preset_cq(quality)
 }
 
 /// VBV 缓冲（kbit）= 码率上限 × 毫秒 / 1000。默认 250 ms：缓冲太小会把整屏 IDR

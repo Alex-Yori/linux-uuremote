@@ -217,15 +217,34 @@ pub fn fps_from_index(index: Option<u64>) -> Option<u32> {
     }
 }
 
-/// 画质档位 → 目标码率 kbps（参照实现的实测值）。0 = 用宿主自动公式。
+/// 画质档位 → 码率天花板 kbps。fork 逆向的枚举：1=流畅 2=标准 3=高清 4=超清 5=自动 6=自定义；
+/// Yori 的 Windows 客户端期望 高清 8M / 超清 14M / 原画 30M——菜单标签比枚举高半档，
+/// 因此 2/3/4 取 8M/14M/30M（无论客户端把"高清"发成 2 还是 3 都命中用户期望），
+/// 7 = 原画的猜测位（fork 从未见过 >6；实机日志"画质档原始值"一验便知，不符就改这张表）。
+/// 自动 = 0 = 不设天花板（质量优先 CQ 自己决定码率）。
 pub fn preset_bitrate_kbps(quality: u64, custom_bps: u64) -> u32 {
     match quality {
         1 => 1_000,
-        2 => 2_000,
-        3 => 8_000,
-        4 => 20_000,
+        2 => 8_000,
+        3 => 14_000,
+        4 => 30_000,
+        5 => 0,
         6 => (custom_bps / 1_000).clamp(1, 100_000) as u32,
+        7 => 30_000,
         _ => 0,
+    }
+}
+
+/// 画质档 → NVENC 常量质量 CQP（质量优先时这才是画质旋钮，码率只是天花板）。
+/// 照 fork 逆向映射（BLURAY 17 / HD 21 / GENERAL 26 / FAST 30 / 其余 18）；7 按原画取 17。
+pub fn preset_cq(quality: u64) -> u32 {
+    match quality {
+        4 => 17,
+        7 => 17,
+        3 => 21,
+        2 => 26,
+        1 => 30,
+        _ => 18,
     }
 }
 
@@ -580,6 +599,29 @@ mod tests {
             .filter_map(|f| match &f.value { WireValue::Bytes(b) => std::str::from_utf8(b).ok(), _ => None })
             .collect();
         assert_eq!(strings, vec!["NVIDIA NVENC", "X11"]);
+    }
+
+    #[test]
+    fn preset_bitrates_follow_official_windows_tiers() {
+        // Yori 的 Windows 客户端档位期望：高清 8M、超清 14M、原画 30M。菜单标签比
+        // fork 枚举高半档，所以按标签映射（实机日志"画质档原始值"校准）。
+        assert_eq!(preset_bitrate_kbps(1, 0), 1_000); // 流畅
+        assert_eq!(preset_bitrate_kbps(2, 0), 8_000); // 高清
+        assert_eq!(preset_bitrate_kbps(3, 0), 14_000); // 超清
+        assert_eq!(preset_bitrate_kbps(4, 0), 30_000); // 原画
+        assert_eq!(preset_bitrate_kbps(7, 0), 30_000); // 原画的猜测位（日志校准）
+        assert_eq!(preset_bitrate_kbps(6, 25_000_000), 25_000); // 自定义
+        assert_eq!(preset_bitrate_kbps(5, 0), 0); // 自动：不设天花板
+    }
+
+    #[test]
+    fn preset_cq_follows_quality_tiers() {
+        assert_eq!(crate::control::preset_cq(4), 17); // 原画档质量（fork BLURAY 实测值）
+        assert_eq!(crate::control::preset_cq(7), 17); // 原画猜测位
+        assert_eq!(crate::control::preset_cq(3), 21); // 超清档（fork HD）
+        assert_eq!(crate::control::preset_cq(2), 26); // 高清档（fork GENERAL）
+        assert_eq!(crate::control::preset_cq(1), 30); // 流畅档（fork FAST）
+        assert_eq!(crate::control::preset_cq(5), 18); // 自动
     }
 
     #[test]
