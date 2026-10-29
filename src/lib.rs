@@ -21,5 +21,7 @@ pub mod initialization;
 pub mod scan;
 pub mod signaling;
 pub mod transport;
+pub mod nvenc;
+pub mod rtp_metadata;
 pub mod uinput;
 pub mod wire;

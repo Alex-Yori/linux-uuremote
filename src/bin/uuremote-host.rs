@@ -23,6 +23,7 @@ use linux_uuremote::capture_setting;
 use linux_uuremote::desktop_mode::{self, Request};
 use linux_uuremote::encoder::{FrameKind, FramePlanner, OpenH264, RtpTimeline};
 use linux_uuremote::gating::{Action, FrameDropper, GateConfig};
+use linux_uuremote::nvenc::NvencH264;
 use linux_uuremote::initialization::{encode_capture_change, encode_permissions, encode_secure_desktop, encode_screen_sources, envelope, Permissions, Screen, ScreenGeometry};
 use linux_uuremote::input::X11Input;
 use linux_uuremote::signaling::{self, Received, Signaling};
@@ -526,7 +527,15 @@ async fn apply_rpc(
     }
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     if request.case == 0 {
-        let reply = encode_rpc_response(request.request_id, next_sequence(), ts, None);
+        // 会话/插件 RPC（send_video_track_req 等）照参照实现回对应响应字段；
+        // 只回空 CaptureSettingResponse 客户端会认为协商失败，画质菜单锁死。
+        let reply = match linux_uuremote::control::session_rpc_response(request.request_id, next_sequence(), ts, &request.kinds) {
+            Some(reply) => {
+                println!("   会话/插件 RPC 已答：请求字段 {:?} → Message 22", request.kinds);
+                reply
+            }
+            None => encode_rpc_response(request.request_id, next_sequence(), ts, None),
+        };
         if let Err(e) = peer.send_on(reply_label, &reply).await {
             eprintln!("   RPC 回包失败：{e}");
         }
@@ -684,13 +693,16 @@ fn start_video(
         // 客户端帧率菜单靠它解锁）→ 7 屏幕清单（带缩放档与真实刷新率）→ 权限 → 锁屏。
         // 缺 18 的宿主会被客户端判成"受限"，菜单锁死默认档、不给指定帧率。
         let refresh = capture_setting::display_fps(display_init.as_deref());
+        // 编码能力报编码器上限（NVENC 固定 4K），不是屏幕尺寸——客户端画质档位按它解锁。
+        let nvenc = linux_uuremote::nvenc::available();
+        let codec_size = if nvenc { capability::CODEC_CAPABILITY_SIZE } else { (width, height) };
         let scaled: Vec<(i32, i32)> = capture_setting::scaled_sizes((width, height))
             .into_iter()
             .map(|(w, h)| (w as i32, h as i32))
             .collect();
         let messages: Vec<Vec<u8>> = vec![
             encode_capture_change(next_sequence(), now(), 0, 0, "Linux desktop").unwrap_or_default(),
-            envelope(next_sequence(), now(), 18, &capture_setting::codec_negotiation((width, height), refresh, false)),
+            envelope(next_sequence(), now(), 18, &capture_setting::codec_negotiation(codec_size, refresh, false)),
             encode_screen_sources(
                 next_sequence(),
                 now(),
@@ -738,16 +750,29 @@ fn start_video(
         emit_tx
             .send((
                 capability::FORWARD_SETTING_EVENT.to_owned(),
-                Some(capability::device_capability(&client_id, &ice_id, 0, refresh as i32, width, height)),
+                Some(capability::device_capability(
+                    &client_id,
+                    &ice_id,
+                    0,
+                    refresh as i32,
+                    if nvenc { capability::CODEC_IMPL_NVENC } else { capability::CODEC_IMPL_SOFTWARE },
+                    false,
+                    false,
+                    codec_size.0,
+                    codec_size.1,
+                )),
             ))
             .ok();
         emit_tx
             .send((
                 capability::FORWARD_SETTING_EVENT.to_owned(),
-                Some(capability::sender_para_info(&client_id, &ice_id, "X11", "OpenH264")),
+                Some(capability::sender_para_info(&client_id, &ice_id, "X11", if nvenc { "NVIDIA NVENC" } else { "OpenH264" })),
             ))
             .ok();
-        println!("   能力已上报：H.264 4:2:0 {width}x{height} @{refresh}fps 刷新率（X11 采集 / OpenH264 软编，推流档 {fps}fps）");
+        println!(
+            "   能力已上报：H.264 4:2:0 {}x{} @{refresh}fps 刷新率（X11 采集 / {}，推流档 {fps}fps）",
+            codec_size.0, codec_size.1, if nvenc { "NVENC 硬编" } else { "OpenH264 软编" }
+        );
         if !app_control_id.is_empty() {
             emit_tx
                 .send((capability::ICE_FINISHED_EVENT.to_owned(), Some(capability::ice_finished(&ice_id, &app_control_id))))
@@ -778,7 +803,9 @@ fn start_video(
     });
 }
 
-/// 采集 → 门控 → 编码：整机读回，内容比对决定发不发，发的都是整帧。
+/// 采集 → 编码 → 送帧。NVENC（FFmpeg 子进程，参照实现在本机的方式）优先，
+/// openh264 软编兜底。NVENC 模式恒帧率恒码率（CBR），不做内容门控——
+/// 客户端右下角 10–40 fps 横跳、几百 Kbps–几 Mbps 横跳正是软编 + 静止门控的产物。
 fn capture_loop(
     display: Option<&str>,
     fps: u32,
@@ -791,6 +818,31 @@ fn capture_loop(
     frames_tx: mpsc::Sender<Encoded>,
     shapes_tx: mpsc::UnboundedSender<Vec<u8>>,
 ) {
+    fn rebuild_backend(
+        pipe: &mut Option<NvencH264>,
+        encoder: &mut Option<OpenH264>,
+        nvenc: &mut bool,
+        w: usize,
+        h: usize,
+        f: u32,
+        br: u32,
+        gop: u32,
+    ) {
+        if *nvenc {
+            match NvencH264::open(w as u32, h as u32, f, br.max(1_000)) {
+                Ok(p) => *pipe = Some(p),
+                Err(e) => {
+                    println!("   NVENC 起不来：{e}（退回 openh264 软编）");
+                    *nvenc = false;
+                    *pipe = None;
+                    *encoder = OpenH264::new(w, h, f, br.max(1), gop, 4).ok();
+                }
+            }
+        } else {
+            *encoder = OpenH264::new(w, h, f, br.max(1), gop, 4).ok();
+        }
+    }
+
     let mut screen = match X11Screen::open(display, DamageLevel::BoundingBox) {
         Ok(s) => s,
         Err(e) => {
@@ -805,19 +857,24 @@ fn capture_loop(
     let measured = (u32::from(screen.width()), u32::from(screen.height()));
     let _ = geom_tx.send(measured);
     *settings.native.lock().unwrap() = measured;
-    let mut encoder = match OpenH264::new(width, height, fps, bitrate_kbps, gop, 4) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("   编码器起不来：{e}");
-            return;
-        }
-    };
     let mut fps = fps.max(1);
+    let mut applied_bitrate = bitrate_kbps;
+    let mut backend_nvenc = linux_uuremote::nvenc::available();
+    let mut pipe: Option<NvencH264> = None;
+    let mut encoder: Option<OpenH264> = None;
+    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+    if pipe.is_none() && encoder.is_none() {
+        eprintln!("   编码器起不来（NVENC 与 openh264 都失败）");
+        return;
+    }
+    println!(
+        "   编码后端：{}",
+        if backend_nvenc { format!("NVENC（FFmpeg h264_nvenc，CBR {applied_bitrate} kbps）") } else { "openh264 软编".to_owned() }
+    );
     let mut gate = FrameDropper::new(GateConfig { moving_fps: fps, still_fps, still_after: Duration::from_millis(1000) });
     let mut planner = FramePlanner::new(fps, still_fps);
     // RTP 时间戳跟真实出帧时刻走（见 RtpTimeline），否则静止/卡顿会把接收端 frm 攒上天。
     let mut timeline = RtpTimeline::new(fps);
-    let mut applied_bitrate = bitrate_kbps;
     let mut last_cursor: Option<(i32, i32)> = None;
     let mut frames_sent: u64 = 0;
     let mut last_stat = Instant::now();
@@ -832,14 +889,14 @@ fn capture_loop(
     let mut content = ContentChange::new(width, height, 32, 18);
     let mut emitted = 0u64;
     let mut idr_frames = 0u64;
+    let mut last_feed = Instant::now();
     let started = Instant::now();
 
     loop {
         std::thread::sleep(Duration::from_nanos(1_000_000_000 / ((fps.max(1) as u64) * 2)));
         let now = Instant::now();
-        // 分辨率可能被动改变（XRandR/切换显示）：每轮免费量一次，变了就重建编码器与比对器。
         // 分辨率可能被动改变（客户端 xrandr 切模式 / 手动改显示）：每轮实时量一次根窗口，
-        // 变了就重开采集 + 重建编码器/比对器/时间线，首帧自然是 IDR。
+        // 变了就重开采集 + 重建后端/比对器/时间线，首帧自然是 IDR。
         let geometry = screen.measure();
         if geometry != last_reported {
             last_reported = geometry;
@@ -850,15 +907,12 @@ fn capture_loop(
                 Ok(s) => screen = s,
                 Err(e) => eprintln!("   重开采集失败：{}", e.0),
             }
-            match OpenH264::new(width, height, fps, applied_bitrate, gop, 4) {
-                Ok(e) => encoder = e,
-                Err(e) => eprintln!("   编码器重建失败（{width}x{height}）：{e}"),
-            }
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
             content = ContentChange::new(width, height, 32, 18);
             timeline = RtpTimeline::new(fps);
-            println!("   屏幕尺寸变化 → {}x{}（已重建编码器，首帧 IDR）", geometry.0, geometry.1);
+            println!("   屏幕尺寸变化 → {}x{}（已重建编码后端，首帧 IDR）", geometry.0, geometry.1);
         }
-        // 远程改帧率立刻生效（档位 + 睡眠节奏）。
+        // 远程改帧率立刻生效（档位 + 睡眠节奏；NVENC 连进程一起重建，framerate 参数在建进程时定）。
         let want_fps = (settings.moving_fps.load(Ordering::Relaxed) as u32).max(1);
         if want_fps != fps {
             fps = want_fps;
@@ -866,23 +920,22 @@ fn capture_loop(
             gate.set_config(GateConfig { moving_fps: fps, still_fps: still, still_after: Duration::from_millis(1000) });
             planner = FramePlanner::new(fps, still);
             timeline = RtpTimeline::new(fps);
+            if backend_nvenc {
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+            }
             println!("   远程改帧率 → {fps} fps");
         }
-        // 远程改码率 → 重建编码器（openh264 的码率在建码器时定），重建后下一帧必须 IDR。
+        // 远程改码率 → 重建后端（两个后端的码率都在建后端时定），重建后首帧必 IDR。
+        // quality=自动 报 0：保持当前码率不动。
         let want_bitrate = settings.bitrate_kbps.load(Ordering::Relaxed) as u32;
-        if want_bitrate != applied_bitrate {
-            match OpenH264::new(width, height, fps, want_bitrate, gop, 4) {
-                Ok(e) => {
-                    encoder = e;
-                    applied_bitrate = want_bitrate;
-                    planner.note_keyframe_request();
-                    println!("   远程改码率 → {want_bitrate} kbps（编码器已重建）");
-                }
-                Err(e) => eprintln!("   码率重建失败：{e}"),
-            }
+        if want_bitrate != 0 && want_bitrate != applied_bitrate {
+            applied_bitrate = want_bitrate;
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop);
+            planner.note_keyframe_request();
+            println!("   远程改码率 → {want_bitrate} kbps（编码后端已重建）");
         }
         // 客户端自己画本地光标（Windows 光标），视频里没有我们的指针；指针移动仍是
-        // "有人在用"的唯一证据，用它维持 moving 档，否则静态桌面永远停在 still 档 3fps。
+        // "有人在用"的唯一证据，用它维持 moving 档（软编门控用；NVENC 恒发只是日志）。
         if let Some(pos) = screen.cursor_position() {
             if last_cursor != Some(pos) {
                 last_cursor = Some(pos);
@@ -894,7 +947,12 @@ fn capture_loop(
         }
         if now.duration_since(last_stat) >= Duration::from_secs(5) {
             let secs = now.duration_since(last_stat).as_secs_f64().max(0.1);
-            println!("   出帧速率 {:.1} fps（近 5s 共 {frames_sent} 帧，门控 moving={})", frames_sent as f64 / secs, gate.is_moving());
+            println!(
+                "   出帧速率 {:.1} fps（近 5s 共 {frames_sent} 帧，后端 {}，门控 moving={}）",
+                frames_sent as f64 / secs,
+                if backend_nvenc { "NVENC" } else { "软编" },
+                gate.is_moving()
+            );
             let ms = |d: Duration| d.as_millis() as f64 / frames_sent.max(1) as f64;
             println!(
                 "   每帧耗时：抓取 {:.1} + 比对 {:.1} + 编码 {:.1} + 发送 {:.1} ms",
@@ -907,16 +965,27 @@ fn capture_loop(
             acc_send = Duration::ZERO;
             last_stat = now;
         }
-        match gate.decide(now) {
-            Action::Idle => continue,
-            Action::Keepalive | Action::Capture => {}
+        // NVENC 恒发帧（客户端帧率显示才稳定），但要按 fps 配速——循环每 tick
+        // 抓两次，不配速会喂进 2×fps 帧，编码白做、输出还得上窜。软编走门控。
+        if backend_nvenc {
+            if now.duration_since(last_feed) < Duration::from_nanos(1_000_000_000 / fps.max(1) as u64) {
+                continue;
+            }
+            last_feed = now;
+        }
+        if !backend_nvenc {
+            match gate.decide(now) {
+                Action::Idle => continue,
+                Action::Keepalive | Action::Capture => {}
+            }
         }
         if keyframe.swap(false, Ordering::Relaxed) {
-            planner.note_keyframe_request();
-        }
-        let plan = planner.plan(gate.is_moving());
-        if !plan.emit {
-            continue;
+            if backend_nvenc {
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
+            } else {
+                planner.note_keyframe_request();
+            }
         }
         let g0 = Instant::now();
         let (frame, _) = match screen.grab_rect(None) {
@@ -962,9 +1031,37 @@ fn capture_loop(
                 screen.composite_cursor(&mut out, sprite, pos);
             }
         }
+        if let Some(hw) = pipe.as_mut() {
+            let e0 = Instant::now();
+            match hw.feed(&out) {
+                Ok(()) => {
+                    acc_encode += e0.elapsed();
+                    // 取回已完成的访问单元逐个发送；编码器攒头几帧时这里暂时为空。
+                    while let Some(unit) = hw.next_unit(Duration::ZERO) {
+                        let s0 = Instant::now();
+                        if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()) }).is_err() {
+                            return;
+                        }
+                        acc_send += s0.elapsed();
+                        frames_sent += 1;
+                        emitted += 1;
+                        if emitted % 300 == 0 {
+                            println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("   NVENC 喂帧失败：{e}（退回软编）");
+                    planner.note_failure();
+                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                }
+            }
+            continue;
+        }
+        let plan = planner.plan(gate.is_moving());
         let e0 = Instant::now();
-        match encoder.encode_bgra(&out, plan.force_idr) {
-            Ok((au, kind)) => {
+        match encoder.as_mut().map(|encoder| encoder.encode_bgra(&out, plan.force_idr)) {
+            Some(Ok((au, kind))) => {
                 acc_encode += e0.elapsed();
                 planner.note_success();
                 frames_sent += 1;
@@ -981,9 +1078,13 @@ fn capture_loop(
                 }
                 acc_send += s0.elapsed();
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 eprintln!("   编码失败：{e}");
                 planner.note_failure();
+            }
+            None => {
+                eprintln!("   编码器没了（重建失败）");
+                return;
             }
         }
     }

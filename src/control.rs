@@ -201,6 +201,8 @@ pub struct RpcRequest {
     pub request_id: u64,
     /// 2=CaptureSetting 3=FpsSetting 4=VideoQuality 6=Resolution；0=认不出的类型（剪贴板 RPC 等），只 ack 不改状态。
     pub case: u32,
+    /// Message 21 body 里出现过的 bytes 字段号（照参照实现区分会话/插件 RPC 用）。
+    pub kinds: Vec<u32>,
     pub patch: SettingPatch,
 }
 
@@ -234,8 +236,9 @@ pub fn decode_rpc(data: &[u8]) -> Result<RpcRequest, String> {
 
 fn decode_rpc_fields(fields: &[WireField<'_>]) -> Option<RpcRequest> {
     let body = nested(fields, 21)?;
-    let header = nested(&body, 1)?;
-    let request_id = varint_field(&header, 1)?;
+    // 会话/插件 RPC 可能不带 RequestHeader——参照实现容忍缺 header，我们也容忍（request_id=0）。
+    let request_id = nested(&body, 1).and_then(|h| varint_field(&h, 1)).unwrap_or(0);
+    let kinds: Vec<u32> = body.iter().filter(|f| matches!(f.value, WireValue::Bytes(_))).map(|f| f.number).collect();
     let mut patch = SettingPatch::default();
     let case;
     if let Some(inner) = nested(&body, 2) {
@@ -262,18 +265,19 @@ fn decode_rpc_fields(fields: &[WireField<'_>]) -> Option<RpcRequest> {
     } else {
         case = 0;
     }
-    Some(RpcRequest { request_id, case, patch })
+    Some(RpcRequest { request_id, case, kinds, patch })
 }
 
 fn put_int(number: u32, value: u64, out: &mut Vec<u8>) {
     if value != 0 {
-        out.push(((number << 3) | 0) as u8);
+        // tag 也是 varint：字段号 ≥16 时 (number<<3) 会超 127，push 单字节会解成续接。
+        put_varint((u64::from(number) << 3) | 0, out);
         put_varint(value, out);
     }
 }
 
 fn put_nested(number: u32, payload: &[u8], out: &mut Vec<u8>) {
-    out.push(((number << 3) | 2) as u8);
+    put_varint((u64::from(number) << 3) | 2, out);
     put_varint(payload.len() as u64, out);
     out.extend_from_slice(payload);
 }
@@ -296,6 +300,37 @@ pub fn encode_rpc_response(request_id: u64, own_seq: u64, timestamp: u64, error:
     // 成功也要发空消息：官方是 put_bytes(2, &[])，缺字段客户端可能一直等。
     put_nested(2, &response, &mut payload);
     envelope(own_seq, timestamp, 22, &payload)
+}
+
+/// 参照实现的会话/插件 RPC 应答面（官方 webrtc.rs 分派）：
+/// 15 send_video_track_req→11、21 virtual_audio_driver_policy_req→17（空响应=接受）；
+/// 插件 16→12（查询：未启用）/ 17→13 / 18→14 / 19→15 / 20→16（error_code=1 不支持）。
+/// Linux 没有插件；不答这些 RPC 客户端会停在"正在建立连接"，画质菜单也不开。
+/// 认不出任何会话/插件字段时返回 None（调用方回空 CaptureSettingResponse）。
+pub fn session_rpc_response(request_id: u64, own_seq: u64, timestamp: u64, kinds: &[u32]) -> Option<Vec<u8>> {
+    let kind = *kinds.iter().find(|k| matches!(**k, 15 | 16..=21))?;
+    let (field, error_code, id_field): (u32, bool, u32) = match kind {
+        15 => (11, false, 0),
+        21 => (17, false, 0),
+        16 => (12, false, 3),
+        17 => (13, true, 3),
+        18 => (14, true, 2),
+        19 => (15, true, 2),
+        _ => (16, true, 2),
+    };
+    let mut response = Vec::new();
+    if error_code {
+        put_int(1, 1, &mut response);
+    }
+    if id_field != 0 {
+        put_nested(id_field, &[], &mut response);
+    }
+    let mut header = Vec::new();
+    put_int(1, request_id, &mut header);
+    let mut payload = Vec::new();
+    put_nested(1, &header, &mut payload);
+    put_nested(field, &response, &mut payload);
+    Some(envelope(own_seq, timestamp, 22, &payload))
 }
 
 /// Message 25 CaptureSettingSync：报**实际生效**值。客户端要 4:4:4 而我们只产 4:2:0，
@@ -339,7 +374,8 @@ pub fn encode_echo_response(request_seq: u64, own_seq: u64, timestamp: u64) -> V
     action.extend_from_slice(args.as_bytes());
     // FeatureFlag（SimpleAction field 4）：1 ff_capture_setting = 4。声明了就必须每条 21 都回 22，
     // 客户端画质菜单才开得起来；不声明它一条 RPC 都不发。
-    let flags = [8u8, capture_setting_feature_version()];
+    // 照参照实现的完整声明：2 ff_simple_action=2、3 ff_system_metrics=2、6 ff_file_transfer_ftp=2。
+    let flags = [8u8, capture_setting_feature_version(), 16, 2, 24, 2, 48, 2];
     action.push(34);
     action.push(flags.len() as u8);
     action.extend_from_slice(&flags);
@@ -490,6 +526,43 @@ pub fn mouse_button_to_x11(button: i32) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::decode_wire;
+
+    fn response_fields(payload: &[u8]) -> Vec<(u32, Vec<u32>)> {
+        let outer = decode_wire(payload).unwrap();
+        let message = nested(&outer, 22).unwrap();
+        let mut out = Vec::new();
+        for f in message {
+            if let WireValue::Bytes(inner) = &f.value {
+                let numbers = decode_wire(inner).unwrap().iter().map(|x| x.number).collect();
+                out.push((f.number, numbers));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn session_rpc_responses_use_the_matching_response_fields() {
+        let reply = session_rpc_response(7, 1, 2, &[15]).unwrap();
+        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (11, vec![])]);
+        let reply = session_rpc_response(8, 1, 2, &[21]).unwrap();
+        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (17, vec![])]);
+        let reply = session_rpc_response(9, 1, 2, &[16]).unwrap();
+        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (12, vec![3])]);
+        let reply = session_rpc_response(10, 1, 2, &[18]).unwrap();
+        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (14, vec![1, 2])]);
+        assert!(session_rpc_response(11, 1, 2, &[2, 3]).is_none());
+    }
+
+    #[test]
+    fn rpc_request_without_header_still_decodes_with_kinds() {
+        // Message 21 body 只有 field 15（send_video_track_req），没有 RequestHeader。
+        let message = envelope(1, 2, 21, &[122u8, 0]);
+        let request = decode_rpc(&message).unwrap();
+        assert_eq!(request.request_id, 0);
+        assert_eq!(request.case, 0);
+        assert_eq!(request.kinds, vec![15]);
+    }
 
     #[test]
     fn protobuf_echo_request_omits_default_action_type() {

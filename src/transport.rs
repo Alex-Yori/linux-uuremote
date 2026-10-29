@@ -293,6 +293,17 @@ impl Peer {
     pub async fn new(config: RTCConfiguration, events: mpsc::UnboundedSender<PeerEvent>) -> Result<Self, String> {
         let mut media = MediaEngine::default();
         media.register_default_codecs().map_err(|e| format!("注册默认编解码失败: {e}"))?;
+        // UU 私有头扩展（capture-index / new-frame）：客户端延迟与 frm 统计靠它们，
+        // 不注册协商不上，右下角永远 50 ms（见 rtp_metadata）。
+        for uri in [crate::rtp_metadata::CAPTURE_INDEX_URI, crate::rtp_metadata::NEW_FRAME_URI] {
+            media
+                .register_header_extension(
+                    webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability { uri: uri.into() },
+                    webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video,
+                    None,
+                )
+                .map_err(|e| format!("注册 UU RTP 头扩展失败: {e}"))?;
+        }
         let registry = register_default_interceptors(webrtc::interceptor::registry::Registry::new(), &mut media)
             .map_err(|e| format!("注册 RTP 拦截器失败: {e}"))?;
         let mut settings = SettingEngine::default();
@@ -456,15 +467,19 @@ impl Peer {
             .await
             .clone()
             .ok_or("视频轨还没建立（还没收到 offer）")?;
+        let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
         track
-            .write_sample(&Sample {
-                data: Bytes::from(access_unit),
-                timestamp: std::time::SystemTime::now(),
-                duration: duration.max(Duration::from_micros(1)),
-                packet_timestamp: 0,
-                prev_dropped_packets: 0,
-                prev_padding_packets: 0,
-            })
+            .write_sample_with_extensions(
+                &Sample {
+                    data: Bytes::from(access_unit),
+                    timestamp: std::time::SystemTime::now(),
+                    duration: duration.max(Duration::from_micros(1)),
+                    packet_timestamp: 0,
+                    prev_dropped_packets: 0,
+                    prev_padding_packets: 0,
+                },
+                &extensions,
+            )
             .await
             .map_err(|e| format!("写视频样本失败: {e}"))
     }
