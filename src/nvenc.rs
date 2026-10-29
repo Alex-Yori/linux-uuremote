@@ -5,7 +5,7 @@
 //! 输入按 `-framerate` 名义配速，NVENC `p6 + tune ll` 几乎逐帧即时出；
 //! 访问单元按 VCL NAL 边界切分（同 AU 里第二个 slice 起就是下一帧）。
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -29,10 +29,16 @@ pub fn available() -> bool {
 }
 
 /// 一路常驻的 NVENC H.264 编码管道。Drop（或换档位重启）即杀进程。
+///
+/// `closed` 表示 ffmpeg 的 stdout 已到 EOF——它可能已经退出（NVENC 会话被拒、
+/// 分辨率/码率组合不被驱动接受）。**必须在喂帧前查它**：往已死的进程喂帧只会
+/// 拿到 Broken pipe，然后无脑重建就会每秒 spawn 上百个 ffmpeg，把 NVENC 会话槽
+/// 和显存吃光，帧率直接归零（2026-10-29 实测事故）。
 pub struct NvencH264 {
     child: Child,
     stdin: ChildStdin,
     units: mpsc::Receiver<Vec<u8>>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for NvencH264 {
@@ -72,11 +78,13 @@ impl NvencH264 {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|e| format!("起 ffmpeg 失败：{e}"))?;
         let stdin = child.stdin.take().ok_or("ffmpeg 没有 stdin")?;
         let mut stdout = child.stdout.take().ok_or("ffmpeg 没有 stdout")?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_thread = closed.clone();
         std::thread::spawn(move || {
             let mut buffer: Vec<u8> = Vec::with_capacity(1 << 20);
             let mut chunk = [0u8; 1 << 16];
@@ -94,8 +102,29 @@ impl NvencH264 {
                     Err(_) => break,
                 }
             }
+            closed_thread.store(true, std::sync::atomic::Ordering::Relaxed);
         });
-        Ok(Self { child, stdin, units: rx })
+        let stderr = child.stderr.take();
+        if let Some(mut stderr) = stderr {
+            std::thread::spawn(move || {
+                // ffmpeg 的错误必须看得见，否则只能靠 Broken pipe 猜（驱动拒绝、
+                // 会话上限、尺寸不合法都在这里报）。一次会话最多记几条，别刷日志。
+                let mut lines = io::BufReader::new(&mut stderr).lines();
+                let mut logged = 0usize;
+                while let Some(Ok(line)) = lines.next() {
+                    if logged < 8 {
+                        logged += 1;
+                        println!("   NVENC(ffmpeg)：{line}");
+                    }
+                }
+            });
+        }
+        Ok(Self { child, stdin, units: rx, closed })
+    }
+
+    /// ffmpeg 是否还在跑（stdout EOF = 已退出）。
+    pub fn alive(&self) -> bool {
+        !self.closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 喂一整帧 BGR0。管道满时阻塞——这本身就是天然配速。

@@ -227,10 +227,18 @@ impl Signaling {
                     Frame::Ack(id, v) => return Ok(Received::Ack(id, v)),
                     Frame::BinaryEvent(name, header) => {
                         let mut attachments = Vec::new();
-                        // 附件帧紧随 header；'46'/结束帧到达即止。EIO4 附件是裸 binary 帧。
+                        // 附件帧紧随 header；'46'/结束帧到达即止。EIO4 附件是裸 binary 帧，
+                        // 但服务端偶尔带旧版 0x04 前缀——带着它 protobuf 解不开，
+                        // ConnectOptions（初始画质/解码能力）就全丢，客户端菜单与采集目标都对不上。
                         loop {
                             match tokio::time::timeout(Duration::from_millis(200), self.ws.next()).await {
-                                Ok(Some(Ok(Message::Binary(b)))) => attachments.push(b.to_vec()),
+                                Ok(Some(Ok(Message::Binary(b)))) => {
+                                    let mut bytes = b.to_vec();
+                                    if bytes.first() == Some(&4) && crate::wire::decode_wire(&bytes).is_err() {
+                                        bytes.remove(0);
+                                    }
+                                    attachments.push(bytes);
+                                }
                                 _ => break,
                             }
                         }

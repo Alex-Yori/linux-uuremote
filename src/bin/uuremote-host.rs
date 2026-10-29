@@ -923,6 +923,9 @@ fn capture_loop(
         chroma_444: bool,
     ) {
         if *nvenc {
+            // 先杀旧进程再开新的：NVENC 会话槽与显存（每个 ffmpeg 约 346 MB）都是
+            // 稀缺资源，新旧并存会把驱动顶满。
+            *pipe = None;
             match NvencH264::open(w as u32, h as u32, f, br.max(1_000), chroma_444) {
                 Ok(p) => *pipe = Some(p),
                 Err(e) => {
@@ -933,6 +936,24 @@ fn capture_loop(
                 }
             }
         } else {
+            *encoder = OpenH264::new(w, h, f, br.max(1), gop, 4).ok();
+        }
+    }
+
+    /// NVENC 挂了：杀管道、切软编，软编一定要真建出来（否则一帧都发不出）。
+    fn fallback_to_software(
+        pipe: &mut Option<NvencH264>,
+        encoder: &mut Option<OpenH264>,
+        nvenc: &mut bool,
+        w: usize,
+        h: usize,
+        f: u32,
+        br: u32,
+        gop: u32,
+    ) {
+        *pipe = None;
+        *nvenc = false;
+        if encoder.is_none() {
             *encoder = OpenH264::new(w, h, f, br.max(1), gop, 4).ok();
         }
     }
@@ -985,6 +1006,8 @@ fn capture_loop(
     let mut idr_frames = 0u64;
     let mut last_chroma = settings.chroma.load(Ordering::Relaxed);
     let mut last_feed = Instant::now();
+    // 软编兜底后多久允许再试 NVENC（0 = 现在就可以试）。
+    let mut nvenc_retry_at = Instant::now();
     let started = Instant::now();
 
     loop {
@@ -1038,6 +1061,16 @@ fn capture_loop(
             }
             planner.note_keyframe_request();
             println!("   色度切换 → {}", if want_chroma == 1 { "4:4:4 真彩" } else { "4:2:0" });
+        }
+        // 软编兜底之后按 30 s 限流重试硬编（会话槽可能已经释放）。重试失败会在
+        // rebuild_backend 里落回软编，不会连打。
+        if !backend_nvenc && encoder.is_some() && Instant::now() >= nvenc_retry_at {
+            nvenc_retry_at = Instant::now() + Duration::from_secs(30);
+            backend_nvenc = true;
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+            if backend_nvenc {
+                println!("   重试 NVENC 成功，切回硬编");
+            }
         }
         // 客户端自己画本地光标（Windows 光标），视频里没有我们的指针；指针移动仍是
         // "有人在用"的唯一证据，用它维持 moving 档（软编门控用；NVENC 恒发只是日志）。
@@ -1137,6 +1170,15 @@ fn capture_loop(
             }
         }
         if let Some(hw) = pipe.as_mut() {
+            // ffmpeg 已退出（驱动拒绝 / 会话槽耗尽）时不能再喂帧：重建要限流，
+            // 否则每个 tick spawn 一个 ffmpeg，会话与显存被吃光，帧率归零。
+            if !hw.alive() {
+                println!("   NVENC 进程已退出（本次会话改用软编兜底）");
+                planner.note_failure();
+                fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                nvenc_retry_at = Instant::now() + Duration::from_secs(30);
+                continue;
+            }
             let e0 = Instant::now();
             match hw.feed(&out) {
                 Ok(()) => {
@@ -1156,9 +1198,10 @@ fn capture_loop(
                     }
                 }
                 Err(e) => {
-                    eprintln!("   NVENC 喂帧失败：{e}（退回软编）");
+                    eprintln!("   NVENC 喂帧失败：{e}（本次会话退回软编，30 s 后再试硬编）");
                     planner.note_failure();
-                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+                    fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                    nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 }
             }
             continue;
