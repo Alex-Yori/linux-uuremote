@@ -52,11 +52,16 @@ impl Signal {
     }
 
     /// control 事件：头 JSON + protobuf 附件（ConnectOptions）。等 "success" 应答拿 ICE 配置。
+    /// 附件带 0x04 前缀 = 线上观测的官方 framing（fork 实测：不加前缀被控端收不到
+    /// ConnectOptions，answer 永远不回；被控端解析附件时按首字节 0x04 剥头）。
     pub async fn control(&mut self, header: Value, app_data: Vec<u8>, timeout: Duration) -> Result<Value, String> {
         self.next_ack += 1;
         let id = self.next_ack;
         self.send(Message::Text(format!("451-{id}{}", serde_json::json!(["control", header])))).await?;
-        self.send(Message::Binary(app_data)).await?;
+        let mut attachment = Vec::with_capacity(app_data.len() + 1);
+        attachment.push(4);
+        attachment.extend(app_data);
+        self.send(Message::Binary(attachment)).await?;
         tokio::time::timeout(timeout, async {
             loop {
                 match self.packet().await? {

@@ -59,6 +59,7 @@ pub struct Stats {
     pub rtt_ms: AtomicU64,
     pub control_open: AtomicBool,
     pub echo_seen: AtomicBool,
+    pub decode_errors: AtomicU64,
     pub audio_enabled: AtomicBool,
     pub remote_w: AtomicU64,
     pub remote_h: AtomicU64,
@@ -218,7 +219,11 @@ impl Peer {
                                         }
                                     }
                                     Ok(None) => {}
-                                    Err(e) => println!("   解码失败：{e}"),
+                                    Err(e) => {
+                                        // 半途接入时首帧前必然失败一串（没等到 IDR），别刷屏。
+                                        let n = h.stats.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                        if n < 5 { println!("   解码失败：{e}"); }
+                                    }
                                 }
                                 if stopped { break; }
                             }
@@ -251,35 +256,18 @@ impl Peer {
         }));
 
         let h2 = host.clone();
-        let (control, text) = {
-            let mut channels = Vec::new();
-            for label in wire::CHANNELS {
-                channels.push(pc.create_data_channel(label, Some(RTCDataChannelInit { ordered: Some(true), ..Default::default() })).await.map_err(|_| "数据通道创建失败")?);
-            }
-            let wc_open = Arc::downgrade(&channels[0]);
-            let hc = h2.clone();
-            channels[0].on_open(Box::new(move || {
-                hc.stats.control_open.store(true, Ordering::Release);
-                println!("   CONTROL 通道已打开");
-                if let Some(channel) = wc_open.upgrade() {
-                    tokio::spawn(async move { let _ = channel.send(&Bytes::from(wire::echo_request(1))).await; });
-                }
-                Box::pin(async {})
-            }));
-            let h3 = h2.clone();
-            channels[0].on_close(Box::new(move || { h3.stats.control_open.store(false, Ordering::Release); Box::pin(async {}) }));
-            // CONTROL 上只会遇到：被控端 echo 请求/对我们 ping 的 echo 应答、光标形状、同步/能力清单。
-            let h4 = h2.clone();
-            let wc_msg = Arc::downgrade(&channels[0]);
-            channels[0].on_message(Box::new(move |message| {
-                let h = h4.clone();
-                let control = wc_msg.clone();
+        // CONTROL 消息处理：官方被控端会把 echo/光标 发在它**自己开的**入站 CONTROL
+        // 通道里（fork 线上观测），所以我们建的和本端收到的通道都要挂同一个处理。
+        fn control_handler(h: Arc<Host>, sink: Arc<RTCDataChannel>) -> webrtc::data_channel::OnMessageHdlrFn {
+            Box::new(move |message| {
+                let h = h.clone();
+                let control = Arc::downgrade(&sink);
                 Box::pin(async move {
                     let data = message.data;
                     if let Some(request_seq) = wire::echo_request_seq(&data) {
                         h.stats.echo_seen.store(true, Ordering::Release);
                         if let Some(channel) = control.upgrade() {
-                            let _ = channel.send(&Bytes::from(wire::echo_response(2_000_000 + request_seq, request_seq))).await;
+                            let _ = channel.send(&Bytes::from(wire::echo_response(1_000_000 + request_seq, request_seq))).await;
                         }
                     } else if let Some(seq) = wire::echo_response_seq(&data) {
                         if let Some(sent) = h.pings.lock().unwrap_or_else(|e| e.into_inner()).remove(&seq) {
@@ -299,7 +287,37 @@ impl Peer {
                         if let Some(codecs) = codecs { println!("   被控端编码能力清单：H264={} HEVC={}", codecs & 1 != 0, codecs & 2 != 0); }
                     }
                 })
+            })
+        }
+        let h_dc = h2.clone();
+        pc.on_data_channel(Box::new(move |channel| {
+            let h = h_dc.clone();
+            Box::pin(async move {
+                println!("   被控端开入站通道：{}", channel.label());
+                if channel.label() == wire::CHANNELS[0] {
+                    channel.on_message(control_handler(h, channel.clone()));
+                }
+            })
+        }));
+        let (control, text) = {
+            let mut channels = Vec::new();
+            for label in wire::CHANNELS {
+                channels.push(pc.create_data_channel(label, Some(RTCDataChannelInit { ordered: Some(true), ..Default::default() })).await.map_err(|_| "数据通道创建失败")?);
+            }
+            let wc_open = Arc::downgrade(&channels[0]);
+            let hc = h2.clone();
+            channels[0].on_open(Box::new(move || {
+                hc.stats.control_open.store(true, Ordering::Release);
+                println!("   CONTROL 通道已打开");
+                if let Some(channel) = wc_open.upgrade() {
+                    tokio::spawn(async move { let _ = channel.send(&Bytes::from(wire::echo_request(1))).await; });
+                }
+                Box::pin(async {})
             }));
+            let h3 = h2.clone();
+            channels[0].on_close(Box::new(move || { h3.stats.control_open.store(false, Ordering::Release); Box::pin(async {}) }));
+            // CONTROL 上只会遇到：被控端 echo 请求/对我们 ping 的 echo 应答、光标形状、同步/能力清单。
+            channels[0].on_message(control_handler(h2.clone(), channels[0].clone()));
             (channels[0].clone(), channels[1].clone())
         };
 
@@ -322,6 +340,7 @@ impl Peer {
             if let Some(i) = sdp.find("a=group:BUNDLE") { sdp.insert_str(i, "a=x-uuremote-quic\r\n"); }
         }
         sdp = with_max_message_size(&sdp);
+        if let Some(path) = std::env::var_os("UU_VIEWER_DUMP_OFFER") { let _ = std::fs::write(path, &sdp); }
         Ok(json!({"client_id": self.remote_client, "data": {"type": "offer", "sdp": sdp, "ice_id": self.ice_id, "app_control_id": self.app_id, "ice_network_type": 3}}))
     }
 
