@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=UU 远程控制端
+Name[en]=UU Remote Viewer
+GenericName=Remote Desktop Client
+Comment=连接并控制你的其他设备（键鼠透传 / 画质帧率调节 / 声音）
+Exec=/home/yori/.local/bin/uu-viewer-launch
+Icon=linux-uuremote-viewer
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=uu-viewer
+Keywords=UU;远程;远控;remote;desktop;

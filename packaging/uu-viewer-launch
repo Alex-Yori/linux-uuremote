@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# UU 远程控制端启动器：不传参数时自动挑一台在线设备连上。
+# 用法: uu-viewer-launch [device_id]   环境变量 UU_VIEWER_DEVICE 可指定默认目标。
+set -u
+BIN="$HOME/.local/bin/uu-viewer"
+LOG="$HOME/.cache/uuremote/viewer.log"
+mkdir -p "$HOME/.cache/uuremote"
+
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export DISPLAY="${DISPLAY:-:1}"
+export XAUTHORITY="${XAUTHORITY:-/run/user/1000/gdm/Xauthority}"
+
+target="${1:-${UU_VIEWER_DEVICE:-}}"
+
+self="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.config/uuremote/config.json"))).get("device_id",""))' 2>/dev/null || true)"
+
+if [ -z "$target" ]; then
+  # 设备列表里第一台在线且不是本机的设备。
+  target="$("$BIN" --list 2>/dev/null | UU_SELF="$self" python3 -c '
+import os, re, sys
+self = os.environ.get("UU_SELF", "")
+for line in sys.stdin:
+    m = re.search(r"id=([a-z0-9]+)", line)
+    # DISCONNECTED 里含 "CONNECTED" 子串，必须排除。
+    if m and re.search(r"\bCONNECTED\b", line) and "DISCONNECTED" not in line and m.group(1) != self:
+        print(m.group(1)); break
+')"
+fi
+
+if [ -z "$target" ]; then
+  notify-send -u critical "UU 远程控制端" "没有可连接的在线设备（用 uu-viewer --list 查看）"
+  exit 1
+fi
+
+echo "=== $(date -Is) 连接 $target ===" >> "$LOG"
+"$BIN" --device "$target" --window 1280x800 2>&1 | tee -a "$LOG"
+rc=$?
+if [ $rc -ne 0 ]; then
+  notify-send -u normal "UU 远程控制端" "连接 $target 失败，详见 $LOG"
+fi
+exit $rc
