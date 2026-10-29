@@ -95,6 +95,10 @@ struct RemoteSettings {
     decoder_fps: AtomicU64,
     /// 控制端能解 4:4:4（官方宿主把 decoder_cap_list 与自身编码能力求交）。
     decoder_full_chroma: AtomicBool,
+    /// 接收端报告的丢包（fraction_lost 0..255）：0 = 链路干净（LAN 直连），配速直接旁路。
+    loss: AtomicU64,
+    /// PeerConnection 是否已连通：自适应降帧的门槛——没连通时统计的是"没人看"，不是编码器吃不下。
+    connected: AtomicBool,
 }
 
 impl RemoteSettings {
@@ -109,6 +113,8 @@ impl RemoteSettings {
             chroma: AtomicU64::new(0),
             decoder_fps: AtomicU64::new(0),
             decoder_full_chroma: AtomicBool::new(false),
+            loss: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
         }
     }
 }
@@ -407,6 +413,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     println!("   连接状态：{state}");
                     // Connected = DTLS 完成，可以开始推桌面声音（opus 轨在 answer 里谈定过才有）。
                     if state == "connected" {
+                        settings.connected.store(true, Ordering::Relaxed);
                         if let Some(session) = session.as_ref() {
                             if let Some(track) = session.peer.audio_track().await {
                                 // 本地默认输出静音时开虚拟路由：远端有声、本地不出声。
@@ -424,8 +431,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(PeerEvent::ReceiverReport { fraction_lost, total_lost }) => {
+                    settings.loss.store(fraction_lost as u64, Ordering::Relaxed);
                     if fraction_lost > 0 {
-                        println!("   视频丢包：fraction_lost={fraction_lost} total_lost={total_lost}");
+                        println!("   视频丢包：fraction_lost={fraction_lost} total_lost={total_lost}（配速接管）");
                     }
                 }
                 Some(PeerEvent::IceCandidate { candidate, sdp_mid, sdp_mline_index }) => {
@@ -1071,6 +1079,13 @@ fn capture_loop(
     // 软编兜底后多久允许再试 NVENC（0 = 现在就可以试）。
     let mut last_feed = Instant::now();
     let mut nvenc_retry_at = Instant::now();
+    // 关键帧请求限流：PLI/FIR 会连打（客户端解码器一慌就发），每次重启 ffmpeg =
+    // 掉帧 + IDR 码率尖峰——正是"码率振荡、帧间隔 100ms+"的来源。3s 内连打只重启一次。
+    let mut last_rebuild = Instant::now();
+    // 空闲保活与自适应的地基：上一个成品帧的时刻/内容，以及上次真正发出的时刻。
+    let mut last_unit = Instant::now();
+    let mut last_au: Option<Vec<u8>> = None;
+    let mut last_emit = Instant::now();
     let started = Instant::now();
 
     loop {
@@ -1231,15 +1246,17 @@ fn capture_loop(
                 nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 continue;
             }
-            if keyframe.swap(false, Ordering::Relaxed) {
+            if keyframe.load(Ordering::Relaxed) && Instant::now() >= last_rebuild + Duration::from_secs(3) {
                 // zerolatency + 无 lookahead 的 NVENC 没法从外部塞 IDR，重启进程即首帧 IDR。
+                keyframe.store(false, Ordering::Relaxed);
                 rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
                 paced = Duration::ZERO;
                 send_time = Instant::now();
-                println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
+                last_rebuild = Instant::now();
+                println!("   关键帧请求 → NVENC 重启（首帧 IDR；3s 内连打只重启一次）");
             }
             // 先把已经编完的帧取走：取帧间隔直接决定端到端延迟，不能等下一次喂帧。
             let mut drained = 0u64;
@@ -1249,6 +1266,7 @@ fn capture_loop(
                     None => break,
                 };
                 let unit_len = unit.len() as u64;
+                let keep = unit.clone();
                 let s0 = Instant::now();
                 if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()) }).is_err() {
                     return;
@@ -1259,38 +1277,66 @@ fn capture_loop(
                 drained += 1;
                 win_frames += 1;
                 win_bytes += unit_len;
-                // 配速（官方 pacer 等价物）：速率 = libwebrtc 默认的 2.5× 带宽估计、
-                // 下限 10 Mbps。按编码器名义码率串行化曾把大帧一次憋出 166 ms 的发送
-                // 间隔（客户端 frm 变红的直接来源），而 LAN UDP 零丢包根本不需要串行化。
-                let pace_kbps = (applied_bitrate as u64 * 5 / 2).max(10_000);
-                send_time += Duration::from_micros(unit_len * 8 * 1_000 / pace_kbps);
-                let pace_now = Instant::now();
-                if send_time > pace_now {
-                    let gap = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
-                    let wait = (send_time - pace_now).min(gap);
-                    std::thread::sleep(wait);
-                    paced += wait;
-                    // 欠账封顶两个帧间隔：突发最多摊到两帧，不会一直憋着清账。
-                    send_time = send_time.min(Instant::now() + gap * 2);
+                last_au = Some(keep);
+                last_emit = Instant::now();
+                last_unit = Instant::now();
+                // 配速只在链路有丢包时才需要（官方 pacer 的意义是防拥塞）。LAN 直连
+                // 零丢包时串行化纯属自伤：一坨 IDR 按 10Mbps 下限摊 = 100ms+ 的帧间隔，
+                // 正是"frm 50-100ms、延迟恒 50ms"的直接来源。丢包一出现立刻恢复
+                // 2.5× 码率的配速（ReceiverReport 喂 settings.loss）。
+                if settings.loss.load(Ordering::Relaxed) > 0 {
+                    let pace_kbps = (applied_bitrate as u64 * 5 / 2).max(10_000);
+                    send_time += Duration::from_micros(unit_len * 8 * 1_000 / pace_kbps);
+                    let pace_now = Instant::now();
+                    if send_time > pace_now {
+                        let gap = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
+                        let wait = (send_time - pace_now).min(gap);
+                        std::thread::sleep(wait);
+                        paced += wait;
+                        // 欠账封顶两个帧间隔：突发最多摊到两帧，不会一直憋着清账。
+                        send_time = send_time.min(Instant::now() + gap * 2);
+                    }
+                } else {
+                    // 旁路时把"该睡的时间"还回去，避免丢包重现瞬间背着旧欠账。
+                    send_time = Instant::now();
                 }
                 if emitted % 300 == 0 {
                     println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
                 }
             }
+            if drained == 0 && last_unit.elapsed() > Duration::from_millis(250) {
+                // 画面静止（x11grab vfr 不产帧）：这段空闲要从"编码器跟不上"的
+                // 分母里扣掉，否则空闲几十秒后一统计就误判降帧——空闲掉到个位数
+                // 帧率是设计行为（官方 idle repeat），不是编码器吃不下。
+                win_start += last_unit.elapsed() - Duration::from_millis(250);
+            }
             if drained > 0 {
                 gate.note_change(now);
             }
+            // 空闲保活：官方被控端静止时按 still_fps 重发上一帧（"idle repeat"）。
+            // x11grab 空闲不产帧，重发上一个 AU 让客户端解码器活着、状态条 frm
+            // 不至于显示几万毫秒。多 AUD 的 AU（起始码成串）不重发，避免双起始码。
+            if self_capture && backend_nvenc && still_fps > 0 {
+                if let Some(last) = last_au.as_ref() {
+                    let aus = last.windows(4).filter(|w| *w == [0, 0, 0, 1]).count();
+                    if aus <= 1 && now.duration_since(last_emit) >= Duration::from_millis(1_000 / still_fps as u64) {
+                        if frames_tx.blocking_send(Encoded { data: last.clone(), duration: Duration::from_millis(1_000 / still_fps as u64) }).is_ok() {
+                            last_emit = now;
+                        }
+                    }
+                }
+            }
             if self_capture {
                 // 抓屏在 ffmpeg 进程里按 -framerate 自配速，本端只取成品帧。
-                if !downgraded && fps > 15 && win_start.elapsed() >= Duration::from_secs(3) {
+                if !downgraded && fps > 15 && settings.connected.load(Ordering::Relaxed) && win_start.elapsed() >= Duration::from_secs(3) {
                     let sustained = win_frames as f64 / win_start.elapsed().saturating_sub(paced).as_secs_f64().max(0.001);
                     if sustained < f64::from(fps) * 0.85 {
                         let target = (sustained.floor() as u32).max(15).min(fps - 1);
-                        println!("   编码器出帧率 {sustained:.1} fps < 设定 {fps} fps → 配速降到 {target} fps（官方同款自适应）");
+                        println!("   持续出帧率 {sustained:.1} fps < 设定 {fps} fps → 时间线配速降到 {target} fps（不重启编码器：重启 = 掉帧 + IDR 尖峰）");
                         downgrade_from = fps;
                         fps = target;
                         downgraded = true;
-                        rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
+                        timeline = RtpTimeline::new(fps);
                     }
                 }
                 if win_start.elapsed() >= Duration::from_secs(3) {
@@ -1353,22 +1399,22 @@ fn capture_loop(
             }
             // 自适应降帧（官方二进制有同款 "adjust fps to" 逻辑）：编码器吃不下设定
             // 帧率时，喂帧配速会按名义 fps 把帧灌进 stdin 排队——队列就是延迟和卡顿。
-            // 连续 3 s 出帧率低于设定 85% 就把配速降到实测值并重建（一次到位，不来回跳）。
-            if !downgraded && fps > 15 && win_start.elapsed() >= Duration::from_secs(3) {
+            // 连续 3 s 出帧率低于设定 85% 就把配速降到实测值（不重启编码器：喂帧管线
+            // 的重建会断流；真正要降的是喂帧节奏，rebuild 对 stdin 管线没必要）。
+            if !downgraded && fps > 15 && settings.connected.load(Ordering::Relaxed) && win_start.elapsed() >= Duration::from_secs(3) {
                 // 编码器吞吐必须剔除配速睡眠：配速是发送策略，不是编码器吃不下。
                 let sustained = win_frames as f64 / win_start.elapsed().saturating_sub(paced).as_secs_f64().max(0.001);
                 if sustained < f64::from(fps) * 0.85 {
                     let target = (sustained.floor() as u32).max(15).min(fps - 1);
-                    println!("   编码器出帧率 {sustained:.1} fps < 设定 {fps} fps → 配速降到 {target} fps（官方同款自适应）");
+                    println!("   持续出帧率 {sustained:.1} fps < 设定 {fps} fps → 配速降到 {target} fps（不重建后端）");
                     downgrade_from = fps;
                     fps = target;
                     downgraded = true;
-                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
-                win_start = Instant::now();
-                win_frames = 0;
-                win_bytes = 0;
-                paced = Duration::ZERO;
-                send_time = Instant::now();
+                    timeline = RtpTimeline::new(fps);
+                    win_start = Instant::now();
+                    win_frames = 0;
+                    win_bytes = 0;
+                    paced = Duration::ZERO;
                 }
             }
             if win_start.elapsed() >= Duration::from_secs(3) {

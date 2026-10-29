@@ -138,7 +138,7 @@ impl NvencH264 {
         };
         command
             .args(timing_args(fps))
-            .args(["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ull", "-bf", "0"])
+            .args(["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ull", "-bf", "0", "-strict_gop", "1"])
             .args(if chroma_444 {
                 ["-profile:v", "high444p", "-pix_fmt", "yuv444p"].as_slice()
             } else {
