@@ -110,6 +110,11 @@ impl NvencH264 {
     /// 客户端请求 4:4:4 时真切 pix_fmt + profile，不是口头拒绝。
     ///
     /// `-draw_mouse 0`：官方画面不含指针，客户端自己画光标（形状靠 Message 15 上报）。
+    ///
+    /// `capture_display = Some(":1")` 时让 ffmpeg 自己 x11grab 抓屏：实测 2K@90 管线
+    /// 76 fps，而 XShm 抓屏 + stdin 喂帧只有 47 fps（每帧两次 14.7 MB 大拷贝 = 20 ms，
+    /// 那是 90 帧档永远跑不满的真瓶颈）。None = rawvideo 从 stdin 喂帧（软编兜底后
+    /// 的硬编重试也走同一构造）。
     pub fn open(
         width: u32,
         height: u32,
@@ -117,17 +122,27 @@ impl NvencH264 {
         maxrate_kbps: u32,
         cq: u32,
         chroma_444: bool,
+        capture_display: Option<&str>,
     ) -> Result<Self, String> {
         let maxrate = maxrate_kbps.max(1_000);
         let mut command = Command::new("ffmpeg");
         command
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
-            .args([
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        match capture_display {
+            Some(dpy) => command.args([
+                "-f", "x11grab", "-draw_mouse", "0",
+                "-framerate", &fps.to_string(),
+                "-video_size", &format!("{width}x{height}"),
+                "-i", dpy,
+            ]),
+            None => command.args([
                 "-f", "rawvideo", "-pix_fmt", "bgr0",
                 "-s", &format!("{width}x{height}"),
                 "-framerate", &fps.to_string(),
                 "-i", "pipe:0",
-            ])
+            ]),
+        };
+        command
             .args(timing_args(fps))
             .args(["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ull", "-bf", "0"])
             .args(if chroma_444 {

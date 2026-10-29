@@ -922,12 +922,15 @@ fn capture_loop(
         gop: u32,
         cq: u32,
         chroma_444: bool,
+        dpy: Option<&str>,
     ) {
         if *nvenc {
             // 先杀旧进程再开新的：NVENC 会话槽与显存（每个 ffmpeg 约 346 MB）都是
             // 稀缺资源，新旧并存会把驱动顶满。
             *pipe = None;
-            match NvencH264::open(w as u32, h as u32, f, br, cq, chroma_444) {
+            // 默认让 ffmpeg 自己 x11grab（实测比喂帧快一倍）；UU_NVENC_FEED=1 走喂帧管线。
+            let capture = if std::env::var("UU_NVENC_FEED").is_ok() { None } else { Some(dpy.unwrap_or(":0")) };
+            match NvencH264::open(w as u32, h as u32, f, br, cq, chroma_444, capture) {
                 Ok(p) => *pipe = Some(p),
                 Err(e) => {
                     println!("   NVENC 起不来：{e}（退回 openh264 软编）");
@@ -976,9 +979,13 @@ fn capture_loop(
     let mut fps = fps.max(1);
     let mut applied_bitrate = bitrate_kbps;
     let mut backend_nvenc = linux_uuremote::nvenc::available();
+    // NVENC 模式默认让 ffmpeg 自己 x11grab 抓屏（实测 2K@90 管线 76 fps）；
+    // XShm 抓屏 + stdin 喂帧只有 ~47 fps——每帧两次 14.7 MB 大拷贝才是 90 帧档
+    // 跑不满的真瓶颈（自适应曾把它误判成编码器吃不下）。UU_NVENC_FEED=1 切回喂帧。
+    let self_capture = std::env::var("UU_NVENC_FEED").is_err();
     let mut pipe: Option<NvencH264> = None;
     let mut encoder: Option<OpenH264> = None;
-    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
     if pipe.is_none() && encoder.is_none() {
         eprintln!("   编码器起不来（NVENC 与 openh264 都失败）");
         return;
@@ -1038,7 +1045,7 @@ fn capture_loop(
                 Ok(s) => screen = s,
                 Err(e) => eprintln!("   重开采集失败：{}", e.0),
             }
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
@@ -1064,7 +1071,7 @@ fn capture_loop(
             planner = FramePlanner::new(fps, still);
             timeline = RtpTimeline::new(fps);
             if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
@@ -1079,7 +1086,7 @@ fn capture_loop(
         let want_bitrate = settings.bitrate_kbps.load(Ordering::Relaxed) as u32;
         if want_bitrate != 0 && want_bitrate != applied_bitrate {
             applied_bitrate = want_bitrate;
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
             planner.note_keyframe_request();
             println!("   远程改码率 → {want_bitrate} kbps（编码后端已重建）");
         }
@@ -1088,7 +1095,7 @@ fn capture_loop(
         if want_chroma != last_chroma {
             last_chroma = want_chroma;
             if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), want_chroma == 1);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), want_chroma == 1, display);
             }
             planner.note_keyframe_request();
             println!("   色度切换 → {}", if want_chroma == 1 { "4:4:4 真彩" } else { "4:2:0" });
@@ -1098,7 +1105,7 @@ fn capture_loop(
         if !backend_nvenc && encoder.is_some() && Instant::now() >= nvenc_retry_at {
             nvenc_retry_at = Instant::now() + Duration::from_secs(30);
             backend_nvenc = true;
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
@@ -1184,7 +1191,7 @@ fn capture_loop(
             }
             if keyframe.swap(false, Ordering::Relaxed) {
                 // zerolatency + 无 lookahead 的 NVENC 没法从外部塞 IDR，重启进程即首帧 IDR。
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;
@@ -1231,6 +1238,27 @@ fn capture_loop(
             }
             if drained > 0 {
                 gate.note_change(now);
+            }
+            if self_capture {
+                // 抓屏在 ffmpeg 进程里按 -framerate 自配速，本端只取成品帧。
+                if !downgraded && fps > 15 && win_start.elapsed() >= Duration::from_secs(3) {
+                    let sustained = win_frames as f64 / win_start.elapsed().saturating_sub(paced).as_secs_f64().max(0.001);
+                    if sustained < f64::from(fps) * 0.85 {
+                        let target = (sustained.floor() as u32).max(15).min(fps - 1);
+                        println!("   编码器出帧率 {sustained:.1} fps < 设定 {fps} fps → 配速降到 {target} fps（官方同款自适应）");
+                        downgrade_from = fps;
+                        fps = target;
+                        downgraded = true;
+                        rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
+                    }
+                }
+                if win_start.elapsed() >= Duration::from_secs(3) {
+                    win_start = Instant::now();
+                    win_frames = 0;
+                    win_bytes = 0;
+                    paced = Duration::ZERO;
+                }
+                continue;
             }
             // 按 fps 配速喂帧：循环 tick 比帧间隔短，不配速会喂进两倍帧。
             if now.duration_since(last_feed) < Duration::from_nanos(1_000_000_000 / fps.max(1) as u64) {
@@ -1294,7 +1322,7 @@ fn capture_loop(
                     downgrade_from = fps;
                     fps = target;
                     downgraded = true;
-                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1, display);
                 win_start = Instant::now();
                 win_frames = 0;
                 win_bytes = 0;

@@ -42,7 +42,7 @@ fn nvenc(display: Option<&str>, fps: u32, frames: u32) {
     };
     let w = u32::from(screen.width()) & !1;
     let h = u32::from(screen.height()) & !1;
-    let mut hw = match NvencH264::open(w, h, fps, 20_000, nvenc::preset_cq(5), false) {
+    let mut hw = match NvencH264::open(w, h, fps, 20_000, nvenc::preset_cq(5), false, None) {
         Ok(pipe) => pipe,
         Err(e) => {
             eprintln!("NVENC 起不来：{e}");
