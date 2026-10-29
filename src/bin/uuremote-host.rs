@@ -920,13 +920,14 @@ fn capture_loop(
         f: u32,
         br: u32,
         gop: u32,
+        cq: u32,
         chroma_444: bool,
     ) {
         if *nvenc {
             // 先杀旧进程再开新的：NVENC 会话槽与显存（每个 ffmpeg 约 346 MB）都是
             // 稀缺资源，新旧并存会把驱动顶满。
             *pipe = None;
-            match NvencH264::open(w as u32, h as u32, f, br.max(1_000), chroma_444) {
+            match NvencH264::open(w as u32, h as u32, f, br, cq, chroma_444) {
                 Ok(p) => *pipe = Some(p),
                 Err(e) => {
                     println!("   NVENC 起不来：{e}（退回 openh264 软编）");
@@ -977,7 +978,7 @@ fn capture_loop(
     let mut backend_nvenc = linux_uuremote::nvenc::available();
     let mut pipe: Option<NvencH264> = None;
     let mut encoder: Option<OpenH264> = None;
-    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
     if pipe.is_none() && encoder.is_none() {
         eprintln!("   编码器起不来（NVENC 与 openh264 都失败）");
         return;
@@ -1005,13 +1006,15 @@ fn capture_loop(
     let mut emitted = 0u64;
     let mut idr_frames = 0u64;
     let mut last_chroma = settings.chroma.load(Ordering::Relaxed);
-    let mut last_feed = Instant::now();
     // 软编兜底后多久允许再试 NVENC（0 = 现在就可以试）。
+    let mut last_feed = Instant::now();
     let mut nvenc_retry_at = Instant::now();
     let started = Instant::now();
 
     loop {
-        std::thread::sleep(Duration::from_nanos(1_000_000_000 / ((fps.max(1) as u64) * 2)));
+        // 软编按 fps×2 tick；NVENC 抓屏在 ffmpeg 里配速，本端只是取成品帧，
+        // 轮询间隔直接决定端到端延迟，压到 4 ms。
+        std::thread::sleep(if backend_nvenc { Duration::from_millis(4) } else { Duration::from_nanos(1_000_000_000 / ((fps.max(1) as u64) * 2)) });
         let now = Instant::now();
         // 分辨率可能被动改变（客户端 xrandr 切模式 / 手动改显示）：每轮实时量一次根窗口，
         // 变了就重开采集 + 重建后端/比对器/时间线，首帧自然是 IDR。
@@ -1025,7 +1028,7 @@ fn capture_loop(
                 Ok(s) => screen = s,
                 Err(e) => eprintln!("   重开采集失败：{}", e.0),
             }
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
             content = ContentChange::new(width, height, 32, 18);
             timeline = RtpTimeline::new(fps);
             println!("   屏幕尺寸变化 → {}x{}（已重建编码后端，首帧 IDR）", geometry.0, geometry.1);
@@ -1039,7 +1042,7 @@ fn capture_loop(
             planner = FramePlanner::new(fps, still);
             timeline = RtpTimeline::new(fps);
             if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
             }
             println!("   远程改帧率 → {fps} fps");
         }
@@ -1048,7 +1051,7 @@ fn capture_loop(
         let want_bitrate = settings.bitrate_kbps.load(Ordering::Relaxed) as u32;
         if want_bitrate != 0 && want_bitrate != applied_bitrate {
             applied_bitrate = want_bitrate;
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
             planner.note_keyframe_request();
             println!("   远程改码率 → {want_bitrate} kbps（编码后端已重建）");
         }
@@ -1057,7 +1060,7 @@ fn capture_loop(
         if want_chroma != last_chroma {
             last_chroma = want_chroma;
             if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, want_chroma == 1);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), want_chroma == 1);
             }
             planner.note_keyframe_request();
             println!("   色度切换 → {}", if want_chroma == 1 { "4:4:4 真彩" } else { "4:2:0" });
@@ -1067,7 +1070,7 @@ fn capture_loop(
         if !backend_nvenc && encoder.is_some() && Instant::now() >= nvenc_retry_at {
             nvenc_retry_at = Instant::now() + Duration::from_secs(30);
             backend_nvenc = true;
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
             if backend_nvenc {
                 println!("   重试 NVENC 成功，切回硬编");
             }
@@ -1103,46 +1106,9 @@ fn capture_loop(
             acc_send = Duration::ZERO;
             last_stat = now;
         }
-        // NVENC 恒发帧（客户端帧率显示才稳定），但要按 fps 配速——循环每 tick
-        // 抓两次，不配速会喂进 2×fps 帧，编码白做、输出还得上窜。软编走门控。
-        if backend_nvenc {
-            if now.duration_since(last_feed) < Duration::from_nanos(1_000_000_000 / fps.max(1) as u64) {
-                continue;
-            }
-            last_feed = now;
-        }
-        if !backend_nvenc {
-            match gate.decide(now) {
-                Action::Idle => continue,
-                Action::Keepalive | Action::Capture => {}
-            }
-        }
-        if keyframe.swap(false, Ordering::Relaxed) {
-            if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
-                println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
-            } else {
-                planner.note_keyframe_request();
-            }
-        }
-        let g0 = Instant::now();
-        let (frame, _) = match screen.grab_rect(None) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("   抓取失败：{}", e.0);
-                planner.note_failure();
-                continue;
-            }
-        };
-        acc_grab += g0.elapsed();
-        let d0 = Instant::now();
-        let diff = content.check(&frame, width, screen.bytes_per_pixel());
-        if diff.first || diff.changed_pixels > 0 {
-            gate.note_change(now);
-        }
-        acc_diff += d0.elapsed();
-        // 官方被控端把光标形状单独上报，画面不带指针；客户端用形状贴图替换自己的箭头。
-        // UU_COMPOSITE_CURSOR=1 切回旧行为（把光标合成进画面）。
+        // 光标形状单独上报（官方画面不含指针，客户端拿形状贴图换掉自己的箭头）。
+        // NVENC 模式的抓屏在 ffmpeg 进程里做，这段照旧跑：一次 XFixes 取图 0.05 ms。
+        // UU_COMPOSITE_CURSOR=1 才把光标合成进画面（旧行为）。
         let sprite = screen.fetch_cursor().ok();
         if let Some(sprite) = &sprite {
             if !sprite.is_empty() {
@@ -1163,48 +1129,120 @@ fn capture_loop(
                 }
             }
         }
-        let mut out = frame.clone();
-        if composite_cursor {
-            if let (Some(sprite), Some(pos)) = (sprite.as_ref(), screen.cursor_position()) {
-                screen.composite_cursor(&mut out, sprite, pos);
-            }
-        }
-        if let Some(hw) = pipe.as_mut() {
-            // ffmpeg 已退出（驱动拒绝 / 会话槽耗尽）时不能再喂帧：重建要限流，
-            // 否则每个 tick spawn 一个 ffmpeg，会话与显存被吃光，帧率归零。
-            if !hw.alive() {
-                println!("   NVENC 进程已退出（本次会话改用软编兜底）");
+
+        if backend_nvenc {
+            // NVENC 模式不做内容门控：恒帧率恒质量，客户端右下角才不会横跳。
+            // 抓屏走我们的 XShm（实测 5.6 ms，比 ffmpeg 的 x11grab/XGetImage 快一倍），
+            // 整帧喂进编码器；画面不含指针（光标靠 Message 15 上报），所以不用合成也不用克隆。
+            let alive = pipe.as_mut().map(|hw| hw.alive()).unwrap_or(false);
+            if !alive {
+                println!("   NVENC 进程已退出（本次会话改用软编兜底，30 s 后再试硬编）");
                 planner.note_failure();
                 fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
                 nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 continue;
             }
-            let e0 = Instant::now();
-            match hw.feed(&out) {
-                Ok(()) => {
-                    acc_encode += e0.elapsed();
-                    // 取回已完成的访问单元逐个发送；编码器攒头几帧时这里暂时为空。
-                    while let Some(unit) = hw.next_unit(Duration::ZERO) {
-                        let s0 = Instant::now();
-                        if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()) }).is_err() {
-                            return;
-                        }
-                        acc_send += s0.elapsed();
-                        frames_sent += 1;
-                        emitted += 1;
-                        if emitted % 300 == 0 {
-                            println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
-                        }
-                    }
+            if keyframe.swap(false, Ordering::Relaxed) {
+                // zerolatency + 无 lookahead 的 NVENC 没法从外部塞 IDR，重启进程即首帧 IDR。
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, linux_uuremote::nvenc::preset_cq(settings.quality.load(Ordering::Relaxed)), settings.chroma.load(Ordering::Relaxed) == 1);
+                println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
+            }
+            // 先把已经编完的帧取走：取帧间隔直接决定端到端延迟，不能等下一次喂帧。
+            let mut drained = 0u64;
+            loop {
+                let unit = match pipe.as_mut().and_then(|hw| hw.next_unit(Duration::ZERO)) {
+                    Some(unit) => unit,
+                    None => break,
+                };
+                let s0 = Instant::now();
+                if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()) }).is_err() {
+                    return;
                 }
+                acc_send += s0.elapsed();
+                frames_sent += 1;
+                emitted += 1;
+                drained += 1;
+                if emitted % 300 == 0 {
+                    println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
+                }
+            }
+            if drained > 0 {
+                gate.note_change(now);
+            }
+            // 按 fps 配速喂帧：循环 tick 比帧间隔短，不配速会喂进两倍帧。
+            if now.duration_since(last_feed) < Duration::from_nanos(1_000_000_000 / fps.max(1) as u64) {
+                continue;
+            }
+            last_feed = now;
+            let g0 = Instant::now();
+            let (frame, _) = match screen.grab_rect(None) {
+                Ok(g) => g,
                 Err(e) => {
+                    eprintln!("   抓取失败：{}", e.0);
+                    planner.note_failure();
+                    continue;
+                }
+            };
+            acc_grab += g0.elapsed();
+            let fed = if composite_cursor {
+                // 只有显式开画面合成时才克隆（多一次 14.7 MB 拷贝）。
+                let mut out = frame.clone();
+                if let (Some(sprite), Some(pos)) = (sprite.as_ref(), screen.cursor_position()) {
+                    screen.composite_cursor(&mut out, sprite, pos);
+                }
+                out
+            } else {
+                frame
+            };
+            let e0 = Instant::now();
+            match pipe.as_mut().map(|hw| hw.feed(&fed)) {
+                Some(Ok(())) => {
+                    acc_encode += e0.elapsed();
+                }
+                Some(Err(e)) => {
                     eprintln!("   NVENC 喂帧失败：{e}（本次会话退回软编，30 s 后再试硬编）");
                     planner.note_failure();
                     fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
                     nvenc_retry_at = Instant::now() + Duration::from_secs(30);
                 }
+                None => {
+                    println!("   NVENC 管道没了（切软编）");
+                    fallback_to_software(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                    nvenc_retry_at = Instant::now() + Duration::from_secs(30);
+                }
             }
             continue;
+        }
+
+        // 软编兜底路径：门控 + 本端抓屏 + 逐块比对。
+        match gate.decide(now) {
+            Action::Idle => continue,
+            Action::Keepalive | Action::Capture => {}
+        }
+        if keyframe.swap(false, Ordering::Relaxed) {
+            planner.note_keyframe_request();
+        }
+        let g0 = Instant::now();
+        let (frame, _) = match screen.grab_rect(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("   抓取失败：{}", e.0);
+                planner.note_failure();
+                continue;
+            }
+        };
+        acc_grab += g0.elapsed();
+        let d0 = Instant::now();
+        let diff = content.check(&frame, width, screen.bytes_per_pixel());
+        if diff.first || diff.changed_pixels > 0 {
+            gate.note_change(now);
+        }
+        acc_diff += d0.elapsed();
+        let mut out = frame.clone();
+        if composite_cursor {
+            if let (Some(sprite), Some(pos)) = (sprite.as_ref(), screen.cursor_position()) {
+                screen.composite_cursor(&mut out, sprite, pos);
+            }
         }
         let plan = planner.plan(gate.is_moving());
         let e0 = Instant::now();

@@ -188,6 +188,40 @@ pub fn with_max_message_size(sdp: &str) -> String {
     out
 }
 
+/// SDP 里谈定的 RTP 头扩展（`a=extmap:<id> <uri>`）。
+///
+/// 只有出现在这里的 URI 才会被写进包：webrtc-rs 发样本时按**谈定表**查 id，
+/// 查不到就静默丢掉那个扩展。UU 私有两条（capture-index / new-frame）缺任何一条，
+/// 接收端就算收到画面也只能按名义帧长推算延迟与 frm，右下角永远显示 50 ms
+/// （2026-10-29 现场：帧率 45 fps、frm 仍 50 ms，就是这两条没谈定）。
+pub fn negotiated_extmap(sdp_text: &str) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    for line in sdp_text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("a=extmap:") {
+            let mut parts = rest.splitn(2, ' ');
+            let id = match parts.next().and_then(|v| v.split('/').next().and_then(|v| v.parse::<i64>().ok())) {
+                Some(id) => id,
+                None => continue,
+            };
+            if let Some(uri) = parts.next() {
+                out.push((id, uri.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// UU 私有的两条采集元数据扩展是否谈定（缺哪条就报哪条）。
+pub fn missing_uu_extensions(sdp_text: &str) -> Vec<&'static str> {
+    let mapped = negotiated_extmap(sdp_text);
+    let have: Vec<&str> = mapped.iter().map(|(_, uri)| uri.as_str()).collect();
+    [crate::rtp_metadata::CAPTURE_INDEX_URI, crate::rtp_metadata::NEW_FRAME_URI]
+        .into_iter()
+        .filter(|uri| !have.contains(uri))
+        .collect()
+}
+
 /// answer 的 video m 行里谈定的 codec 名字（按 payload type 回查 rtpmap）。
 pub fn negotiated_video_codecs(answer_sdp: &str) -> Vec<String> {
     let mut payload_types: Vec<String> = Vec::new();
@@ -423,6 +457,13 @@ impl Peer {
             return Err(format!("协商后视频没有 H.264（谈定的是 {negotiated:?}）"));
         }
         println!("   视频协商完成：{}", negotiated.join(" / "));
+        // 采集元数据扩展没谈定 = 接收端 frm/延迟永远按名义 50 ms 报，必须看得见。
+        let missing = missing_uu_extensions(&answer.sdp);
+        if missing.is_empty() {
+            println!("   RTP 采集元数据已谈定：capture-index + new-frame");
+        } else {
+            println!("   ⚠ offer 没提出这些 RTP 头扩展，写不进包：{:?}", missing);
+        }
         self.pc.set_local_description(answer.clone()).await.map_err(|e| format!("设置本端描述失败: {e}"))?;
         if !wait_gathering_complete(&self.pc, Duration::from_secs(1)).await {
             // 超时照发：剩余 candidate 走 trickle，客户端照样能打洞。
@@ -577,6 +618,26 @@ pub async fn wait_gathering_complete(pc: &RTCPeerConnection, timeout: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uu_capture_extensions_must_be_in_the_negotiated_extmap() {
+        // 接收端算 frm/延迟靠这两条私有扩展；answer 谈不到 = 写不进包 = 永远显示 50 ms。
+        let offered = format!(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:3 {}\r\na=extmap:5 {}\r\n",
+            crate::rtp_metadata::CAPTURE_INDEX_URI,
+            crate::rtp_metadata::NEW_FRAME_URI
+        );
+        assert!(missing_uu_extensions(&offered).is_empty());
+        assert_eq!(negotiated_extmap(&offered).len(), 2);
+
+        // 只有 abs-send-time 这类标准扩展：UU 两条都缺，必须报出来。
+        let plain = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:4 http://www.abs-send-time\r\n";
+        assert_eq!(missing_uu_extensions(plain).len(), 2);
+
+        // 只谈定一条也要点名，别报"全齐"。
+        let one = format!("a=extmap:3 {}\r\n", crate::rtp_metadata::CAPTURE_INDEX_URI);
+        assert_eq!(missing_uu_extensions(&one), vec![crate::rtp_metadata::NEW_FRAME_URI]);
+    }
 
     #[test]
     fn h264_capability_is_picked_from_the_offer_not_hardcoded() {

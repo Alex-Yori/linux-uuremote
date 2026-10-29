@@ -76,6 +76,17 @@ async fn run(display: Option<String>, frames: u32) -> Result<(), String> {
     // ---------- 控制器（模拟官方客户端：offerer，收视频，建 CONTROL） ----------
     let mut media = MediaEngine::default();
     media.register_default_codecs().map_err(|e| format!("控制器注册编解码失败: {e}"))?;
+    // 官方 Windows 客户端的 offer 会提出 UU 私有采集扩展；自测的控制器必须照做，
+    // 否则被控端谈不到这两条，frm/延迟在接收端只能按名义帧长推算。
+    for uri in [linux_uuremote::rtp_metadata::CAPTURE_INDEX_URI, linux_uuremote::rtp_metadata::NEW_FRAME_URI] {
+        media
+            .register_header_extension(
+                webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability { uri: uri.into() },
+                webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video,
+                None,
+            )
+            .map_err(|e| format!("控制器注册 UU RTP 扩展失败: {e}"))?;
+    }
     let registry = register_default_interceptors(webrtc::interceptor::registry::Registry::new(), &mut media)
         .map_err(|e| format!("控制器注册拦截器失败: {e}"))?;
     let mut settings = SettingEngine::default();
@@ -187,6 +198,11 @@ async fn run(display: Option<String>, frames: u32) -> Result<(), String> {
     // 回环不需要服务器：显式空列表，绕开公共 STUN 的收集等待。
     let host = Peer::new(RTCConfiguration { ice_servers: vec![], ..Default::default() }, host_tx).await?;
     let answer = host.answer_offer(&offer_sdp).await?;
+    // 谈定表里有 UU 两条 = 我们写的 capture-index/new-frame 真会进 RTP 包。
+    let missing = linux_uuremote::transport::missing_uu_extensions(&answer);
+    if !missing.is_empty() {
+        return Err(format!("answer 没谈定 UU 采集元数据扩展：{missing:?}"));
+    }
     println!("   宿主 answer：{} 字节，candidate 行 {} 条", answer.len(), answer.lines().filter(|l| l.contains("a=candidate")).count());
     for line in answer.lines().filter(|l| l.starts_with("m=") || l.starts_with("a=sctp-port") || l.starts_with("a=setup")) {
         println!("   answer: {line}");
