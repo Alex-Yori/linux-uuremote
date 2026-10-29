@@ -6,7 +6,15 @@
 //! 摊平在顶层的话客户端不认，画质与色度会一直停在默认值。
 //!
 //! `video_codec_capability` 每项带自己的最大尺寸；官方查看器把 0x0 当成"不支持"，
-//! 所以只列我们真能产的格式（H.264 / 4:2:0 / 8 bit），不吹 HEVC 和 4:4:4。
+//! 所以只列我们真能产的格式，不吹没实现的能力。
+//!
+//! Windows 控制端的 `negotiation_helper`（二进制里的 negotiation_helper.cpp）按两个
+//! section 解析这份能力：**frame_quality 条目必须有 `max_frame_quality`/`bit_depth`/
+//! `video_codec`/`max_width`/`max_height`，display 条目必须有 `fps`/`hdr`**——缺任一项
+//! 该条目被 `reason=missing_field` 整条丢弃，codec_count 归零后客户端判定"被控端不支持"
+//! （原画与真彩菜单全锁、指定帧率被拒）。所以每条目同时带 `width/height`（旧形状）与
+//! `max_width/max_height/max_frame_quality`（Windows 契约），并额外给出
+//! `frame_quality`/`display` 别名数组，两代客户端都解得动。
 
 use serde_json::{json, Value};
 
@@ -21,6 +29,9 @@ pub const CODEC_IMPL_NVENC: i32 = 0;
 /// 编码能力尺寸：参照实现固定报 3840x2160（编码器的能力，不是当前屏幕的尺寸），
 /// 客户端画质档位按它解锁；报实际屏幕尺寸会把菜单锁死在屏幕档（"原画：被控端不支持"）。
 pub const CODEC_CAPABILITY_SIZE: (u32, u32) = (3840, 2160);
+/// 我们能接受的最高画质档。官方 VideoQuality：0 未知/1 Fast/2 General/3 HD/4 Bluray/5 Auto/6 Custom；
+/// 声明自定义码率（ff_capture_setting=4）就可以到 6。
+pub const MAX_FRAME_QUALITY: i32 = 6;
 
 /// `forward_setting` 的 device_capability：可采集显示器 + 编码能力。
 ///
@@ -48,15 +59,23 @@ pub fn device_capability(
                 "bit_depth": 8,
                 "width": width,
                 "height": height,
+                // Windows negotiation_helper 的必需键（缺了整条被丢）。
+                "max_width": width,
+                "max_height": height,
+                "max_frame_quality": MAX_FRAME_QUALITY,
             }));
         }
     }
+    let displays = json!([{"id": display_id, "fps": fps, "type": 0, "hdr": -1, "width": width, "height": height}]);
     json!({
         "client_id": client_id,
         "data": {
             "device_capability": {
-                "display_info": [{"id": display_id, "fps": fps, "type": 0, "hdr": -1}],
-                "video_codec_capability": codecs,
+                "display_info": [{"id": display_id, "fps": fps, "type": 0, "hdr": -1, "width": width, "height": height}],
+                "video_codec_capability": codecs.clone(),
+                // Windows 控制端按 section 名解析，给出别名数组。
+                "display": displays,
+                "frame_quality": codecs,
                 "ice_id": ice_id,
             },
             "type": "device_capability",
@@ -105,15 +124,24 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(caps.len(), 1);
+        // Windows 必需键必须在场（缺任一项整条被 negotiation_helper 丢弃）。
         assert_eq!(
             caps[0],
-            json!({"video_codec": 1, "chroma_sampling": 1, "codec_impl": 0, "bit_depth": 8, "width": 3840, "height": 2160})
+            json!({"video_codec": 1, "chroma_sampling": 1, "codec_impl": 0, "bit_depth": 8, "width": 3840,
+                   "height": 2160, "max_width": 3840, "max_height": 2160, "max_frame_quality": 6})
         );
+        // frame_quality 是 Windows 控制端读的 section 名，必须与 video_codec_capability 同步。
+        assert_eq!(payload["data"]["device_capability"]["frame_quality"], payload["data"]["device_capability"]["video_codec_capability"]);
+        assert_eq!(payload["data"]["device_capability"]["display"][0]["fps"], 30);
+        // display 条目也必须带 fps/hdr：缺一项 negotiation_helper 整条丢，帧率菜单被判受限。
+        assert_eq!(payload["data"]["device_capability"]["display"][0]["hdr"], -1);
+        assert!(payload["data"]["device_capability"]["display"][0]["hdr"].is_i64());
         assert_eq!(payload["data"]["device_capability"]["display_info"][0]["hdr"], -1);
         assert_eq!(payload["data"]["device_capability"]["ice_id"], "ice-example");
         // HEVC + 真彩叠加出 4 项（照参照实现的笛卡尔积）；没实现的能力绝不虚报。
         let wide = device_capability("c", "i", 0, 60, CODEC_IMPL_NVENC, true, true, 3840, 2160);
         assert_eq!(wide["data"]["device_capability"]["video_codec_capability"].as_array().unwrap().len(), 4);
+        assert_eq!(wide["data"]["device_capability"]["frame_quality"].as_array().unwrap().len(), 4);
     }
 
     #[test]

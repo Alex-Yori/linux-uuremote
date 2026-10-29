@@ -302,8 +302,9 @@ pub fn encode_rpc_response(request_id: u64, own_seq: u64, timestamp: u64, error:
     envelope(own_seq, timestamp, 22, &payload)
 }
 
-/// 参照实现的会话/插件 RPC 应答面（官方 webrtc.rs 分派）：
-/// 15 send_video_track_req→11、21 virtual_audio_driver_policy_req→17（空响应=接受）；
+/// 会话/插件 RPC 应答面，字段号照 Windows GameViewerServer.exe 内嵌 rpc_main.proto：
+/// RpcResponse{11 send_video_track_rsp、12 query_plugin、13 update_plugin、14 dl_install_plugin、
+/// 15 plugin_enable_notif、16 plugin_notif、17 virtual_audio_policy_rsp}，与请求同位；
 /// 插件 16→12（查询：未启用）/ 17→13 / 18→14 / 19→15 / 20→16（error_code=1 不支持）。
 /// Linux 没有插件；不答这些 RPC 客户端会停在"正在建立连接"，画质菜单也不开。
 /// 认不出任何会话/插件字段时返回 None（调用方回空 CaptureSettingResponse）。
@@ -330,16 +331,12 @@ pub fn session_rpc_response(request_id: u64, own_seq: u64, timestamp: u64, kinds
     let mut payload = Vec::new();
     put_nested(1, &header, &mut payload);
     put_nested(field, &response, &mut payload);
-    // send_video_track_req：参照实现实测回 field 11，官方 rpc_main.proto 数到的是
-    // field 17 send_video_track_rsp——并列放空消息，oneof 取最后一个，两边语义都是"已接受"。
-    if kind == 15 {
-        put_nested(17, &[], &mut payload);
-    }
     Some(envelope(own_seq, timestamp, 22, &payload))
 }
 
-/// Message 25 CaptureSettingSync：报**实际生效**值。`chroma` 是管线真实色度
-/// （1 = 4:2:0、3 = 4:4:4）——参照实现请求 4:4:4、实际 4:2:0 时同步报 1。
+/// Message 25 CaptureSettingSync：报**实际生效**值。官方 schema（Windows 内嵌描述符）里
+/// field 1 是 **FPS 枚举**（1=30/2=60/3=90/4=144），不是帧率数字——报 60 客户端解成未知档，
+/// 会判定"被控端没接受指定帧率"。`chroma` 是管线真实色度（1=4:2:0、3=4:4:4）。
 pub fn encode_capture_setting_sync(
     seq: u64,
     timestamp: u64,
@@ -351,7 +348,7 @@ pub fn encode_capture_setting_sync(
     chroma: u64,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
-    put_int(1, u64::from(fps), &mut payload);
+    put_int(1, crate::capture_setting::fps_to_enum(fps), &mut payload);
     put_int(2, quality, &mut payload);
     put_int(3, chroma, &mut payload);
     if quality == 6 && custom_bps > 0 {
@@ -362,6 +359,30 @@ pub fn encode_capture_setting_sync(
     put_int(9, u64::from(width), &mut payload);
     put_int(10, u64::from(height), &mut payload);
     envelope(seq, timestamp, 25, &payload)
+}
+
+/// Message 14 `ReportQosStats`（官方 Windows 宿主每次会话都报）：
+/// `{1 encoder_type, 2 capture_type, 3 probe_bps, 4 video_quality, 5 fast_bitrate,
+/// 6 general_bitrate, 7 hd_bitrate, 8 bluray_bitrate}`。控制端的编码器/采集显示与各档
+/// 码率上限读这份报文；不报它，客户端只能显示默认值。码率单位 bit/s。
+pub fn encode_qos_stats(
+    seq: u64,
+    timestamp: u64,
+    encoder_type: &str,
+    capture_type: &str,
+    probe_bps: u64,
+    quality: u64,
+    tier_bitrates_bps: (u64, u64, u64, u64),
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_nested(1, encoder_type.as_bytes(), &mut payload);
+    put_nested(2, capture_type.as_bytes(), &mut payload);
+    put_int(3, probe_bps, &mut payload);
+    put_int(4, quality, &mut payload);
+    for (field, bps) in [(5u32, tier_bitrates_bps.0), (6, tier_bitrates_bps.1), (7, tier_bitrates_bps.2), (8, tier_bitrates_bps.3)] {
+        put_int(field, bps, &mut payload);
+    }
+    envelope(seq, timestamp, 14, &payload)
 }
 
 /// ff_capture_setting 版本号。4 = 累积含 CUSTOM_BITRATE（fps/预设画质/自定义码率 RPC）。
@@ -548,10 +569,42 @@ mod tests {
     }
 
     #[test]
+    fn qos_stats_reports_encoder_names_and_tier_bitrates() {
+        let stats = encode_qos_stats(1, 2, "NVIDIA NVENC", "X11", 6_000_000, 5, (1_000_000, 2_000_000, 8_000_000, 20_000_000));
+        let fields = decode_wire(&stats).unwrap();
+        let body = nested(&fields, 14).unwrap();
+        let numbers: Vec<u32> = body.iter().map(|f| f.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let strings: Vec<&str> = body
+            .iter()
+            .filter_map(|f| match &f.value { WireValue::Bytes(b) => std::str::from_utf8(b).ok(), _ => None })
+            .collect();
+        assert_eq!(strings, vec!["NVIDIA NVENC", "X11"]);
+    }
+
+    #[test]
+    fn sync_reports_fps_as_enum_not_as_a_number() {
+        // 官方 CaptureSettingSync{1 fps(FPS 枚举), 2 frame_quality, 3 chroma_format, 5/6 逻辑分辨率,
+        // 9/10 像素分辨率}。field 1 报 60（数字）客户端解成未知档 → "被控端不支持指定帧率"。
+        let sync = encode_capture_setting_sync(1, 2, 60, 4, 0, 2560, 1440, 3);
+        let fields = decode_wire(&sync).unwrap();
+        let body = nested(&fields, 25).unwrap();
+        let got: Vec<(u32, u64)> = body
+            .iter()
+            .filter_map(|f| match &f.value { WireValue::Varint(v) => Some((f.number, *v)), _ => None })
+            .collect();
+        assert_eq!(got, vec![(1, 2), (2, 4), (3, 3), (5, 2560), (6, 1440), (9, 2560), (10, 1440)]);
+        // 帧率档边界：30→1、90→3、144/更高→4（>144 官方走 super screen，普通档封顶 144）。
+        assert_eq!(crate::capture_setting::fps_to_enum(12), 1);
+        assert_eq!(crate::capture_setting::fps_to_enum(90), 3);
+        assert_eq!(crate::capture_setting::fps_to_enum(240), 4);
+    }
+
+    #[test]
     fn session_rpc_responses_use_the_matching_response_fields() {
         let reply = session_rpc_response(7, 1, 2, &[15]).unwrap();
-        // 11（参照实现实测）与 17（官方 rpc_main.proto）并列空响应，两边语义都是"已接受"。
-        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (11, vec![]), (17, vec![])]);
+        // 官方 rpc_main.proto：RpcResponse 11 = send_video_track_rsp（空 = 已接受）。
+        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (11, vec![])]);
         let reply = session_rpc_response(8, 1, 2, &[21]).unwrap();
         assert_eq!(response_fields(&reply), vec![(1, vec![1]), (17, vec![])]);
         let reply = session_rpc_response(9, 1, 2, &[16]).unwrap();

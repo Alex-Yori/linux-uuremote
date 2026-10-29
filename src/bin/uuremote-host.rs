@@ -16,7 +16,7 @@ use linux_uuremote::config;
 use linux_uuremote::content::ContentChange;
 use linux_uuremote::capability;
 use linux_uuremote::control::{
-    action_name, decode_control, encode_capture_setting_sync, encode_echo_response, encode_rpc_response,
+    action_name, decode_control, encode_capture_setting_sync, encode_echo_response, encode_qos_stats, encode_rpc_response,
     preset_bitrate_kbps, ControlMessage, RpcRequest,
 };
 use linux_uuremote::capture_setting;
@@ -44,6 +44,8 @@ enum Signal {
     BeControlled {
         header: Value,
         capture_type: u64,
+        /// 官方 ConnectOptions：客户端带来的初始采集设置与解码能力（可能解不出来，None = 按默认）。
+        options: Option<linux_uuremote::capture_setting::ConnectOptions>,
     },
     Offer {
         sdp: String,
@@ -89,6 +91,10 @@ struct RemoteSettings {
     native: std::sync::Mutex<(u32, u32)>,
     /// 真彩：1 = 4:4:4（NVENC yuv444p 管线），0 = 4:2:0。软编永远 4:2:0。
     chroma: AtomicU64,
+    /// 控制端解码帧率上限（ConnectOptions.DecoderCap），0 = 未知。
+    decoder_fps: AtomicU64,
+    /// 控制端能解 4:4:4（官方宿主把 decoder_cap_list 与自身编码能力求交）。
+    decoder_full_chroma: AtomicBool,
 }
 
 impl RemoteSettings {
@@ -101,6 +107,8 @@ impl RemoteSettings {
             custom_bps: AtomicU64::new(0),
             native: std::sync::Mutex::new((0, 0)),
             chroma: AtomicU64::new(0),
+            decoder_fps: AtomicU64::new(0),
+            decoder_full_chroma: AtomicBool::new(false),
         }
     }
 }
@@ -191,7 +199,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         println!("   信令事件：{name} type={kind}");
                         match name.as_str() {
                             signaling::EVENT_SOAC => forward_soac(&sig_tx, v),
-                            signaling::EVENT_BE_CONTROLLED => { let _ = sig_tx.send(Signal::BeControlled { header: v, capture_type: 0 }); }
+                            signaling::EVENT_BE_CONTROLLED => { let _ = sig_tx.send(Signal::BeControlled { header: v, capture_type: 0, options: None }); }
                             signaling::EVENT_RELEASED | signaling::EVENT_LEFT => { let _ = sig_tx.send(Signal::PeerLeft); }
                             _ => {}
                         }
@@ -204,16 +212,32 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     Ok(Received::BinaryEvent(name, header, attachments)) => {
                         // be-controlled 的关键信息在附件的 protobuf 里：field 1 = 采集目标
                         // （0 未知 / 1 桌面 / 2 窗口 / 5 文件 / 8 终端 / 9 端口映射）。
-                        let capture_type = attachments
+                        let options = attachments
                             .iter()
-                            .find_map(|bytes| linux_uuremote::wire::decode_wire(bytes).ok())
-                            .map(|fields| fields.iter().find(|f| f.number == 1).and_then(|f| match &f.value { linux_uuremote::wire::WireValue::Varint(v) => Some(*v), _ => None }))
-                            .flatten()
-                            .unwrap_or(0);
+                            .find_map(|bytes| linux_uuremote::capture_setting::connect_options(bytes));
+                        // ConnectOptions 解不出来时至少把采集目标抠出来，别退成 0。
+                        let capture_type = options.as_ref().map(|o| o.capture_type).unwrap_or_else(|| {
+                            attachments
+                                .iter()
+                                .find_map(|bytes| linux_uuremote::wire::decode_wire(bytes).ok())
+                                .and_then(|fields| linux_uuremote::wire::varint_field(&fields, 1))
+                                .unwrap_or(0)
+                        });
                         let header = header.unwrap_or(Value::Null);
-                        println!("   {name}(binary)：附件 {} 段 capture_type={capture_type}", attachments.len());
+                        println!(
+                            "   {name}(binary)：附件 {} 段 capture_type={capture_type}{}{}",
+                            attachments.len(),
+                            options.as_ref().map(|o| format!(" 客户端版本={}", o.client_version)).unwrap_or_default(),
+                            options.as_ref().map(|o| format!(" 解码能力 {} 条", o.decoder_caps.len())).unwrap_or_default(),
+                        );
+                        if options.is_none() && name == signaling::EVENT_BE_CONTROLLED {
+                            // 解不出 ConnectOptions 就把结构打出来，下次连接能照着官方 schema 修。
+                            for bytes in attachments.iter().take(2) {
+                                println!("   ConnectOptions 结构：{}", linux_uuremote::wire::wire_shape(bytes, 3));
+                            }
+                        }
                         if name == signaling::EVENT_BE_CONTROLLED {
-                            let _ = sig_tx.send(Signal::BeControlled { header, capture_type });
+                            let _ = sig_tx.send(Signal::BeControlled { header, capture_type, options });
                         }
                     }
                     Ok(Received::Closed) => { let _ = sig_tx.send(Signal::Closed("信令关闭".into())); break; }
@@ -235,8 +259,37 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     // room_info 的 iceServers 只是备份：真正的每会议配置在 be-controlled 的 header 里。
                     println!("   room_info ack ✓：iceServers {} 台", ice_servers_from_json(&v).len());
                 }
-                Some(Signal::BeControlled { header, capture_type }) => {
+                Some(Signal::BeControlled { header, capture_type, options }) => {
                     println!("   收到拉流请求（capture_type={capture_type}）");
+                    // 官方 ConnectOptions 带来客户端的初始采集设置与解码能力：
+                    // 先按它设初值（客户端 UI 上显示的就是这些），再拿解码能力与自身
+                    // 编码能力求交——真彩/帧率上限都由这个交集决定，不是宿主单方面声明。
+                    if let Some(opts) = options.as_ref() {
+                        let dec_fps = linux_uuremote::capture_setting::decoder_max_fps(&opts.decoder_caps, 0);
+                        settings.decoder_fps.store(u64::from(dec_fps), Ordering::Relaxed);
+                        let full = linux_uuremote::capture_setting::decoder_allows_full_chroma(&opts.decoder_caps);
+                        settings.decoder_full_chroma.store(full, Ordering::Relaxed);
+                        if let Some(fps) = opts.initial.fps {
+                            settings.moving_fps.store((fps.max(5)).min(144) as u64, Ordering::Relaxed);
+                        }
+                        if let Some(quality) = opts.initial.quality {
+                            let custom = opts.initial.custom_bps.unwrap_or(0);
+                            settings.quality.store(quality, Ordering::Relaxed);
+                            settings.custom_bps.store(custom, Ordering::Relaxed);
+                            let kbps = preset_bitrate_kbps(quality, custom);
+                            if kbps > 0 {
+                                settings.bitrate_kbps.store(kbps as u64, Ordering::Relaxed);
+                            }
+                        }
+                        if opts.initial.chroma == Some(3) && full && linux_uuremote::nvenc::available() {
+                            settings.chroma.store(1, Ordering::Relaxed);
+                        }
+                        println!(
+                            "   客户端初始设置：fps={:?} 画质档={:?} 色度={:?} hdr={} 跟随被控端={}；解码上限 fps={} 真彩={}",
+                            opts.initial.fps, opts.initial.quality, opts.initial.chroma, opts.initial.hdr,
+                            opts.initial.follow_remote, dec_fps, full,
+                        );
+                    }
                     SOAC_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
                     // 每次拉流新建一条会话：ICE 配置属于这一次会议，不能复用上一条。
                     if let Some(old) = session.take() {
@@ -527,7 +580,7 @@ async fn apply_rpc(
     }
     // 真彩照参照实现：NVENC 管线真切 4:4:4，软编拒绝并降 4:2:0，Sync 一律报实际值。
     if p.chroma == Some(3) {
-        if linux_uuremote::nvenc::available() {
+        if linux_uuremote::nvenc::available() && settings.decoder_full_chroma.load(Ordering::Relaxed) {
             settings.chroma.store(1, Ordering::Relaxed);
             println!("   真彩：NVENC 切 4:4:4（采集循环按新色度重建编码器）");
         } else {
@@ -681,6 +734,7 @@ fn start_video(
     let display = display.clone();
     let display_init = display.clone();
     let thread_settings = settings.clone();
+    let init_settings = settings.clone();
     session.capture = Some(
         std::thread::Builder::new()
             .name("uu-capture".into())
@@ -710,13 +764,36 @@ fn start_video(
         // 编码能力报编码器上限（NVENC 固定 4K），不是屏幕尺寸——客户端画质档位按它解锁。
         let nvenc = linux_uuremote::nvenc::available();
         let codec_size = if nvenc { capability::CODEC_CAPABILITY_SIZE } else { (width, height) };
+        // 与客户端解码能力求交：CodecNegotiation 的 fps 上限不能超过对端能解的帧率，
+        // 真彩只有两边都支持才声明（官方宿主就是这么做的）。
+        let dec_fps = init_settings.decoder_fps.load(Ordering::Relaxed) as u32;
+        let cap_fps = if dec_fps > 0 { refresh.min(dec_fps) } else { refresh };
+        let full_chroma = nvenc && init_settings.decoder_full_chroma.load(Ordering::Relaxed);
         let scaled: Vec<(i32, i32)> = capture_setting::scaled_sizes((width, height))
             .into_iter()
             .map(|(w, h)| (w as i32, h as i32))
             .collect();
+        let applied_bitrate_init = bitrate_kbps;
+        // 各档码率上限照官方档位表报（Message 14 ReportQosStats 的 5-8 号字段）。
+        let tiers = (
+            u64::from(preset_bitrate_kbps(1, 0)) * 1_000,
+            u64::from(preset_bitrate_kbps(2, 0)) * 1_000,
+            u64::from(preset_bitrate_kbps(3, 0)) * 1_000,
+            u64::from(preset_bitrate_kbps(4, 0)) * 1_000,
+        );
+        let encoder_name = if nvenc { "NVIDIA NVENC" } else { "OpenH264" };
         let messages: Vec<Vec<u8>> = vec![
             encode_capture_change(next_sequence(), now(), 0, 0, "Linux desktop").unwrap_or_default(),
-            envelope(next_sequence(), now(), 18, &capture_setting::codec_negotiation(codec_size, refresh, false)),
+            envelope(next_sequence(), now(), 18, &capture_setting::codec_negotiation(codec_size, cap_fps, false)),
+            encode_qos_stats(
+                next_sequence(),
+                now(),
+                encoder_name,
+                "X11",
+                u64::from(applied_bitrate_init.max(1)) * 1_000,
+                init_settings.quality.load(Ordering::Relaxed),
+                tiers,
+            ),
             encode_screen_sources(
                 next_sequence(),
                 now(),
@@ -770,9 +847,9 @@ fn start_video(
                     0,
                     refresh as i32,
                     if nvenc { capability::CODEC_IMPL_NVENC } else { capability::CODEC_IMPL_SOFTWARE },
-                    // HEVC 本机驱动实测 InitializeEncoder failed，不虚报；NVENC 真能编 4:4:4。
+                    // HEVC 本机驱动实测 InitializeEncoder failed，不虚报；真彩要两边都支持。
                     false,
-                    nvenc,
+                    full_chroma,
                     codec_size.0,
                     codec_size.1,
                 )),
@@ -785,8 +862,9 @@ fn start_video(
             ))
             .ok();
         println!(
-            "   能力已上报：H.264 4:2:0 {}x{} @{refresh}fps 刷新率（X11 采集 / {}，推流档 {fps}fps）",
-            codec_size.0, codec_size.1, if nvenc { "NVENC 硬编" } else { "OpenH264 软编" }
+            "   能力已上报：H.264 {} {}x{} @{}fps（X11 采集 / {}，推流档 {fps}fps）",
+            if full_chroma { "4:2:0+4:4:4" } else { "4:2:0" },
+            codec_size.0, codec_size.1, cap_fps, if nvenc { "NVENC 硬编" } else { "OpenH264 软编" },
         );
         if !app_control_id.is_empty() {
             emit_tx
