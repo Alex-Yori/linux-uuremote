@@ -87,6 +87,8 @@ struct RemoteSettings {
     custom_bps: AtomicU64,
     /// 实测原生尺寸（采集线程每轮刷新；RPC 回复与 Sync 报真实值）。
     native: std::sync::Mutex<(u32, u32)>,
+    /// 真彩：1 = 4:4:4（NVENC yuv444p 管线），0 = 4:2:0。软编永远 4:2:0。
+    chroma: AtomicU64,
 }
 
 impl RemoteSettings {
@@ -98,6 +100,7 @@ impl RemoteSettings {
             quality: AtomicU64::new(5),
             custom_bps: AtomicU64::new(0),
             native: std::sync::Mutex::new((0, 0)),
+            chroma: AtomicU64::new(0),
         }
     }
 }
@@ -522,8 +525,17 @@ async fn apply_rpc(
         println!("   设置 RPC case={} fps={:?} quality={:?} bps={:?} {}x{:?} follow_host={} chroma={:?} codec={:?}",
             request.case, p.fps, p.quality, p.custom_bps, "当前", p.width.zip(p.height), p.follow_host, p.chroma, p.codec);
     }
+    // 真彩照参照实现：NVENC 管线真切 4:4:4，软编拒绝并降 4:2:0，Sync 一律报实际值。
     if p.chroma == Some(3) {
-        println!("   请求 4:4:4 真彩；本编码管线只产 4:2:0（Sync 报实际值）");
+        if linux_uuremote::nvenc::available() {
+            settings.chroma.store(1, Ordering::Relaxed);
+            println!("   真彩：NVENC 切 4:4:4（采集循环按新色度重建编码器）");
+        } else {
+            settings.chroma.store(0, Ordering::Relaxed);
+            println!("   请求 4:4:4 真彩；软编管线只产 4:2:0（Sync 报实际值）");
+        }
+    } else if p.chroma == Some(1) {
+        settings.chroma.store(0, Ordering::Relaxed);
     }
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     if request.case == 0 {
@@ -578,6 +590,7 @@ async fn apply_rpc(
     let reply = encode_rpc_response(request.request_id, next_sequence(), ts, None);
     let (native_w, native_h) = *settings.native.lock().unwrap();
     let fps_now = settings.moving_fps.load(Ordering::Relaxed) as u32;
+    let chroma_now = settings.chroma.load(Ordering::Relaxed);
     let sync = encode_capture_setting_sync(
         next_sequence(),
         ts,
@@ -586,6 +599,7 @@ async fn apply_rpc(
         settings.custom_bps.load(Ordering::Relaxed),
         native_w,
         native_h,
+        if chroma_now == 1 { 3 } else { 1 },
     );
     if let Err(e) = peer.send_on(reply_label, &reply).await {
         eprintln!("   RPC 回包失败：{e}");
@@ -756,8 +770,9 @@ fn start_video(
                     0,
                     refresh as i32,
                     if nvenc { capability::CODEC_IMPL_NVENC } else { capability::CODEC_IMPL_SOFTWARE },
+                    // HEVC 本机驱动实测 InitializeEncoder failed，不虚报；NVENC 真能编 4:4:4。
                     false,
-                    false,
+                    nvenc,
                     codec_size.0,
                     codec_size.1,
                 )),
@@ -827,9 +842,10 @@ fn capture_loop(
         f: u32,
         br: u32,
         gop: u32,
+        chroma_444: bool,
     ) {
         if *nvenc {
-            match NvencH264::open(w as u32, h as u32, f, br.max(1_000)) {
+            match NvencH264::open(w as u32, h as u32, f, br.max(1_000), chroma_444) {
                 Ok(p) => *pipe = Some(p),
                 Err(e) => {
                     println!("   NVENC 起不来：{e}（退回 openh264 软编）");
@@ -862,7 +878,7 @@ fn capture_loop(
     let mut backend_nvenc = linux_uuremote::nvenc::available();
     let mut pipe: Option<NvencH264> = None;
     let mut encoder: Option<OpenH264> = None;
-    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
     if pipe.is_none() && encoder.is_none() {
         eprintln!("   编码器起不来（NVENC 与 openh264 都失败）");
         return;
@@ -889,6 +905,7 @@ fn capture_loop(
     let mut content = ContentChange::new(width, height, 32, 18);
     let mut emitted = 0u64;
     let mut idr_frames = 0u64;
+    let mut last_chroma = settings.chroma.load(Ordering::Relaxed);
     let mut last_feed = Instant::now();
     let started = Instant::now();
 
@@ -907,7 +924,7 @@ fn capture_loop(
                 Ok(s) => screen = s,
                 Err(e) => eprintln!("   重开采集失败：{}", e.0),
             }
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
             content = ContentChange::new(width, height, 32, 18);
             timeline = RtpTimeline::new(fps);
             println!("   屏幕尺寸变化 → {}x{}（已重建编码后端，首帧 IDR）", geometry.0, geometry.1);
@@ -921,7 +938,7 @@ fn capture_loop(
             planner = FramePlanner::new(fps, still);
             timeline = RtpTimeline::new(fps);
             if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
             }
             println!("   远程改帧率 → {fps} fps");
         }
@@ -930,9 +947,19 @@ fn capture_loop(
         let want_bitrate = settings.bitrate_kbps.load(Ordering::Relaxed) as u32;
         if want_bitrate != 0 && want_bitrate != applied_bitrate {
             applied_bitrate = want_bitrate;
-            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop);
+            rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, want_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
             planner.note_keyframe_request();
             println!("   远程改码率 → {want_bitrate} kbps（编码后端已重建）");
+        }
+        // 真彩开关（apply_rpc 写 settings.chroma）→ 重建后端换 pix_fmt，首帧自然 IDR。
+        let want_chroma = settings.chroma.load(Ordering::Relaxed);
+        if want_chroma != last_chroma {
+            last_chroma = want_chroma;
+            if backend_nvenc {
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, want_chroma == 1);
+            }
+            planner.note_keyframe_request();
+            println!("   色度切换 → {}", if want_chroma == 1 { "4:4:4 真彩" } else { "4:2:0" });
         }
         // 客户端自己画本地光标（Windows 光标），视频里没有我们的指针；指针移动仍是
         // "有人在用"的唯一证据，用它维持 moving 档（软编门控用；NVENC 恒发只是日志）。
@@ -981,7 +1008,7 @@ fn capture_loop(
         }
         if keyframe.swap(false, Ordering::Relaxed) {
             if backend_nvenc {
-                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
                 println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
             } else {
                 planner.note_keyframe_request();
@@ -1053,7 +1080,7 @@ fn capture_loop(
                 Err(e) => {
                     eprintln!("   NVENC 喂帧失败：{e}（退回软编）");
                     planner.note_failure();
-                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop);
+                    rebuild_backend(&mut pipe, &mut encoder, &mut backend_nvenc, width, height, fps, applied_bitrate, gop, settings.chroma.load(Ordering::Relaxed) == 1);
                 }
             }
             continue;

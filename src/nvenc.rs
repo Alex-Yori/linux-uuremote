@@ -43,7 +43,9 @@ impl Drop for NvencH264 {
 }
 
 impl NvencH264 {
-    pub fn open(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self, String> {
+    /// `chroma_444` = 真彩：NVENC 实测能编 yuv444p（ffprobe 解出 High 4:4:4 Predictive），
+    /// 客户端请求 4:4:4 时照参照实现（NVENC 全色度管线）切过去，不是口头拒绝。
+    pub fn open(width: u32, height: u32, fps: u32, bitrate_kbps: u32, chroma_444: bool) -> Result<Self, String> {
         let bitrate = bitrate_kbps.max(1_000);
         let mut command = Command::new("ffmpeg");
         command
@@ -56,7 +58,11 @@ impl NvencH264 {
             ])
             .args([
                 "-c:v", "h264_nvenc", "-preset", "p6", "-tune", "ll",
-                "-profile:v", "high", "-pix_fmt", "yuv420p", "-bf", "0",
+                "-bf", "0",
+            ])
+            // 4:4:4 不锁 profile：ffmpeg 自动选 High 4:4:4 Predictive（实测可解）。
+            .args(if chroma_444 { ["-pix_fmt", "yuv444p"].as_slice() } else { ["-profile:v", "high", "-pix_fmt", "yuv420p"].as_slice() })
+            .args([
                 "-rc", "cbr",
                 "-b:v", &format!("{bitrate}k"),
                 "-maxrate", &format!("{bitrate}k"),

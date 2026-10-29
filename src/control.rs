@@ -330,11 +330,16 @@ pub fn session_rpc_response(request_id: u64, own_seq: u64, timestamp: u64, kinds
     let mut payload = Vec::new();
     put_nested(1, &header, &mut payload);
     put_nested(field, &response, &mut payload);
+    // send_video_track_req：参照实现实测回 field 11，官方 rpc_main.proto 数到的是
+    // field 17 send_video_track_rsp——并列放空消息，oneof 取最后一个，两边语义都是"已接受"。
+    if kind == 15 {
+        put_nested(17, &[], &mut payload);
+    }
     Some(envelope(own_seq, timestamp, 22, &payload))
 }
 
-/// Message 25 CaptureSettingSync：报**实际生效**值。客户端要 4:4:4 而我们只产 4:2:0，
-/// chroma 就报 1——参照实现请求 4:4:4、实际 4:2:0、同步报 1。
+/// Message 25 CaptureSettingSync：报**实际生效**值。`chroma` 是管线真实色度
+/// （1 = 4:2:0、3 = 4:4:4）——参照实现请求 4:4:4、实际 4:2:0 时同步报 1。
 pub fn encode_capture_setting_sync(
     seq: u64,
     timestamp: u64,
@@ -343,11 +348,12 @@ pub fn encode_capture_setting_sync(
     custom_bps: u64,
     width: u32,
     height: u32,
+    chroma: u64,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     put_int(1, u64::from(fps), &mut payload);
     put_int(2, quality, &mut payload);
-    put_int(3, 1, &mut payload);
+    put_int(3, chroma, &mut payload);
     if quality == 6 && custom_bps > 0 {
         put_int(4, custom_bps, &mut payload);
     }
@@ -544,7 +550,8 @@ mod tests {
     #[test]
     fn session_rpc_responses_use_the_matching_response_fields() {
         let reply = session_rpc_response(7, 1, 2, &[15]).unwrap();
-        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (11, vec![])]);
+        // 11（参照实现实测）与 17（官方 rpc_main.proto）并列空响应，两边语义都是"已接受"。
+        assert_eq!(response_fields(&reply), vec![(1, vec![1]), (11, vec![]), (17, vec![])]);
         let reply = session_rpc_response(8, 1, 2, &[21]).unwrap();
         assert_eq!(response_fields(&reply), vec![(1, vec![1]), (17, vec![])]);
         let reply = session_rpc_response(9, 1, 2, &[16]).unwrap();
