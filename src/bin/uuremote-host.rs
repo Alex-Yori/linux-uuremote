@@ -143,6 +143,9 @@ fn main() {
 }
 
 async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u32, gop: u32) -> Result<(), String> {
+    // 回收上次崩溃残留的虚拟音频路由；进程退出时恢复默认输出。
+    linux_uuremote::virtual_audio::init();
+    let _audio_cleanup = linux_uuremote::virtual_audio::Cleanup;
     let (file, borrowed) = config::read_with_fallback()?;
     println!("登录态：{}", if borrowed { "借用参照实现的配置" } else { "本机私有配置" });
     let creds = Credentials::load(file.as_ref())?;
@@ -354,12 +357,14 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(Signal::PeerLeft) => {
+                    linux_uuremote::virtual_audio::disable();
                     println!("   对端离开，关会话");
                     if let Some(session) = session.take() {
                         stop_session(session).await;
                     }
                 }
                 Some(Signal::Closed(reason)) => {
+                    linux_uuremote::virtual_audio::disable();
                     if let Some(session) = session.take() {
                         stop_session(session).await;
                     }
@@ -394,7 +399,26 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         session.keyframe.store(true, Ordering::Relaxed);
                     }
                 }
-                Some(PeerEvent::ConnectionState(state)) => println!("   连接状态：{state}"),
+                Some(PeerEvent::ConnectionState(state)) => {
+                    println!("   连接状态：{state}");
+                    // Connected = DTLS 完成，可以开始推桌面声音（opus 轨在 answer 里谈定过才有）。
+                    if state == "connected" {
+                        if let Some(session) = session.as_ref() {
+                            if let Some(track) = session.peer.audio_track().await {
+                                // 本地默认输出静音时开虚拟路由：远端有声、本地不出声。
+                                if linux_uuremote::audio::enabled()
+                                    && linux_uuremote::virtual_audio::default_sink_muted()
+                                    && linux_uuremote::virtual_audio::enable()
+                                {
+                                    println!("   本地输出静音 → 开虚拟路由（远端有声，本地不出声）");
+                                }
+                                tokio::spawn(linux_uuremote::audio::stream_audio(session.peer.pc_handle(), track));
+                            }
+                        }
+                    } else if matches!(state.as_str(), "disconnected" | "closed" | "failed") {
+                        linux_uuremote::virtual_audio::disable();
+                    }
+                }
                 Some(PeerEvent::ReceiverReport { fraction_lost, total_lost }) => {
                     if fraction_lost > 0 {
                         println!("   视频丢包：fraction_lost={fraction_lost} total_lost={total_lost}");
@@ -813,7 +837,7 @@ fn start_video(
                 0,
             )
             .unwrap_or_default(),
-            encode_permissions(next_sequence(), now(), Permissions { assistant: false, video_capture_allowed: true, capture_content_visible: true, audio_capture_allowed: false, floating_ball: false }),
+            encode_permissions(next_sequence(), now(), Permissions { assistant: false, video_capture_allowed: true, capture_content_visible: true, audio_capture_allowed: linux_uuremote::audio::enabled(), floating_ball: false }),
             encode_secure_desktop(next_sequence(), now(), false, false, false),
         ];
         for message in messages.iter().filter(|m| !m.is_empty()) {
@@ -1051,7 +1075,6 @@ fn capture_loop(
                 win_bytes = 0;
                 paced = Duration::ZERO;
                 send_time = Instant::now();
-                paced = Duration::ZERO;
             content = ContentChange::new(width, height, 32, 18);
             timeline = RtpTimeline::new(fps);
             println!("   屏幕尺寸变化 → {}x{}（已重建编码后端，首帧 IDR）", geometry.0, geometry.1);
@@ -1077,7 +1100,6 @@ fn capture_loop(
                 win_bytes = 0;
                 paced = Duration::ZERO;
                 send_time = Instant::now();
-                paced = Duration::ZERO;
             }
             println!("   远程改帧率 → {fps} fps");
         }
@@ -1111,7 +1133,6 @@ fn capture_loop(
                 win_bytes = 0;
                 paced = Duration::ZERO;
                 send_time = Instant::now();
-                paced = Duration::ZERO;
             if backend_nvenc {
                 println!("   重试 NVENC 成功，切回硬编");
             }
@@ -1197,7 +1218,6 @@ fn capture_loop(
                 win_bytes = 0;
                 paced = Duration::ZERO;
                 send_time = Instant::now();
-                paced = Duration::ZERO;
                 println!("   关键帧请求 → NVENC 重启（首帧 IDR）");
             }
             // 先把已经编完的帧取走：取帧间隔直接决定端到端延迟，不能等下一次喂帧。
@@ -1328,7 +1348,6 @@ fn capture_loop(
                 win_bytes = 0;
                 paced = Duration::ZERO;
                 send_time = Instant::now();
-                paced = Duration::ZERO;
                 }
             }
             if win_start.elapsed() >= Duration::from_secs(3) {

@@ -21,7 +21,12 @@ pub mod initialization;
 pub mod scan;
 pub mod signaling;
 pub mod transport;
+pub mod audio;
+pub mod virtual_audio;
 pub mod nvenc;
 pub mod rtp_metadata;
 pub mod uinput;
 pub mod wire;
+
+/// 测试动进程环境变量时串行化（env 是进程级全局，并行测试会互踩）。
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

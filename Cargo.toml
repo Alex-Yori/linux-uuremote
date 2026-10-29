@@ -57,3 +57,7 @@ path = "src/bin/uu-input-probe.rs"
 name = "uu-encode-bench"
 path = "src/bin/uu-encode-bench.rs"
 
+[[bin]]
+name = "uu-audio-probe"
+path = "src/bin/uu-audio-probe.rs"
+

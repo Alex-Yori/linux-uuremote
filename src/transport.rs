@@ -248,6 +248,14 @@ pub fn negotiated_video_codecs(answer_sdp: &str) -> Vec<String> {
     out
 }
 
+/// offer 里有没有可用的音频 m 行（`m=audio` 且端口非 0）。
+fn offer_has_audio(sdp: &str) -> bool {
+    sdp.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("m=audio") && fields.next().map(|port| port != "0").unwrap_or(false)
+    })
+}
+
 /// 从 offer SDP 里挑一个能用的 H.264 codec 能力。
 ///
 /// 各家客户端给的 profile-level-id / packetization-mode 都不一样（Windows、Mac、手机各不同），
@@ -316,6 +324,8 @@ pub struct Peer {
     pc: Arc<RTCPeerConnection>,
     /// 视频轨要等看见 offer 才能建：codec 必须照 offer 里的 fmtp 挑（见 `h264_capability_from_offer`）。
     track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
+    /// 音频轨（opus）：offer 带 audio m 行且没关 UU_AUDIO 时挂上；宿主拿到它发 Opus 包。
+    audio_track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
     control: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     /// 客户端会开多条通道（CONTROL / TEXT / STREAMER…），回包必须回到来的那条。
     channels: Arc<Mutex<std::collections::HashMap<String, Arc<RTCDataChannel>>>>,
@@ -431,7 +441,7 @@ impl Peer {
                 }
             }
         });
-        Ok(Self { pc, track: Arc::new(Mutex::new(None)), control, channels, events })
+        Ok(Self { pc, track: Arc::new(Mutex::new(None)), audio_track: Arc::new(Mutex::new(None)), control, channels, events })
     }
 
     /// 吃客户端 offer，回我们要用的 answer SDP（已补 max-message-size）。
@@ -447,6 +457,28 @@ impl Peer {
             let sender = self.pc.add_track(track.clone()).await.map_err(|e| format!("添加视频轨失败: {e}"))?;
             spawn_rtcp_drain(sender, self.events.clone());
             *self.track.lock().await = Some(track);
+        }
+        // 客户端 offer 永远带 Opus 音频 m 行（官方 Windows 解码侧有 opusdec）——挂音频轨
+        // 才有声音；没 audio 行或 UU_AUDIO=0 就不挂（webrtc-rs 会自己把 m 行收成 inactive）。
+        if self.audio_track.lock().await.is_none() && crate::audio::enabled() && offer_has_audio(sdp_text) {
+            let audio = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: "audio/opus".to_owned(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    ..Default::default()
+                },
+                "audio_0".to_owned(),
+                "audio_0".to_owned(),
+            ));
+            match self.pc.add_track(audio.clone()).await {
+                Ok(sender) => {
+                    spawn_rtcp_drain(sender, self.events.clone());
+                    *self.audio_track.lock().await = Some(audio);
+                    println!("   音频轨已挂：opus 48k 立体声");
+                }
+                Err(e) => println!("   挂音频轨失败（没声音，视频不受影响）：{}", e.to_string().chars().take(160).collect::<String>()),
+            }
         }
         self.pc.set_remote_description(offer).await.map_err(|e| format!("设置远端描述失败: {e}"))?;
         let answer = self.pc.create_answer(None).await.map_err(|e| format!("生成 answer 失败: {e}"))?;
@@ -487,6 +519,16 @@ impl Peer {
     }
 
     /// 喂一条远端 ICE candidate（soac 事件里带的）。
+    /// 音频轨（挂了才有声音可发）。
+    pub async fn audio_track(&self) -> Option<Arc<TrackLocalStaticSample>> {
+        self.audio_track.lock().await.clone()
+    }
+
+    /// RTCPeerConnection 句柄（音频推流任务要查连接状态）。
+    pub fn pc_handle(&self) -> Arc<RTCPeerConnection> {
+        self.pc.clone()
+    }
+
     pub async fn add_candidate(&self, candidate: &str, sdp_mid: Option<&str>, mline_index: Option<u16>) -> Result<(), String> {
         if candidate.is_empty() {
             return Ok(());
@@ -637,6 +679,13 @@ mod tests {
         // 只谈定一条也要点名，别报"全齐"。
         let one = format!("a=extmap:3 {}\r\n", crate::rtp_metadata::CAPTURE_INDEX_URI);
         assert_eq!(missing_uu_extensions(&one), vec![crate::rtp_metadata::NEW_FRAME_URI]);
+    }
+
+    #[test]
+    fn offer_has_audio_detects_active_audio_lines() {
+        assert!(offer_has_audio("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"));
+        assert!(!offer_has_audio("m=audio 0 RTP/AVP 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"));
+        assert!(!offer_has_audio("m=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"));
     }
 
     #[test]
