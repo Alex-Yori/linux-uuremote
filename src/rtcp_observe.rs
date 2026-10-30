@@ -305,9 +305,10 @@ mod tests {
 
     #[test]
     fn compact_ntp_and_delay_units_match_libwebrtc() {
-        // libwebrtc CompactNtp = 64 位 NTP 的中间 32 位。
-        let ntp: u64 = 0x0000_0000_e000_0000_0000_0000;
-        assert_eq!(compact_ntp(ntp), 0xe000_0000);
+        // libwebrtc CompactNtp = static_cast<uint32_t>(ntp >> 16)：取中间 32 位，
+        // 秒数高位溢出后按 2^16 秒回绕（RTT 是小差值，回绕不影响）。
+        let ntp: u64 = 0xe8f0_a1b2_3456_7890;
+        assert_eq!(compact_ntp(ntp), 0xa1b2_3456);
         // 1/2^16 秒为单位：1 ms = 65.536 单位。
         assert_eq!(compact_delay(0.001), 65);
         assert_eq!(compact_delay(1.0), 65_536);

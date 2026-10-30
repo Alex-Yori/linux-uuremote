@@ -78,6 +78,13 @@ struct Session {
     route: Value,
     /// 诊断用：本会话收到过几条 CONTROL 报文（前几条打形状，查"鼠标没反应"）。
     control_msgs: u32,
+    /// 这次会议的 ice_id（offer 到达时写入）。客户端重试 be-controlled 时只要
+    /// 会议还没谈定，就必须复用同一条 PeerConnection——重建会换 ICE ufrag/password，
+    /// 客户端攒的一百来条 remote candidate 全部作废，外网场景变成 8 秒一轮的死循环，
+    /// P2P 永远配不上。
+    ice_id: Option<Value>,
+    /// 本会话见过 offer 没有：没见过 = 还在 ICE 收集阶段，重试可以复用。
+    saw_offer: bool,
     /// 是否已发出 answer（远端描述已设）：早到 candidate 要等它才能 add。
     answered: bool,
     /// 连接阶段计时（"连接半分钟"的账要能算）：be-controlled 到达的时刻。
@@ -379,9 +386,20 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     SOAC_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
                     offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(20));
                     last_signal_at = tokio::time::Instant::now();
-                    // 每次拉流新建一条会话：ICE 配置属于这一次会议，不能复用上一条。
-                    if let Some(old) = session.take() {
-                        stop_session(old).await;
+                    // 客户端在等自己的 ICE 收集，超过超时就重发 be-controlled。只要
+                    // ice_id 还是同一个会议，就复用现有 PeerConnection：ufrag 不变，
+                    // 它发来的 remote candidate 与我们的 srflx/relay 收集成果都还有效。
+                    // be-controlled header 不带 ice_id（只在 soac offer/candidate 里），
+                    // 所以复用判据 = 还没 answer、也还没收到过 offer：即客户端还在自己的
+                    // ICE 收集阶段重试，会议还是同一个。
+                    let reuse = session.as_ref().is_some_and(|s| !s.answered && !s.saw_offer);
+                    if reuse {
+                        hostlog::log("be-controlled 重试（同 ice_id）→ 复用会话，不重建 ICE");
+                    } else {
+                        // 新会议才拆旧会话：ICE 配置属于这一次会议，不能复用上一条。
+                        if let Some(old) = session.take() {
+                            stop_session(old).await;
+                        }
                     }
                     let config = match ice_configuration(&header) {
                         Ok(config) => config,
@@ -391,7 +409,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     };
                     match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, answered: false, video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
                         Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
@@ -407,6 +425,11 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         session.t_be_controlled.elapsed().as_millis(),
                         sdp.len()
                     ));
+                    session.saw_offer = true;
+                    if session.ice_id.is_some() && session.ice_id != ice_id {
+                        hostlog::log("⚠ offer 的 ice_id 与本会话不同（客户端开了新会议），answer 可能对不上 ufrag");
+                    }
+                    session.ice_id = ice_id.clone();
                     session.route = json!({ "ice_id": ice_id, "client_id": client_id, "app_control_id": app_control_id });
                     match session.peer.answer_offer(&sdp).await {
                         Ok(answer) => {
@@ -452,6 +475,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     } else {
                         early_candidates.push((candidate, sdp_mid, sdp_mline_index));
+                        if early_candidates.len() == 1 || early_candidates.len() % 40 == 0 {
+                            hostlog::log(&format!("offer 未到，已暂存客户端 candidate {} 条（收集正常，等 offer）", early_candidates.len()));
+                        }
                         println!("   candidate 先于 offer 到达，暂存 {} 条", early_candidates.len());
                     }
                 }

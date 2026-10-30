@@ -377,6 +377,11 @@ impl Peer {
         let mut settings = SettingEngine::default();
         settings.set_answering_dtls_role(DTLSRole::Server).map_err(|e| format!("设置 DTLS answer 角色失败: {e}"))?;
         settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // P2P 关键：host candidate 只报真实物理网卡。lo 的 127.0.0.1、docker/veth 等
+        // 虚拟网段客户端解不了，混在里面只会污染候选对选择（LAN 直连要靠 wlo1/enp*）。
+        settings.set_interface_filter(Box::new(|name: &str| {
+            !["lo", "docker", "br-", "veth", "virbr", "zt", "kube"].iter().any(|p| name.starts_with(p))
+        }));
         let api = APIBuilder::new().with_media_engine(media).with_setting_engine(settings).with_interceptor_registry(registry).build();
 
         let pc = Arc::new(api.new_peer_connection(config).await.map_err(|e| format!("创建 PeerConnection 失败: {e}"))?);
@@ -394,6 +399,17 @@ impl Peer {
                     };
                     if let Ok(init) = candidate.to_json() {
                         println!("   本机 candidate 收集：{}", init.candidate);
+                        // P2P 诊断：host=LAN 直连料、srflx=公网 P2P 料、relay=兜底中继。
+                        let kind = if init.candidate.contains(" typ host") {
+                            "host"
+                        } else if init.candidate.contains(" typ srflx") {
+                            "srflx"
+                        } else if init.candidate.contains(" typ relay") {
+                            "relay"
+                        } else {
+                            "?"
+                        };
+                        crate::hostlog::log(&format!("本机 candidate {kind}：{}", init.candidate));
                         let _ = ev.send(PeerEvent::IceCandidate {
                             candidate: init.candidate,
                             sdp_mid: init.sdp_mid,
