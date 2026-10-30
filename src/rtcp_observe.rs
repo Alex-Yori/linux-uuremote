@@ -1,4 +1,12 @@
-//! RTCP 观测拦截器：把双端 RTCP 实际收发内容记进日志文件。
+//! RTCP 观测拦截器 + XR RRTR→DLRR 回复器。
+//!
+//! 为什么要回 XR：libwebrtc 收流侧（receiver）的 RTT 根本不走 SR/RR，而是
+//! `RTCPReceiver::OnPeriodicRttUpdate(sending=false)` 里的 `GetAndResetXrRrRtt()`
+//! —— 对端（客户端）按 RFC 3611 发 XR/RRTR 请求，宿主必须回一个 XR/DLRR
+//! （sub-block: ssrc=对端 ssrc、LRR=RRTR 的 compact NTP、DLRR=收到 RRTR 到现在的
+//! 延迟，单位 1/2^16 秒）。客户端再用 `rtt = now - dlrr - lrr` 算出真实 RTT。
+//! 我们以前从不回 XR，客户端永远没有 RTT 样本，"网络延迟"就恒显示 libwebrtc 的
+//! 默认常量 50 ms。
 //!
 //! 为什么要看到 RTCP：客户端"延迟"这一行的正源是它自己的 RTT 估计，而 RTT 只能来自
 //! RTCP（SR 的 request-fdb 探测回复，或对端 RR 里的 LSR/DLSR）。没有 RTCP 级日志，
@@ -13,6 +21,7 @@ use webrtc::interceptor::{
     stream_info::StreamInfo, Attributes, Error, Interceptor, InterceptorBuilder, RTCPReader,
     RTCPWriter, RTPReader, RTPWriter,
 };
+use webrtc::rtcp::extended_report::{DLRRReport, DLRRReportBlock, ExtendedReport, ReceiverReferenceTimeReportBlock};
 use webrtc::rtcp::packet::Packet;
 use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtcp::sender_report::SenderReport;
@@ -28,6 +37,12 @@ struct Observe {
     last_rr: Option<(u32, u32, u32)>,
     /// 我们发出的 SR 快照（回复探测时要用的 ssrc/ntp/rtp 计数）。
     last_sr: Option<(u32, u64, u32, u32, u32)>,
+    /// 对端 XR 里最近一条 RRTR：(对端 ssrc, RRTR 的 compact NTP, 到达时刻)。
+    rrtr: Option<(u32, u32, Instant)>,
+    /// 我方 RTCP 写通道与媒体 ssrc：回 XR 用。
+    writer: Option<Arc<dyn RTCPWriter + Send + Sync>>,
+    local_ssrc: u32,
+    xr_replies: u32,
     since: Instant,
 }
 
@@ -41,6 +56,10 @@ impl InterceptorBuilder for RtcpObserveBuilder {
                 errors: 0,
                 last_rr: None,
                 last_sr: None,
+                rrtr: None,
+                writer: None,
+                local_ssrc: 0,
+                xr_replies: 0,
                 since: Instant::now(),
             })),
         }))
@@ -67,6 +86,7 @@ impl Interceptor for RtcpObserve {
         &self,
         writer: Arc<dyn RTCPWriter + Send + Sync>,
     ) -> Arc<dyn RTCPWriter + Send + Sync> {
+        self.state.lock().await.writer = Some(writer.clone());
         Arc::new(ObserveWriter {
             state: self.state.clone(),
             parent: writer,
@@ -75,9 +95,15 @@ impl Interceptor for RtcpObserve {
 
     async fn bind_local_stream(
         &self,
-        _info: &StreamInfo,
+        info: &StreamInfo,
         writer: Arc<dyn RTPWriter + Send + Sync>,
     ) -> Arc<dyn RTPWriter + Send + Sync> {
+        // XR 的 sender ssrc 必须是我们的媒体 ssrc，否则 libwebrtc 不按会话处理。
+        let mut s = self.state.lock().await;
+        if s.local_ssrc == 0 {
+            s.local_ssrc = info.ssrc;
+        }
+        drop(s);
         writer
     }
 
@@ -147,6 +173,10 @@ async fn tally(state: &Arc<Mutex<Observe>>, dir: u8, pkts: &[Box<dyn Packet + Se
             .last_sr
             .map(|(ssrc, ntp, _, _, _)| format!(" 我方SR ssrc={ssrc:08x} ntp={ntp:016x}"))
             .unwrap_or_default();
+        if s.xr_replies > 0 {
+            parts.push(format!("发 XR/DLRR {}", s.xr_replies));
+            s.xr_replies = 0;
+        }
         let errors = s.errors;
         s.errors = 0;
         s.since = Instant::now();
@@ -168,6 +198,69 @@ struct ObserveReader {
     parent: Arc<dyn RTCPReader + Send + Sync>,
 }
 
+/// RFC 3611 的 compact NTP：64 位 NTP 时间戳的中间 32 位（libwebrtc `CompactNtp`）。
+fn compact_ntp(ntp64: u64) -> u32 {
+    (ntp64 >> 16) as u32
+}
+
+/// 把秒数换算成 compact NTP 单位（1/2^16 秒）。
+fn compact_delay(secs: f64) -> u32 {
+    let v = secs * 65_536.0;
+    if v >= u32::MAX as f64 { u32::MAX } else { v as u32 }
+}
+
+impl ObserveReader {
+    /// 对端的 XR/RRTR → 立刻回一条 XR/DLRR，让客户端能算出真实 RTT。
+    async fn reply_dlrr(&self, pkts: &[Box<dyn Packet + Send + Sync>]) {
+        let mut rrtr: Option<(u32, u32)> = None;
+        for p in pkts {
+            if let Some(xr) = p.as_any().downcast_ref::<ExtendedReport>() {
+                for b in &xr.reports {
+                    if let Some(block) = b.as_any().downcast_ref::<ReceiverReferenceTimeReportBlock>() {
+                        rrtr = Some((xr.sender_ssrc, compact_ntp(block.ntp_timestamp)));
+                    }
+                }
+            }
+        }
+        let Some((peer_ssrc, lrr)) = rrtr else { return };
+        let (writer, our_ssrc) = {
+            let mut s = self.state.lock().await;
+            s.rrtr = Some((peer_ssrc, lrr, Instant::now()));
+            s.xr_replies += 1;
+            (s.writer.clone(), s.local_ssrc)
+        };
+        let Some(writer) = writer else {
+            if our_ssrc != 0 {
+                crate::hostlog::log("收到 XR/RRTR，但 RTCP 写通道还没绑上，回复不了");
+            }
+            return;
+        };
+        if our_ssrc == 0 {
+            return;
+        }
+        // 我们收到 RRTR 后马上回，滞留按实测时刻算（几乎为 0，语义与 libwebrtc 一致）。
+        let delay = {
+            let s = self.state.lock().await;
+            match s.rrtr {
+                Some((_, _, at)) => compact_delay(at.elapsed().as_secs_f64()),
+                None => 0,
+            }
+        };
+        let xr = ExtendedReport {
+            sender_ssrc: our_ssrc,
+            reports: vec![Box::new(DLRRReportBlock {
+                reports: vec![DLRRReport { ssrc: peer_ssrc, last_rr: lrr, dlrr: delay }],
+            })],
+        };
+        if let Err(e) = writer
+            .write(&[Box::new(xr) as Box<dyn Packet + Send + Sync>], &Attributes::new())
+            .await
+        {
+            crate::hostlog::log(&format!("XR/DLRR 回复失败：{e}"));
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl RTCPReader for ObserveReader {
     async fn read(
@@ -178,6 +271,7 @@ impl RTCPReader for ObserveReader {
         match self.parent.read(buf, a).await {
             Ok((pkts, attr)) => {
                 tally(&self.state, 0, &pkts).await;
+                self.reply_dlrr(&pkts).await;
                 Ok((pkts, attr))
             }
             Err(e) => {
@@ -208,6 +302,16 @@ impl RTCPWriter for ObserveWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_ntp_and_delay_units_match_libwebrtc() {
+        // libwebrtc CompactNtp = 64 位 NTP 的中间 32 位。
+        let ntp: u64 = 0x0000_0000_e000_0000_0000_0000;
+        assert_eq!(compact_ntp(ntp), 0xe000_0000);
+        // 1/2^16 秒为单位：1 ms = 65.536 单位。
+        assert_eq!(compact_delay(0.001), 65);
+        assert_eq!(compact_delay(1.0), 65_536);
+    }
 
     #[test]
     fn kind_names_are_distinguishable() {
