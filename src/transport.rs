@@ -370,8 +370,10 @@ impl Peer {
                 )
                 .map_err(|e| format!("注册 UU RTP 头扩展失败: {e}"))?;
         }
-        let registry = register_default_interceptors(webrtc::interceptor::registry::Registry::new(), &mut media)
+        let mut registry = register_default_interceptors(webrtc::interceptor::registry::Registry::new(), &mut media)
             .map_err(|e| format!("注册 RTP 拦截器失败: {e}"))?;
+        // RTCP 级观测（RTT 恒 50 ms 的取证）：收发的 RTCP 类型 + 对端 RR 的 LSR/DLSR 进日志。
+        registry.add(Box::new(crate::rtcp_observe::RtcpObserveBuilder));
         let mut settings = SettingEngine::default();
         settings.set_answering_dtls_role(DTLSRole::Server).map_err(|e| format!("设置 DTLS answer 角色失败: {e}"))?;
         settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);

@@ -26,6 +26,7 @@ pub mod audio;
 pub mod virtual_audio;
 pub mod nvenc;
 pub mod hostlog;
+pub mod rtcp_observe;
 pub mod rtp_metadata;
 pub mod uinput;
 pub mod viewer;

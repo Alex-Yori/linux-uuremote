@@ -48,6 +48,7 @@ qrcode = { version = "0.14", default-features = false }
 flate2 = "1"
 openh264 = "0.9"
 webrtc = "0.10"
+async-trait = "0.1"
 # 控制端（uu-viewer）：SDL 窗口渲染/音频，opus 解码
 sdl2 = { version = "0.37", features = ["ttf"] }
 opus = "0.2"
