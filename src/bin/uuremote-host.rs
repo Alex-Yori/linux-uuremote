@@ -35,6 +35,8 @@ use tokio::sync::{mpsc, oneshot};
 struct Encoded {
     data: Vec<u8>,
     duration: Duration,
+    /// AU 出编码器的时刻：发样本时算发送侧滞留，填进 video-timing 扩展上报给客户端。
+    t_out: std::time::Instant,
 }
 
 /// 信令侧事件（主循环看得懂的形式）。
@@ -1003,7 +1005,8 @@ fn start_video(
     tokio::spawn(async move {
         let _ = init_done_rx.await;
         while let Some(frame) = frames_rx.recv().await {
-            if let Err(e) = peer.write_video(frame.data, frame.duration).await {
+            let pipeline_ms = frame.t_out.elapsed().as_millis().min(65_535) as u64;
+            if let Err(e) = peer.write_video(frame.data, frame.duration, pipeline_ms).await {
                 eprintln!("   写视频样本失败：{e}");
             }
         }
@@ -1341,7 +1344,7 @@ fn capture_loop(
                 let unit_len = unit.len() as u64;
                 let keep = unit.clone();
                 let s0 = Instant::now();
-                if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()) }).is_err() {
+                if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()), t_out: s0 }).is_err() {
                     return;
                 }
                 acc_send += s0.elapsed();
@@ -1388,7 +1391,7 @@ fn capture_loop(
                 if let Some(last) = last_au.as_ref() {
                     let aus = last.windows(4).filter(|w| *w == [0, 0, 0, 1]).count();
                     if aus <= 1 && now.duration_since(last_emit) >= Duration::from_millis(1_000 / still_fps as u64) {
-                        if frames_tx.blocking_send(Encoded { data: last.clone(), duration: Duration::from_millis(1_000 / still_fps as u64) }).is_ok() {
+                        if frames_tx.blocking_send(Encoded { data: last.clone(), duration: Duration::from_millis(1_000 / still_fps as u64), t_out: now }).is_ok() {
                             last_emit = now;
                         }
                     }
@@ -1539,7 +1542,7 @@ fn capture_loop(
                     println!("   已发 {emitted} 帧（IDR {idr_frames}），{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));
                 }
                 let s0 = Instant::now();
-                if frames_tx.blocking_send(Encoded { data: au, duration: timeline.duration_after(Instant::now()) }).is_err() {
+                if frames_tx.blocking_send(Encoded { data: au, duration: timeline.duration_after(Instant::now()), t_out: s0 }).is_err() {
                     return;
                 }
                 acc_send += s0.elapsed();

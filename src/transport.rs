@@ -221,6 +221,7 @@ pub fn missing_uu_extensions(sdp_text: &str) -> Vec<&'static str> {
         crate::rtp_metadata::NEW_FRAME_URI,
         crate::rtp_metadata::ABS_SEND_TIME_URI,
         crate::rtp_metadata::ABS_CAPTURE_TIME_URI,
+        crate::rtp_metadata::VIDEO_TIMING_URI,
     ]
     .into_iter()
     .filter(|uri| !have.contains(uri))
@@ -359,6 +360,7 @@ impl Peer {
             crate::rtp_metadata::NEW_FRAME_URI,
             crate::rtp_metadata::ABS_SEND_TIME_URI,
             crate::rtp_metadata::ABS_CAPTURE_TIME_URI,
+            crate::rtp_metadata::VIDEO_TIMING_URI,
         ] {
             media
                 .register_header_extension(
@@ -516,7 +518,7 @@ impl Peer {
         // 采集/时序扩展没谈定 = 接收端 frm/延迟按名义兜底报，必须看得见。
         let missing = missing_uu_extensions(&answer.sdp);
         if missing.is_empty() {
-            println!("   RTP 采集/时序扩展全部谈定（capture-index/new-frame/send-time/capture-time）");
+            println!("   RTP 采集/时序扩展全部谈定（capture-index/new-frame/send-time/capture-time/video-timing）");
         } else {
             println!("   ⚠ offer 没提出这些 RTP 头扩展，写不进包：{:?}", missing);
         }
@@ -572,7 +574,7 @@ impl Peer {
     }
 
     /// 送一个 H.264 访问单元（Annex-B 字节）到视频轨。
-    pub async fn write_video(&self, access_unit: Vec<u8>, duration: Duration) -> Result<(), String> {
+    pub async fn write_video(&self, access_unit: Vec<u8>, duration: Duration, pipeline_ms: u64) -> Result<(), String> {
         let track = self
             .track
             .lock()
@@ -587,6 +589,7 @@ impl Peer {
             crate::rtp_metadata::new_frame(),
             crate::rtp_metadata::abs_send_time(now),
             crate::rtp_metadata::abs_capture_time(now),
+            crate::rtp_metadata::video_timing(pipeline_ms),
         ];
         track
             .write_sample_with_extensions(
@@ -702,18 +705,19 @@ mod tests {
     fn uu_capture_extensions_must_be_in_the_negotiated_extmap() {
         // 接收端算 frm/延迟靠这四条（UU 私有两条 + 时序两条）；answer 谈不到 = 写不进包。
         let offered = format!(
-            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:3 {}\r\na=extmap:5 {}\r\na=extmap:6 {}\r\na=extmap:7 {}\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:3 {}\r\na=extmap:5 {}\r\na=extmap:6 {}\r\na=extmap:7 {}\r\na=extmap:11 {}\r\n",
             crate::rtp_metadata::CAPTURE_INDEX_URI,
             crate::rtp_metadata::NEW_FRAME_URI,
             crate::rtp_metadata::ABS_SEND_TIME_URI,
-            crate::rtp_metadata::ABS_CAPTURE_TIME_URI
+            crate::rtp_metadata::ABS_CAPTURE_TIME_URI,
+            crate::rtp_metadata::VIDEO_TIMING_URI
         );
         assert!(missing_uu_extensions(&offered).is_empty());
-        assert_eq!(negotiated_extmap(&offered).len(), 4);
+        assert_eq!(negotiated_extmap(&offered).len(), 5);
 
-        // 只有非清单上的标准扩展：四条全缺，必须报出来。
+        // 只有非清单上的标准扩展：五条全缺，必须报出来。
         let plain = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:4 http://www.abs-send-time\r\n";
-        assert_eq!(missing_uu_extensions(plain).len(), 4);
+        assert_eq!(missing_uu_extensions(plain).len(), 5);
 
         // 只谈定一条也要点名，别报"全齐"。
         let one = format!("a=extmap:3 {}\r\n", crate::rtp_metadata::CAPTURE_INDEX_URI);
@@ -722,7 +726,8 @@ mod tests {
             vec![
                 crate::rtp_metadata::NEW_FRAME_URI,
                 crate::rtp_metadata::ABS_SEND_TIME_URI,
-                crate::rtp_metadata::ABS_CAPTURE_TIME_URI
+                crate::rtp_metadata::ABS_CAPTURE_TIME_URI,
+                crate::rtp_metadata::VIDEO_TIMING_URI
             ]
         );
     }
