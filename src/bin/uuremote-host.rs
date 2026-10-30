@@ -287,6 +287,10 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
     let settings = Arc::new(RemoteSettings::new(fps, still_fps));
     let mut session: Option<Session> = None;
     let mut early_candidates: Vec<(String, Option<String>, Option<u16>)> = Vec::new();
+    // offer 看门狗：be-controlled 到后只等到 candidate 而 offer 迟迟不来 = 云端
+    // 路由卡死（2026-10-30 20:50 实测：13 条 candidate 全到、offer 一条没有，
+    // 客户端 12s 超时重连才通）。到点主动重连信令，把房间重新注册一遍。
+    let mut offer_deadline: Option<tokio::time::Instant> = None;
 
     println!("等待客户端拉流（Ctrl-C 退出）…");
     // 长按重复的宿主自驱动节拍：50ms 粒度排空到期键（周期 33ms），不等 CONTROL
@@ -301,6 +305,15 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         let _ = engine.tick_repeats();
                     });
                 }
+            }
+            _ = tokio::time::sleep_until(offer_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if offer_deadline.is_some() && session.as_ref().is_some_and(|s| !s.answered) =>
+            {
+                println!("   ⚠ be-controlled 后 6 秒没等到 offer（只有 candidate）→ 疑似云端路由卡死，重连信令重新注册房间");
+                if let Some(old) = session.take() {
+                    stop_session(old).await;
+                }
+                return Err("offer-watchdog: 重连信令重新注册房间".to_string());
             }
             signal = sig_rx.recv() => match signal {
                 Some(Signal::IceServers(v)) => {
@@ -343,6 +356,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         );
                     }
                     SOAC_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
+                    offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(6));
                     // 每次拉流新建一条会话：ICE 配置属于这一次会议，不能复用上一条。
                     if let Some(old) = session.take() {
                         stop_session(old).await;
@@ -360,6 +374,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(Signal::Offer { sdp, ice_id, client_id, app_control_id }) => {
+                    offer_deadline = None;
                     let Some(session) = session.as_mut() else {
                         println!("   soac offer 在没有会话时到达，忽略");
                         continue;
@@ -411,6 +426,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(Signal::PeerLeft) => {
+                    offer_deadline = None;
                     linux_uuremote::virtual_audio::disable();
                     println!("   对端离开，关会话");
                     if let Some(session) = session.take() {
@@ -453,6 +469,11 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     } else if label != "STREAMER_DATA_CHANNEL" || session.as_ref().is_some_and(|s| s.control_msgs % 20 == 0) {
                         let head: String = data.iter().take(48).map(|b| format!("{b:02x}")).collect();
                         println!("   旁路通道（{label}）：{} 字节 head={head}", data.len());
+                        if std::env::var("UU_HOST_DEBUG").is_ok() && label == "STREAMER_DATA_CHANNEL" {
+                            // 客户端周期统计（connection_period_stats_event）原样回传，
+                            // 排查延迟/frm/帧率口径时直接看它报了些什么。
+                            println!("   STREAMER 载荷：{}", String::from_utf8_lossy(&data[..data.len().min(4000)]));
+                        }
                     }
                 }
                 Some(PeerEvent::KeyframeRequest) => {
@@ -1332,25 +1353,20 @@ fn capture_loop(
                 last_au = Some(keep);
                 last_emit = Instant::now();
                 last_unit = Instant::now();
-                // 配速只在链路有丢包时才需要（官方 pacer 的意义是防拥塞）。LAN 直连
-                // 零丢包时串行化纯属自伤：一坨 IDR 按 10Mbps 下限摊 = 100ms+ 的帧间隔，
-                // 正是"frm 50-100ms、延迟恒 50ms"的直接来源。丢包一出现立刻恢复
-                // 2.5× 码率的配速（ReceiverReport 喂 settings.loss）。
-                if settings.loss.load(Ordering::Relaxed) > 0 {
-                    let pace_kbps = (applied_bitrate as u64 * 5 / 2).max(10_000);
-                    send_time += Duration::from_micros(unit_len * 8 * 1_000 / pace_kbps);
-                    let pace_now = Instant::now();
-                    if send_time > pace_now {
-                        let gap = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
-                        let wait = (send_time - pace_now).min(gap);
-                        std::thread::sleep(wait);
-                        paced += wait;
-                        // 欠账封顶两个帧间隔：突发最多摊到两帧，不会一直憋着清账。
-                        send_time = send_time.min(Instant::now() + gap * 2);
-                    }
-                } else {
-                    // 旁路时把"该睡的时间"还回去，避免丢包重现瞬间背着旧欠账。
-                    send_time = Instant::now();
+                // 配速对齐官方 libwebrtc pacer：恒定 2.5× 码率串行发送，欠账封顶
+                // 两帧间隔。零丢包旁路会让 IDR 整坨轰上 Wi-Fi——到达忽密忽疏，
+                // 客户端帧率显示就在 80~90 之间来回摆；丢包出现又切回配速，
+                // 状态乒乓本身就是振荡源。稳态内容远低于 2.5× 码率，配速不拖帧率。
+                let pace_kbps = (applied_bitrate as u64 * 5 / 2).max(10_000);
+                send_time += Duration::from_micros(unit_len * 8 * 1_000 / pace_kbps);
+                let pace_now = Instant::now();
+                if send_time > pace_now {
+                    let gap = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
+                    let wait = (send_time - pace_now).min(gap);
+                    std::thread::sleep(wait);
+                    paced += wait;
+                    // 欠账封顶两个帧间隔：突发最多摊到两帧，不会一直憋着清账。
+                    send_time = send_time.min(Instant::now() + gap * 2);
                 }
                 if emitted % 300 == 0 {
                     println!("   已发 {emitted} 帧，{:.1} fps", emitted as f64 / started.elapsed().as_secs_f64().max(0.001));

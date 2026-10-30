@@ -1,14 +1,22 @@
-//! UU 私有 RTP 头扩展（官方被控端每帧都挂）：video-capture-index（源序号，u16 大端）
-//! + new-frame（1 字节布尔）。
+//! UU 私有 + 标准时序 RTP 头扩展（官方被控端每帧都挂）。
 //!
-//! 客户端的延迟/frm 统计靠这两条扩展还原真实出帧信息；不挂的话接收端按名义帧长
-//! 推算，右下角永远显示 50 ms。URI 与布局照参照实现（官方库实测验证）。
+//! UU 私有两条：video-capture-index（源序号，u16 大端）+ new-frame（1 字节布尔）。
+//! 时序三条（libwebrtc 标准布局，官方 Android/Windows 被控端实测同款 extmap）：
+//! abs-send-time（发送时刻 NTP 中段 24 位）、abs-capture-time（帧采集时刻：RTP 时钟 +
+//! NTP 快照）、video-timing（编码起止毫秒，tag/value 对）。
+//! 客户端右下角"延迟/frm"就是从这些时序还原出来的——不挂，接收端按名义帧长兜底推算，
+//! 永远显示 50 ms。URI 与布局照 libstreamer.so 逆向结果。
 
+use std::time::SystemTime;
+
+use webrtc::rtp::extension::abs_send_time_extension::unix2ntp;
 use webrtc::rtp::extension::HeaderExtension;
 use webrtc::util::{Marshal, MarshalSize};
 
 pub const CAPTURE_INDEX_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-capture-index";
 pub const NEW_FRAME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-frame-is-new-frame";
+pub const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+pub const ABS_CAPTURE_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time";
 
 #[derive(Debug)]
 struct NewFrame(pub bool);
@@ -48,6 +56,30 @@ impl Marshal for CaptureIndex {
     }
 }
 
+/// abs-capture-time（官方 spec 布局，缩短版）：8 字节大端 NTP 时间戳（UQ32.32），
+/// 与 RTCP 发送者报告的 NTP 同时钟。接收端拿"收包 NTP − 采集 NTP"就是全链路延迟——
+/// 这正是右下角 frm/延迟的正式口径。不带 8 字节时钟偏移扩展（采集端=发送端，偏移恒 0）。
+#[derive(Debug)]
+struct AbsCaptureTime {
+    capture_ntp: u64,
+}
+
+impl MarshalSize for AbsCaptureTime {
+    fn marshal_size(&self) -> usize {
+        8
+    }
+}
+
+impl Marshal for AbsCaptureTime {
+    fn marshal_to(&self, buffer: &mut [u8]) -> webrtc::util::Result<usize> {
+        let target = buffer
+            .get_mut(..8)
+            .ok_or_else(|| webrtc::util::Error::Other("Abs capture time buffer too short".into()))?;
+        target.copy_from_slice(&self.capture_ntp.to_be_bytes());
+        Ok(8)
+    }
+}
+
 /// 主采集源序号固定 0（本实现只有一个屏幕源）。
 pub fn capture_index(source: u16) -> HeaderExtension {
     HeaderExtension::Custom {
@@ -61,5 +93,67 @@ pub fn new_frame() -> HeaderExtension {
     HeaderExtension::Custom {
         uri: NEW_FRAME_URI.into(),
         extension: Box::new(NewFrame(true)),
+    }
+}
+
+/// 发送时刻（webrtc-rs 内置布局：NTP 右移 14 位取中 24 位）。
+pub fn abs_send_time(now: SystemTime) -> HeaderExtension {
+    HeaderExtension::AbsSendTime(webrtc::rtp::extension::abs_send_time_extension::AbsSendTimeExtension::new(now))
+}
+
+/// 帧采集时刻：墙钟 NTP（与 abs-send-time 和 RTCP SR 共用同一时钟）。本管线里
+/// 采集≈写样本瞬间（编码耗时相对 LAN 延迟可忽略），与 Sample.timestamp 用同一个
+/// `now`，保证接收端算出的分段自洽。
+pub fn abs_capture_time(now: SystemTime) -> HeaderExtension {
+    HeaderExtension::Custom {
+        uri: ABS_CAPTURE_TIME_URI.into(),
+        extension: Box::new(AbsCaptureTime { capture_ntp: unix2ntp(now) }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn capture_index_is_two_byte_be() {
+        let mut buf = [0u8; 4];
+        assert_eq!(CaptureIndex(0x1234).marshal_to(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn new_frame_is_one_byte_boolean() {
+        let mut buf = [0u8; 2];
+        assert_eq!(NewFrame(true).marshal_to(&mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 1);
+    }
+
+    #[test]
+    fn abs_capture_time_is_eight_byte_be_ntp() {
+        // spec 缩短版：8 字节大端 NTP（UQ32.32），无标志字。unix→ntp 偏移 2208988800s。
+        let t = UNIX_EPOCH + Duration::from_secs(1_000);
+        let ext = abs_capture_time(t);
+        let HeaderExtension::Custom { extension, .. } = &ext else { panic!("shape") };
+        assert_eq!(extension.marshal_size(), 8);
+        let mut buf = [0u8; 8];
+        assert_eq!(extension.marshal_to(&mut buf).unwrap(), 8);
+        let ntp = ((1_000 + 2_208_988_800u64) << 32) as u64;
+        assert_eq!(buf, ntp.to_be_bytes());
+    }
+
+    #[test]
+    fn abs_capture_time_buffer_too_short_fails() {
+        let HeaderExtension::Custom { extension, .. } = abs_capture_time(SystemTime::now()) else { panic!("shape") };
+        assert!(extension.marshal_to(&mut [0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn extension_uris_are_canonical() {
+        assert_eq!(capture_index(0).uri(), CAPTURE_INDEX_URI);
+        assert_eq!(new_frame().uri(), NEW_FRAME_URI);
+        assert_eq!(abs_send_time(SystemTime::now()).uri(), ABS_SEND_TIME_URI);
+        assert_eq!(abs_capture_time(SystemTime::now()).uri(), ABS_CAPTURE_TIME_URI);
     }
 }

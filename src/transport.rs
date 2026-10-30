@@ -212,13 +212,27 @@ pub fn negotiated_extmap(sdp_text: &str) -> Vec<(i64, String)> {
     out
 }
 
-/// UU 私有的两条采集元数据扩展是否谈定（缺哪条就报哪条）。
+/// 采集/时序扩展是否谈定（缺哪条就报哪条）。时序两条决定客户端延迟/frm 的真实度。
 pub fn missing_uu_extensions(sdp_text: &str) -> Vec<&'static str> {
     let mapped = negotiated_extmap(sdp_text);
     let have: Vec<&str> = mapped.iter().map(|(_, uri)| uri.as_str()).collect();
-    [crate::rtp_metadata::CAPTURE_INDEX_URI, crate::rtp_metadata::NEW_FRAME_URI]
-        .into_iter()
-        .filter(|uri| !have.contains(uri))
+    [
+        crate::rtp_metadata::CAPTURE_INDEX_URI,
+        crate::rtp_metadata::NEW_FRAME_URI,
+        crate::rtp_metadata::ABS_SEND_TIME_URI,
+        crate::rtp_metadata::ABS_CAPTURE_TIME_URI,
+    ]
+    .into_iter()
+    .filter(|uri| !have.contains(uri))
+    .collect()
+}
+
+/// SDP 里全部 a=extmap 行（调试用：看客户端官方 extmap 到底提了哪些）。
+pub fn extmap_lines(sdp_text: &str) -> Vec<String> {
+    sdp_text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("a=extmap:"))
+        .map(|l| l.trim().to_string())
         .collect()
 }
 
@@ -338,8 +352,14 @@ impl Peer {
         let mut media = MediaEngine::default();
         media.register_default_codecs().map_err(|e| format!("注册默认编解码失败: {e}"))?;
         // UU 私有头扩展（capture-index / new-frame）：客户端延迟与 frm 统计靠它们，
-        // 不注册协商不上，右下角永远 50 ms（见 rtp_metadata）。
-        for uri in [crate::rtp_metadata::CAPTURE_INDEX_URI, crate::rtp_metadata::NEW_FRAME_URI] {
+        // 不注册协商不上，右下角永远 50 ms（见 rtp_metadata）。时序两条是客户端
+        // "延迟/frm"统计的正源：abs-send-time（网络段）、abs-capture-time（全链路段）。
+        for uri in [
+            crate::rtp_metadata::CAPTURE_INDEX_URI,
+            crate::rtp_metadata::NEW_FRAME_URI,
+            crate::rtp_metadata::ABS_SEND_TIME_URI,
+            crate::rtp_metadata::ABS_CAPTURE_TIME_URI,
+        ] {
             media
                 .register_header_extension(
                     webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability { uri: uri.into() },
@@ -493,12 +513,16 @@ impl Peer {
             return Err(format!("协商后视频没有 H.264（谈定的是 {negotiated:?}）"));
         }
         println!("   视频协商完成：{}", negotiated.join(" / "));
-        // 采集元数据扩展没谈定 = 接收端 frm/延迟永远按名义 50 ms 报，必须看得见。
+        // 采集/时序扩展没谈定 = 接收端 frm/延迟按名义兜底报，必须看得见。
         let missing = missing_uu_extensions(&answer.sdp);
         if missing.is_empty() {
-            println!("   RTP 采集元数据已谈定：capture-index + new-frame");
+            println!("   RTP 采集/时序扩展全部谈定（capture-index/new-frame/send-time/capture-time）");
         } else {
             println!("   ⚠ offer 没提出这些 RTP 头扩展，写不进包：{:?}", missing);
+        }
+        if std::env::var("UU_HOST_DEBUG").is_ok() {
+            println!("   offer extmap：{}", extmap_lines(sdp_text).join(" | "));
+            println!("   answer extmap：{}", extmap_lines(&answer.sdp).join(" | "));
         }
         self.pc.set_local_description(answer.clone()).await.map_err(|e| format!("设置本端描述失败: {e}"))?;
         if !wait_gathering_complete(&self.pc, Duration::from_millis(300)).await {
@@ -555,12 +579,20 @@ impl Peer {
             .await
             .clone()
             .ok_or("视频轨还没建立（还没收到 offer）")?;
-        let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
+        // 采集/发送共用同一个墙钟时刻：abs-send-time 与 abs-capture-time 自洽，
+        // 接收端算出的网络段与全链路段不打架。
+        let now = std::time::SystemTime::now();
+        let extensions = [
+            crate::rtp_metadata::capture_index(0),
+            crate::rtp_metadata::new_frame(),
+            crate::rtp_metadata::abs_send_time(now),
+            crate::rtp_metadata::abs_capture_time(now),
+        ];
         track
             .write_sample_with_extensions(
                 &Sample {
                     data: Bytes::from(access_unit),
-                    timestamp: std::time::SystemTime::now(),
+                    timestamp: now,
                     duration: duration.max(Duration::from_micros(1)),
                     packet_timestamp: 0,
                     prev_dropped_packets: 0,
@@ -668,22 +700,31 @@ mod tests {
 
     #[test]
     fn uu_capture_extensions_must_be_in_the_negotiated_extmap() {
-        // 接收端算 frm/延迟靠这两条私有扩展；answer 谈不到 = 写不进包 = 永远显示 50 ms。
+        // 接收端算 frm/延迟靠这四条（UU 私有两条 + 时序两条）；answer 谈不到 = 写不进包。
         let offered = format!(
-            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:3 {}\r\na=extmap:5 {}\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:3 {}\r\na=extmap:5 {}\r\na=extmap:6 {}\r\na=extmap:7 {}\r\n",
             crate::rtp_metadata::CAPTURE_INDEX_URI,
-            crate::rtp_metadata::NEW_FRAME_URI
+            crate::rtp_metadata::NEW_FRAME_URI,
+            crate::rtp_metadata::ABS_SEND_TIME_URI,
+            crate::rtp_metadata::ABS_CAPTURE_TIME_URI
         );
         assert!(missing_uu_extensions(&offered).is_empty());
-        assert_eq!(negotiated_extmap(&offered).len(), 2);
+        assert_eq!(negotiated_extmap(&offered).len(), 4);
 
-        // 只有 abs-send-time 这类标准扩展：UU 两条都缺，必须报出来。
+        // 只有非清单上的标准扩展：四条全缺，必须报出来。
         let plain = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=extmap:4 http://www.abs-send-time\r\n";
-        assert_eq!(missing_uu_extensions(plain).len(), 2);
+        assert_eq!(missing_uu_extensions(plain).len(), 4);
 
         // 只谈定一条也要点名，别报"全齐"。
         let one = format!("a=extmap:3 {}\r\n", crate::rtp_metadata::CAPTURE_INDEX_URI);
-        assert_eq!(missing_uu_extensions(&one), vec![crate::rtp_metadata::NEW_FRAME_URI]);
+        assert_eq!(
+            missing_uu_extensions(&one),
+            vec![
+                crate::rtp_metadata::NEW_FRAME_URI,
+                crate::rtp_metadata::ABS_SEND_TIME_URI,
+                crate::rtp_metadata::ABS_CAPTURE_TIME_URI
+            ]
+        );
     }
 
     #[test]
