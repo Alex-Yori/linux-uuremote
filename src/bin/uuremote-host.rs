@@ -123,6 +123,18 @@ impl RemoteSettings {
     }
 }
 
+/// 信令断线重连的退避秒数：连续失败指数翻倍、封顶 30 秒；
+/// 上一轮活过 10 秒说明服务器可达（只是会话/信令断了），回到基础 2 秒。
+fn next_reconnect_delay(fail_streak: u32, last_run_secs: u64) -> u64 {
+    if last_run_secs >= 10 { return 2; }
+    (2u64 << fail_streak.min(30)).min(30)
+}
+
+/// 登录态失效不值得原地重试（要人扫码），其余错误（信令关闭、会话异常）就地重建房间。
+fn fatal_after_run(err: &str) -> bool {
+    err.contains("token 已失效") || err.contains("尚未登录") || err.contains("1120")
+}
+
 fn main() {
     let mut display: Option<String> = None;
     let mut fps: u32 = 60;
@@ -146,9 +158,21 @@ fn main() {
         }
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    if let Err(e) = rt.block_on(run(display, fps, still_fps, bitrate_kbps, gop)) {
-        eprintln!("宿主退出：{e}");
-        std::process::exit(1);
+    // 信令断线是常态（云端闲时关连）：就地退避重建房间，只有登录态失效才退出交给 systemd/人。
+    let mut fail_streak = 0u32;
+    loop {
+        let t0 = std::time::Instant::now();
+        match rt.block_on(run(display.clone(), fps, still_fps, bitrate_kbps, gop)) {
+            Ok(()) => println!("信令通道结束，重建房间…"),
+            Err(e) => {
+                println!("宿主退出：{e}");
+                if fatal_after_run(&e) { std::process::exit(1); }
+            }
+        }
+        let delay = next_reconnect_delay(fail_streak, t0.elapsed().as_secs());
+        fail_streak = fail_streak.saturating_add(1).min(5);
+        println!("   {delay} 秒后重连（连续失败 {fail_streak} 次）…");
+        std::thread::sleep(std::time::Duration::from_secs(delay));
     }
 }
 
@@ -1513,5 +1537,31 @@ fn capture_loop(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::next_reconnect_delay;
+
+    #[test]
+    fn first_failure_backs_off_two_seconds() {
+        assert_eq!(next_reconnect_delay(0, 0), 2);
+    }
+
+    #[test]
+    fn consecutive_failures_double_up_to_thirty() {
+        assert_eq!(next_reconnect_delay(1, 0), 4);
+        assert_eq!(next_reconnect_delay(2, 0), 8);
+        assert_eq!(next_reconnect_delay(3, 0), 16);
+        assert_eq!(next_reconnect_delay(4, 0), 30);
+        assert_eq!(next_reconnect_delay(9, 0), 30);
+    }
+
+    #[test]
+    fn a_long_live_run_resets_the_backoff() {
+        // 上一轮活过 10 秒说明服务器可达，只是会话断了：回到基础退避。
+        assert_eq!(next_reconnect_delay(5, 12), 2);
+        assert_eq!(next_reconnect_delay(5, 9), 30);
     }
 }
