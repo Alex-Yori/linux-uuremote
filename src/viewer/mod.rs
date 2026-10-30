@@ -152,6 +152,10 @@ impl Session {
 
 /// POST /api/v1/room/join/by_device/{id} → 房间 token + 信令列表。
 pub async fn join(api: &crate::api::ApiClient, device: &str) -> Result<RoomData, String> {
+    if std::env::var("UU_VIEWER_DEBUG").is_ok_and(|v| v == "1") {
+        println!("   join 调试：device={device} req_device={} client={} csrf={} token={}",
+            api.creds.device_id, api.creds.client_id, api.creds.csrf.len(), api.creds.token.len());
+    }
     let (status, body) = api.post_json(&format!("/api/v1/room/join/by_device/{device}"), &json!({"force_join": false})).await?;
     let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
