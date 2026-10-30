@@ -49,6 +49,9 @@ flate2 = "1"
 openh264 = "0.9"
 webrtc = "0.10"
 async-trait = "0.1"
+# pion 内部日志（log facade），UU_HOST_DEBUG=1 时打开：能看到 "Failed to start SCTP: …" 这类关键告警
+log = "0.4"
+env_logger = "0.11"
 # 控制端（uu-viewer）：SDL 窗口渲染/音频，opus 解码
 sdl2 = { version = "0.37", features = ["ttf"] }
 opus = "0.2"

@@ -156,6 +156,17 @@ fn fatal_after_run(err: &str) -> bool {
 }
 
 fn main() {
+    // pion 内部日志：外网连不上这类问题只有它的 ICE/DTLS/SCTP 日志能说明白。
+    // UU_HOST_DEBUG=1 时开，默认只放 webrtc 系（我们的 println 不受影响）。
+    if std::env::var("UU_HOST_DEBUG").is_ok_and(|v| v == "1") {
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(
+                "warn,webrtc_ice=info,webrtc_dtls=info,webrtc_sctp=info,webrtc_data=info,webrtc=warn",
+            ),
+        )
+        .format_timestamp_millis()
+        .init();
+    }
     let mut display: Option<String> = None;
     let mut fps: u32 = 60;
     let mut still_fps: u32 = 3;

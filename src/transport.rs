@@ -433,6 +433,10 @@ impl Peer {
             let events = events.clone();
             move |d: Arc<RTCDataChannel>| {
                 let label = d.label().to_owned();
+                // 协商到了但没有 on_open，说明 SCTP 关联没成——这条与下面的 open 分开记，
+                // 「连上但黑屏」就是卡在两者之间。
+                println!("   数据通道 协商：{label}");
+                crate::hostlog::log(&format!("数据通道 协商：{label}"));
                 let is_control = label == CONTROL_LABEL;
                 // 真正能用是 on_open 之后：那时才存通道、才报 ControlOpen。
                 let control_open = control.clone();
@@ -476,17 +480,33 @@ impl Peer {
                 Box::pin(async move {})
             }
         }));
+        pc.sctp().on_error(Box::new({
+            move |err: webrtc::error::Error| {
+                println!("   SCTP 错误：{err}");
+                crate::hostlog::log(&format!("SCTP 错误：{err}"));
+                Box::pin(async move {})
+            }
+        }));
         // webrtc-rs 0.10 没有 `on_connection_state_change`：轮询状态，变化时报出去。
         let poll_pc = pc.clone();
         let poll_events = events.clone();
         tokio::spawn(async move {
             let mut last = poll_pc.connection_state();
+            let mut last_sctp = poll_pc.sctp().state().to_string();
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let now = poll_pc.connection_state();
                 if now != last {
                     let _ = poll_events.send(PeerEvent::ConnectionState(state_name(now)));
                     last = now;
+                }
+                // SCTP 是数据通道（控制面）的地基：DTLS connected 而 SCTP 不到 connected
+                // = 客户端控制通道永远开不了 → 黑屏。单独盯它的状态迁移。
+                let sctp_now = poll_pc.sctp().state().to_string();
+                if sctp_now != last_sctp {
+                    last_sctp = sctp_now.clone();
+                    println!("   SCTP 传输状态：{sctp_now}");
+                    crate::hostlog::log(&format!("SCTP 传输状态：{sctp_now}"));
                 }
                 // webrtc-rs 0.10 不把 RTCIceTransport 暴露出来，选中的 candidate 对
                 // （host/srflx/relay）拿不到；通路类型只能靠 tcpdump 或升级 crate 再看。
