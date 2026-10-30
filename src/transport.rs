@@ -377,6 +377,11 @@ impl Peer {
         let mut settings = SettingEngine::default();
         settings.set_answering_dtls_role(DTLSRole::Server).map_err(|e| format!("设置 DTLS answer 角色失败: {e}"))?;
         settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // 关掉 pion 的 disconnected(5s)/failed(25s) 判定：我们是受控端，pion 只用
+        // 「收到对端 STUN Request」刷新 selected pair 的 last_received；官方客户端（libwebrtc）
+        // 有媒体流就不发 connectivity check，于是通路明明双向有 RTP/RTCP，pion 却误判 failed，
+        // 客户端跟着拆会话 →「连上一分钟就断」。存活交给媒体（RTCP 观测）+ 信令看门狗。
+        settings.set_ice_timeouts(None, None, Some(std::time::Duration::from_secs(2)));
         // P2P 关键：host candidate 只报真实物理网卡。lo 的 127.0.0.1、docker/veth 等
         // 虚拟网段客户端解不了，混在里面只会污染候选对选择（LAN 直连要靠 wlo1/enp*）。
         settings.set_interface_filter(Box::new(|name: &str| {
@@ -483,6 +488,8 @@ impl Peer {
                     let _ = poll_events.send(PeerEvent::ConnectionState(state_name(now)));
                     last = now;
                 }
+                // webrtc-rs 0.10 不把 RTCIceTransport 暴露出来，选中的 candidate 对
+                // （host/srflx/relay）拿不到；通路类型只能靠 tcpdump 或升级 crate 再看。
             }
         });
         Ok(Self { pc, track: Arc::new(Mutex::new(None)), audio_track: Arc::new(Mutex::new(None)), control, channels, events })
