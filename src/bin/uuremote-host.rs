@@ -82,6 +82,10 @@ struct Session {
     answered: bool,
     /// 连接阶段计时（"连接半分钟"的账要能算）：be-controlled 到达的时刻。
     t_be_controlled: std::time::Instant,
+    /// 上一路会话的出帧与光标任务句柄：新拉流请求来了必须掐掉，否则每重连一次
+    /// 就多留一套编码器+消费任务（实测同时跑 3 路 NVENC，CPU/GPU 全浪费）。
+    video_abort: Option<tokio::task::AbortHandle>,
+    shape_abort: Option<tokio::task::AbortHandle>,
     /// answer 发出的时刻（None = 还没收到 offer）。
     t_answer: Option<std::time::Instant>,
 }
@@ -387,7 +391,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     };
                     match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, answered: false, t_be_controlled: std::time::Instant::now(), t_answer: None }),
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, answered: false, video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
                         Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
@@ -572,6 +576,13 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
 
 /// 关会话：先停采集线程（它在 blocking_send 上等），再关 PeerConnection，最后松开按住的键。
 async fn stop_session(session: Session) {
+    // 先掐消费任务：frames_rx 一被 drop，采集线程的 blocking_send 就报 Err 自行退出。
+    if let Some(h) = &session.video_abort {
+        h.abort();
+    }
+    if let Some(h) = &session.shape_abort {
+        h.abort();
+    }
     if let Some(handle) = &session.capture {
         // 采集线程会在 frames_tx 关闭后退出，这里先不等它，避免卡死在 blocking_send。
         let _ = handle;
@@ -1032,8 +1043,9 @@ fn start_video(
 
     let peer = session.peer.clone();
     let settings_pipe = Some(settings.clone());
-    tokio::spawn(async move {
+    let video_task = tokio::spawn(async move {
         let _ = init_done_rx.await;
+        let mut write_fails = 0u32;
         while let Some(frame) = frames_rx.recv().await {
             let pipeline_us = frame.t_out.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             let pipeline_ms = (pipeline_us / 1000).min(65_535) as u64;
@@ -1043,13 +1055,22 @@ fn start_video(
             }
             if let Err(e) = peer.write_video(frame.data, frame.duration, pipeline_ms).await {
                 eprintln!("   写视频样本失败：{e}");
+                // 轨道连着失败 = 这条会话已经死了，别再拖着一整套编码器空转。
+                write_fails += 1;
+                if write_fails >= 5 {
+                    hostlog::log("出帧任务：连续 5 次写轨道失败 → 会话已死，退出采集");
+                    break;
+                }
+            } else {
+                write_fails = 0;
             }
         }
     });
+    session.video_abort = Some(video_task.abort_handle());
     // 光标形状镜像：Message{15: SystemStateChange{2: CursorShape}} 走 CONTROL 通道，
     // 客户端拿它替换自己画的本地贴图（不发的话用户永远看到 Windows 箭头）。
     let peer_shape = session.peer.clone();
-    tokio::spawn(async move {
+    let shape_task = tokio::spawn(async move {
         while let Some(shape) = shapes_rx.recv().await {
             if let Err(e) = peer_shape.send_control(&shape).await {
                 eprintln!("   光标形状发送失败：{e}");
@@ -1058,6 +1079,7 @@ fn start_video(
             }
         }
     });
+    session.shape_abort = Some(shape_task.abort_handle());
 }
 
 /// 采集 → 编码 → 送帧。NVENC（FFmpeg 子进程，参照实现在本机的方式）优先，
