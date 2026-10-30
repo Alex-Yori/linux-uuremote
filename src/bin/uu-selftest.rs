@@ -377,7 +377,7 @@ async fn run(display: Option<String>, frames: u32) -> Result<(), String> {
             FrameKind::Delta => p += 1,
             FrameKind::Skipped => {}
         }
-        host.write_video(access_unit, Duration::from_millis(33)).await?;
+        host.write_video(access_unit, Duration::from_millis(33), 0).await?;
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
     let mut waited = 0;

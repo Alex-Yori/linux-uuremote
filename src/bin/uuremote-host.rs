@@ -26,6 +26,7 @@ use linux_uuremote::gating::{Action, FrameDropper, GateConfig};
 use linux_uuremote::nvenc::NvencH264;
 use linux_uuremote::initialization::{encode_capture_change, encode_permissions, encode_secure_desktop, encode_screen_sources, envelope, Permissions, Screen, ScreenGeometry};
 use linux_uuremote::input::X11Input;
+use linux_uuremote::hostlog;
 use linux_uuremote::signaling::{self, Received, Signaling};
 use linux_uuremote::transport::{decode_offer_sdp, ice_configuration, ice_servers_from_json, Peer, PeerEvent, CONTROL_LABEL};
 use serde_json::{json, Value};
@@ -105,13 +106,19 @@ struct RemoteSettings {
     loss: AtomicU64,
     /// PeerConnection 是否已连通：自适应降帧的门槛——没连通时统计的是"没人看"，不是编码器吃不下。
     connected: AtomicBool,
+    /// 发送侧管线滞留（AU 出编码器→写样本）总和/帧数：video-timing 上报值的均值，
+    /// 进周期日志与客户端 delay_send_* 对账。
+    pipe_sum_us: AtomicU64,
+    pipe_n: AtomicU64,
 }
 
 impl RemoteSettings {
     fn new(fps: u32, still_fps: u32) -> Self {
         Self {
             moving_fps: AtomicU64::new(fps.max(1) as u64),
-            still_fps: AtomicU64::new(still_fps as u64),
+            still_fps: AtomicU64::new(still_fps.max(1) as u64),
+            pipe_sum_us: AtomicU64::new(0),
+            pipe_n: AtomicU64::new(0),
             bitrate_kbps: AtomicU64::new(0),
             quality: AtomicU64::new(5),
             custom_bps: AtomicU64::new(0),
@@ -311,7 +318,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
             _ = tokio::time::sleep_until(offer_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if offer_deadline.is_some() && session.as_ref().is_some_and(|s| !s.answered) =>
             {
-                println!("   ⚠ be-controlled 后 6 秒没等到 offer（只有 candidate）→ 疑似云端路由卡死，重连信令重新注册房间");
+                hostlog::log("⚠ be-controlled 后 6 秒没等到 offer（只有 candidate）→ 疑似云端路由卡死，重连信令重新注册房间");
                 if let Some(old) = session.take() {
                     stop_session(old).await;
                 }
@@ -323,7 +330,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     println!("   room_info ack ✓：iceServers {} 台", ice_servers_from_json(&v).len());
                 }
                 Some(Signal::BeControlled { header, capture_type, options }) => {
-                    println!("   收到拉流请求（capture_type={capture_type}）");
+                    hostlog::log(&format!("收到拉流请求（capture_type={capture_type}）"));
                     // 官方 ConnectOptions 带来客户端的初始采集设置与解码能力：
                     // 先按它设初值（客户端 UI 上显示的就是这些），再拿解码能力与自身
                     // 编码能力求交——真彩/帧率上限都由这个交集决定，不是宿主单方面声明。
@@ -397,11 +404,11 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             emit_tx.send(("soac".to_string(), Some(payload))).ok();
                             session.answered = true;
                             session.t_answer = Some(std::time::Instant::now());
-                            println!(
-                                "   answer 已发出（SDP {} 字节；be-controlled→answer {} ms）",
+                            hostlog::log(&format!(
+                                "answer 已发出（SDP {} 字节；be-controlled→answer {} ms）",
                                 answer.len(),
                                 std::time::Instant::now().duration_since(session.t_be_controlled).as_millis()
-                            );
+                            ));
                             // 补上早到的 candidate（客户端可能靠它们打洞）。
                             for (c, mid, mline) in std::mem::take(&mut early_candidates) {
                                 if let Err(e) = session.peer.add_candidate(&c, mid.as_deref(), mline).await {
@@ -468,14 +475,19 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         if let Some(session) = session.as_mut() {
                             handle_control(&data, session, &settings, &label, &display).await;
                         }
-                    } else if label != "STREAMER_DATA_CHANNEL" || session.as_ref().is_some_and(|s| s.control_msgs % 20 == 0) {
+                    } else if label == "STREAMER_DATA_CHANNEL" {
+                        // 客户端周期统计（connection_period_stats_event）：延迟/frm 的
+                        // 客户端口径正源，常开解码进日志文件，与宿主侧管线对账。
+                        match serde_json::from_slice::<Value>(&data) {
+                            Ok(v) => hostlog::log(&format!("客户端周期统计：{}", hostlog::truncate(&v.to_string(), 4000))),
+                            Err(_) => {
+                                let head: String = data.iter().take(48).map(|b| format!("{b:02x}")).collect();
+                                hostlog::log(&format!("STREAMER 通道（非JSON）：{} 字节 head={head}", data.len()));
+                            }
+                        }
+                    } else if session.as_ref().is_some_and(|s| s.control_msgs % 40 == 0) {
                         let head: String = data.iter().take(48).map(|b| format!("{b:02x}")).collect();
                         println!("   旁路通道（{label}）：{} 字节 head={head}", data.len());
-                        if std::env::var("UU_HOST_DEBUG").is_ok() && label == "STREAMER_DATA_CHANNEL" {
-                            // 客户端周期统计（connection_period_stats_event）原样回传，
-                            // 排查延迟/frm/帧率口径时直接看它报了些什么。
-                            println!("   STREAMER 载荷：{}", String::from_utf8_lossy(&data[..data.len().min(4000)]));
-                        }
                     }
                 }
                 Some(PeerEvent::KeyframeRequest) => {
@@ -1002,10 +1014,16 @@ fn start_video(
     });
 
     let peer = session.peer.clone();
+    let settings_pipe = Some(settings.clone());
     tokio::spawn(async move {
         let _ = init_done_rx.await;
         while let Some(frame) = frames_rx.recv().await {
-            let pipeline_ms = frame.t_out.elapsed().as_millis().min(65_535) as u64;
+            let pipeline_us = frame.t_out.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            let pipeline_ms = (pipeline_us / 1000).min(65_535) as u64;
+            if let Some(s) = settings_pipe.as_ref() {
+                s.pipe_sum_us.fetch_add(pipeline_us, Ordering::Relaxed);
+                s.pipe_n.fetch_add(1, Ordering::Relaxed);
+            }
             if let Err(e) = peer.write_video(frame.data, frame.duration, pipeline_ms).await {
                 eprintln!("   写视频样本失败：{e}");
             }
@@ -1275,6 +1293,15 @@ fn capture_loop(
                 "   每帧耗时：抓取 {:.1} + 比对 {:.1} + 编码 {:.1} + 发送 {:.1} ms",
                 ms(acc_grab), ms(acc_diff), ms(acc_encode), ms(acc_send)
             );
+            // 发送侧管线滞留均值（video-timing 上报的 delay_send_* 正源）：进日志文件对账。
+            let n = settings.pipe_n.swap(0, Ordering::Relaxed);
+            let sum = settings.pipe_sum_us.swap(0, Ordering::Relaxed);
+            hostlog::log(&format!(
+                "周期统计：{:.1} fps ≈ {:.0} kbps，管线滞留均值 {:.1} ms（{n} 帧）",
+                since_last as f64 / secs,
+                win_bytes as f64 * 8.0 / win_start.elapsed().as_secs_f64().max(0.1) / 1000.0,
+                sum as f64 / n.max(1) as f64 / 1000.0
+            ));
             frames_sent = 0;
             acc_grab = Duration::ZERO;
             acc_diff = Duration::ZERO;

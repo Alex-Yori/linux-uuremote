@@ -514,13 +514,13 @@ impl Peer {
         if !negotiated.iter().any(|c| c.eq_ignore_ascii_case("H264")) {
             return Err(format!("协商后视频没有 H.264（谈定的是 {negotiated:?}）"));
         }
-        println!("   视频协商完成：{}", negotiated.join(" / "));
+        crate::hostlog::log(&format!("视频协商完成：{}", negotiated.join(" / ")));
         // 采集/时序扩展没谈定 = 接收端 frm/延迟按名义兜底报，必须看得见。
         let missing = missing_uu_extensions(&answer.sdp);
         if missing.is_empty() {
-            println!("   RTP 采集/时序扩展全部谈定（capture-index/new-frame/send-time/capture-time/video-timing）");
+            crate::hostlog::log("RTP 采集/时序扩展全部谈定（capture-index/new-frame/send-time/capture-time/video-timing）");
         } else {
-            println!("   ⚠ offer 没提出这些 RTP 头扩展，写不进包：{:?}", missing);
+            crate::hostlog::log(&format!("⚠ offer 没提出这些 RTP 头扩展，写不进包：{:?}", missing));
         }
         if std::env::var("UU_HOST_DEBUG").is_ok() {
             println!("   offer extmap：{}", extmap_lines(sdp_text).join(" | "));
