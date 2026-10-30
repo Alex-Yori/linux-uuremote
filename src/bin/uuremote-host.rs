@@ -299,7 +299,11 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
     // offer 看门狗：be-controlled 到后只等到 candidate 而 offer 迟迟不来 = 云端
     // 路由卡死（2026-10-30 20:50 实测：13 条 candidate 全到、offer 一条没有，
     // 客户端 12s 超时重连才通）。到点主动重连信令，把房间重新注册一遍。
+    // 但 Windows 客户端带 7 台 TURN 时 ICE gather 本身就能要十几秒（offer 在
+    // gather 完成后才发），所以期限给到 20s，且只在信令静默 ≥5s 时才动手——
+    // 否则会把正在路上跑的 offer 冲掉，连接反而变成 8s 一轮的死循环。
     let mut offer_deadline: Option<tokio::time::Instant> = None;
+    let mut last_signal_at = tokio::time::Instant::now();
 
     println!("等待客户端拉流（Ctrl-C 退出）…");
     // 长按重复的宿主自驱动节拍：50ms 粒度排空到期键（周期 33ms），不等 CONTROL
@@ -316,9 +320,13 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 }
             }
             _ = tokio::time::sleep_until(offer_deadline.unwrap_or_else(tokio::time::Instant::now)),
-                if offer_deadline.is_some() && session.as_ref().is_some_and(|s| !s.answered) =>
+                if offer_deadline.is_some()
+                    && session.as_ref().is_some_and(|s| !s.answered)
+                    && last_signal_at.elapsed() >= Duration::from_secs(5) =>
             {
-                hostlog::log("⚠ be-controlled 后 6 秒没等到 offer（只有 candidate）→ 疑似云端路由卡死，重连信令重新注册房间");
+                hostlog::log(
+                    "⚠ be-controlled 后 20 秒无 offer 且信令静默 5 秒 → 疑似云端路由卡死，重连信令重新注册房间",
+                );
                 if let Some(old) = session.take() {
                     stop_session(old).await;
                 }
@@ -365,7 +373,8 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         );
                     }
                     SOAC_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
-                    offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(6));
+                    offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(20));
+                    last_signal_at = tokio::time::Instant::now();
                     // 每次拉流新建一条会话：ICE 配置属于这一次会议，不能复用上一条。
                     if let Some(old) = session.take() {
                         stop_session(old).await;
@@ -383,11 +392,17 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(Signal::Offer { sdp, ice_id, client_id, app_control_id }) => {
+                    last_signal_at = tokio::time::Instant::now();
                     offer_deadline = None;
                     let Some(session) = session.as_mut() else {
                         println!("   soac offer 在没有会话时到达，忽略");
                         continue;
                     };
+                    hostlog::log(&format!(
+                        "offer 到达（be-controlled 起累计 {} ms，SDP {} 字节）",
+                        session.t_be_controlled.elapsed().as_millis(),
+                        sdp.len()
+                    ));
                     session.route = json!({ "ice_id": ice_id, "client_id": client_id, "app_control_id": app_control_id });
                     match session.peer.answer_offer(&sdp).await {
                         Ok(answer) => {
@@ -421,6 +436,8 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(Signal::Candidate { candidate, sdp_mid, sdp_mline_index }) => {
+                    // 信令还活着（有 candidate 在流）→ 看门狗不该动手。
+                    last_signal_at = tokio::time::Instant::now();
                     // 客户端的 trickle candidate 常常比 offer 先到；这时 add 会报
                     // "remote description is not set"，白丢一批，连接就慢一步。先攒着。
                     if session.as_ref().is_some_and(|s| s.answered) {
