@@ -529,6 +529,8 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     if keep {
                         hostlog::log("对端离开但会话还没谈定 → 保留 PeerConnection（ufrag/TURN 分配不重来）");
                         println!("   对端离开（未谈定，保留会话等重进）");
+                        // 保留不是无限占着 TURN 分配：15 秒内没有新 offer 照样拆。
+                        offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
                     } else {
                         println!("   对端离开，关会话");
                         if let Some(session) = session.take() {
