@@ -171,8 +171,12 @@ fn main() {
                     match home.hit(x, y) {
                         HomeAction::None => {
                             // 顶栏空白区按下 = 拖动整窗（borderless 后没有系统标题栏，这里就是标题栏）。
+                            // 抓鼠：指针移出窗口边界后 SDL 仍继续送相对事件，拖动不会断/跳。
                             let (ww, _) = canvas.window().size();
-                            if y < TOPBAR_H && x < ww as i32 - 222 { home.drag = Some((x, y)); }
+                            if y < TOPBAR_H && x < ww as i32 - 222 {
+                                home.drag = Some((x, y));
+                                canvas.window_mut().set_grab(true);
+                            }
                         }
                         HomeAction::Select(i) => home.selected = Some(i),
                         HomeAction::Login => {
@@ -217,7 +221,9 @@ fn main() {
                         canvas.window_mut().set_position(WindowPos::Positioned(px + (x - ox)), WindowPos::Positioned(py + (y - oy)));
                     }
                 }
-                Event::MouseButtonUp { .. } => home.drag = None,
+                Event::MouseButtonUp { .. } => {
+                    if home.drag.take().is_some() { canvas.window_mut().set_grab(false); }
+                },
                 _ => {}
             }
         }
