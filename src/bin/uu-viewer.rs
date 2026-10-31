@@ -114,6 +114,7 @@ fn main() {
 
     // ---- 主页 ----
     let mut canvas = video.window("网易UU远程", 980, 640).position_centered().resizable().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
 
     let logged = rt.block_on(load_base_creds()).is_ok_and(|c| !c.token.is_empty());
@@ -536,9 +537,21 @@ fn resolve_device(devs: &[Value], creds: &Credentials, want: &str) -> Option<Str
 
 // ---------------- 远程画面窗口 ----------------
 
+/// 官方 UU 远程应用图标（从 GameViewer.exe RT_ICON 抽取的 256px RGBA PNG）。
+/// SDL2 X11 后端把 SDL_SetWindowIcon 映射为 _NET_WM_ICON（任务栏/切换器用）；
+/// GNOME 标题栏本身不绘制图标，属正常。
+fn set_app_icon(window: &mut sdl2::video::Window) {
+    if let Ok(mut img) = linux_uuremote::viewer::png::decode(icons::APP) {
+        if let Ok(surf) = sdl2::surface::Surface::from_data(&mut img.rgba, img.width, img.height, img.width * 4, PixelFormatEnum::RGBA8888) {
+            window.set_icon(surf);
+        }
+    }
+}
+
 fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf::Font<'static, 'static>>, creds: &Credentials, target: &str, alias: &str, quality: u64, fps: u32, win_w: u32, win_h: u32, view_only: bool, no_audio: bool, event_pump: &mut sdl2::EventPump) -> Result<(), String> {
     let title = if alias.is_empty() { "UU 远程".to_owned() } else { format!("UU 远程 · {alias}") };
     let mut canvas = video.window(&title, win_w, win_h).position_centered().resizable().build().map_err(|e| e.to_string())?.into_canvas().build().map_err(|e| e.to_string())?;
+    set_app_icon(canvas.window_mut());
     canvas.window_mut().set_always_on_top(true);
     let texture_creator = canvas.texture_creator();
     let mouse_sys = sdl.mouse();
@@ -807,6 +820,7 @@ fn run_ui_preview() {
     let video = sdl.video().expect("视频子系统失败");
     let font = load_font();
     let mut canvas = video.window("UU 远程 · UI 预览", 1280, 720).position_centered().resizable().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
     let mut ui = Ui::new(4, 90, false);
     ui.notify("真彩模式下不支持当前画质，已降到超清");
