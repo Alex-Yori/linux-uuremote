@@ -60,6 +60,11 @@ enum Signal {
         candidate: String,
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u16>,
+        /// 客户端 candidate 消息自带这次会议的 ice_id/app_control_id：在 offer 到达之前，
+        /// 这是唯一能让我们自己的 trickle candidate 挂上正确 ice_id 的来源。
+        ice_id: Option<Value>,
+        client_id: Option<String>,
+        app_control_id: Option<Value>,
     },
     PeerLeft,
     Closed(String),
@@ -87,6 +92,9 @@ struct Session {
     saw_offer: bool,
     /// 是否已发出 answer（远端描述已设）：早到 candidate 要等它才能 add。
     answered: bool,
+    /// 还没拿到会议路由时收集到的本地 candidate：带 ice_id=null 客户端对不上号，
+    /// 先攒着，采纳路由（来自客户端 candidate 或 offer）后统一补发。
+    pending_local: Vec<(String, Option<String>, Option<u32>)>,
     /// 连接阶段计时（"连接半分钟"的账要能算）：be-controlled 到达的时刻。
     t_be_controlled: std::time::Instant,
     /// 上一路会话的出帧与光标任务句柄：新拉流请求来了必须掐掉，否则每重连一次
@@ -420,7 +428,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         }
                     };
                     match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
+                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
                         Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
@@ -442,6 +450,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                     session.ice_id = ice_id.clone();
                     session.route = json!({ "ice_id": ice_id, "client_id": client_id, "app_control_id": app_control_id });
+                    // offer 一到就补发攒下的本地 candidate，不等 answer：客户端越早拿到
+                    // 我们的候选越早能开始打洞/配对。
+                    flush_local_candidates(session, &emit_tx).await;
                     match session.peer.answer_offer(&sdp).await {
                         Ok(answer) => {
                             // fork 把 SoacMessage 的字段摊平在顶层发；顺手带一份 data 副本，两边都认。
@@ -473,9 +484,25 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                         Err(e) => eprintln!("   answer 失败：{e}"),
                     }
                 }
-                Some(Signal::Candidate { candidate, sdp_mid, sdp_mline_index }) => {
+                Some(Signal::Candidate { candidate, sdp_mid, sdp_mline_index, ice_id, client_id, app_control_id }) => {
                     // 信令还活着（有 candidate 在流）→ 看门狗不该动手。
                     last_signal_at = tokio::time::Instant::now();
+                    // 首连慢的关键一环：客户端的 candidate 比 offer 先到，而消息里带着本次会议的
+                    // ice_id/app_control_id。此前我们只在 offer 时才记 route，于是这之前自己
+                    // trickle 出去的 candidate 全是 ice_id=null → 客户端对不上号 → 一直等 →
+                    // 十几秒后放弃重来。提前采纳路由，并把已收集的本地 candidate 补发一遍。
+                    if let Some(session) = session.as_mut() {
+                        if session.route.get("ice_id").and_then(Value::as_str).is_none() && ice_id.is_some() {
+                            session.route = json!({
+                                "ice_id": ice_id,
+                                "client_id": client_id.clone(),
+                                "app_control_id": app_control_id,
+                            });
+                            session.ice_id = Some(session.route.get("ice_id").cloned().unwrap_or(Value::Null));
+                            hostlog::log(&format!("采纳会议路由（来自 candidate，早于 offer）：{}", session.route));
+                            flush_local_candidates(session, &emit_tx).await;
+                        }
+                    }
                     // 客户端的 trickle candidate 常常比 offer 先到；这时 add 会报
                     // "remote description is not set"，白丢一批，连接就慢一步。先攒着。
                     if session.as_ref().is_some_and(|s| s.answered) {
@@ -495,9 +522,18 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 Some(Signal::PeerLeft) => {
                     offer_deadline = None;
                     linux_uuremote::virtual_audio::disable();
-                    println!("   对端离开，关会话");
-                    if let Some(session) = session.take() {
-                        stop_session(session).await;
+                    // 还没谈定就拆 PeerConnection = 换 ufrag + 重新 TURN 分配（几秒），
+                    // 客户端攒的 candidate 全作废 → 外网首连变成十几秒一轮的死循环。
+                    // 客户端只是离开房间又立刻重进，这时候留着会话，下一轮直接接着谈。
+                    let keep = session.as_ref().is_some_and(|s| !s.answered && !s.saw_offer);
+                    if keep {
+                        hostlog::log("对端离开但会话还没谈定 → 保留 PeerConnection（ufrag/TURN 分配不重来）");
+                        println!("   对端离开（未谈定，保留会话等重进）");
+                    } else {
+                        println!("   对端离开，关会话");
+                        if let Some(session) = session.take() {
+                            stop_session(session).await;
+                        }
                     }
                 }
                 Some(Signal::Closed(reason)) => {
@@ -584,21 +620,18 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     }
                 }
                 Some(PeerEvent::IceCandidate { candidate, sdp_mid, sdp_mline_index }) => {
-                    // trickle：照 fork 的形状摊平在顶层，再带一份 data 副本。
-                    let route = session.as_ref().map(|s| s.route.clone()).unwrap_or_else(|| json!({}));
-                    let body = json!({
-                        "type": "candidate",
-                        "candidate": { "candidate": candidate, "sdpMid": sdp_mid, "sdpMLineIndex": sdp_mline_index },
-                        "ice_id": route.get("ice_id").cloned().unwrap_or(Value::Null),
-                        "client_id": route.get("client_id").cloned().unwrap_or(Value::Null),
-                        "app_control_id": route.get("app_control_id").cloned().unwrap_or(Value::Null),
-                    });
-                    let mut payload = body.clone();
-                    if let Some(map) = payload.as_object_mut() {
-                        map.insert("data".to_owned(), body.clone());
+                    // 还没会议路由就先攒着：带 ice_id=null 的 candidate 客户端对不上号，
+                    // 白发一条还占信令额度；采纳路由（candidate 或 offer）后统一补发。
+                    match session.as_mut() {
+                        Some(s) if s.route.get("ice_id").and_then(Value::as_str).is_some() => {
+                            send_candidate(&emit_tx, &s.route, &candidate, sdp_mid.as_deref(), sdp_mline_index).await;
+                        }
+                        Some(s) => {
+                            s.pending_local.push((candidate, sdp_mid, sdp_mline_index));
+                            hostlog::log(&format!("本地 candidate 暂无会议路由，攒 {} 条待补发", s.pending_local.len()));
+                        }
+                        None => {}
                     }
-                    emit_tx.send(("soac".to_string(), Some(payload))).ok();
-                    println!("   candidate 已 trickle");
                 }
                 Some(PeerEvent::ControlClose { label }) => println!("   数据通道 close：{label}"),
                 None => break,
@@ -631,6 +664,44 @@ async fn stop_session(session: Session) {
     }
 }
 
+/// trickle 一条本地 candidate：照 fork 的形状摊平在顶层，再带一份 data 副本，
+/// 路由字段（ice_id / client_id / app_control_id）必须齐全，缺一样客户端就不认。
+async fn send_candidate(
+    emit_tx: &mpsc::UnboundedSender<(String, Option<Value>)>,
+    route: &Value,
+    candidate: &str,
+    sdp_mid: Option<&str>,
+    sdp_mline_index: Option<u32>,
+) {
+    let body = json!({
+        "type": "candidate",
+        "candidate": { "candidate": candidate, "sdpMid": sdp_mid, "sdpMLineIndex": sdp_mline_index },
+        "ice_id": route.get("ice_id").cloned().unwrap_or(Value::Null),
+        "client_id": route.get("client_id").cloned().unwrap_or(Value::Null),
+        "app_control_id": route.get("app_control_id").cloned().unwrap_or(Value::Null),
+    });
+    let mut payload = body.clone();
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("data".to_owned(), body.clone());
+    }
+    emit_tx.send(("soac".to_string(), Some(payload))).ok();
+}
+
+/// 会议路由到手（无论是从客户端 candidate 还是 offer 采纳）就把攒下的本地 candidate
+/// 全部补发：首连慢的一半原因是这些 candidate 早早就收集好了，却因为没路由发不出去。
+async fn flush_local_candidates(session: &mut Session, emit_tx: &mpsc::UnboundedSender<(String, Option<Value>)>) {
+    if session.pending_local.is_empty() {
+        return;
+    }
+    let route = session.route.clone();
+    let items = std::mem::take(&mut session.pending_local);
+    let n = items.len();
+    for (candidate, sdp_mid, sdp_mline_index) in items {
+        send_candidate(emit_tx, &route, &candidate, sdp_mid.as_deref(), sdp_mline_index).await;
+    }
+    hostlog::log(&format!("补发攒下的本地 candidate {n} 条（路由已采纳）"));
+}
+
 /// 每次拉流会话只打前 8 条 soac 的完整形状：连接慢时要知道客户端到底发了什么
 /// （实测前三次尝试只有 13 条 candidate、零条 offer，光靠事件名看不出内容）。
 static SOAC_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -659,7 +730,14 @@ fn forward_soac(sig_tx: &mpsc::UnboundedSender<Signal>, payload: Value) {
             };
             let sdp_mid = inner.get("sdpMid").and_then(Value::as_str).map(str::to_owned);
             let mline = inner.get("sdpMLineIndex").and_then(Value::as_u64).map(|i| i as u16);
-            let _ = sig_tx.send(Signal::Candidate { candidate, sdp_mid, sdp_mline_index: mline });
+            let _ = sig_tx.send(Signal::Candidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index: mline,
+                ice_id,
+                client_id: client_id.clone(),
+                app_control_id,
+            });
         }
         other => println!("   soac {other}（忽略）"),
     }
