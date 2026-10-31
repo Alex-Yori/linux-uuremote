@@ -43,6 +43,7 @@ const MAIN_BG: Color = Color::RGB(252, 253, 254);
 const ROW_HOVER: Color = Color::RGB(235, 238, 242);
 const TEXT_DARK: Color = Color::RGB(48, 52, 58);
 const TEXT_MUT: Color = Color::RGB(140, 145, 152);
+const TOPBAR_H: i32 = 40;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -52,6 +53,12 @@ fn main() {
     // UI 预览：不连云端，用合成帧驱动远程窗口界面，验证工具栏/图标/HUD/Toast 渲染。
     if flag("--ui-preview") {
         run_ui_preview();
+        return;
+    }
+
+    // 主页预览：合成设备列表渲染主页一帧，把 RGBA 落到文件（--home-snap 给路径），供外部转 PNG 检查。
+    if flag("--home-preview") {
+        run_home_preview(opt("--home-snap").as_deref());
         return;
     }
 
@@ -183,9 +190,12 @@ fn main() {
                                 }
                             }
                         }
+                        HomeAction::Minimize => canvas.window_mut().minimize(),
+                        HomeAction::Close => break 'home,
                         HomeAction::Stub(label) => home.status_msg = format!("{label}（暂未实现）"),
                     }
                 }
+                Event::MouseMotion { x, y, .. } => home.mouse = (x, y),
                 _ => {}
             }
         }
@@ -232,7 +242,8 @@ fn main() {
         }
         if login_thread.as_ref().is_some_and(|h| h.is_finished()) { login_thread = None; }
 
-        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, qr_tex.as_ref());
+        let (hm_x, hm_y) = home.mouse;
+        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, qr_tex.as_ref(), hm_x, hm_y);
         canvas.present();
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -253,7 +264,7 @@ impl DeviceRow {
 }
 
 #[derive(Clone, PartialEq)]
-enum HomeAction { None, Select(usize), Login, Enter(bool), Stub(String) }
+enum HomeAction { None, Select(usize), Login, Enter(bool), Minimize, Close, Stub(String) }
 
 struct Home {
     devices: Vec<DeviceRow>,
@@ -263,11 +274,12 @@ struct Home {
     login_status: String,
     status_msg: String,
     session_busy: bool,
+    mouse: (i32, i32),
     hit_map: Vec<(Rect, HomeAction)>,
 }
 impl Home {
     fn new(logged_in: bool) -> Self {
-        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, hit_map: Vec::new() }
+        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, mouse: (-1, -1), hit_map: Vec::new() }
     }
     fn selected_device(&self) -> Option<&DeviceRow> { self.selected.and_then(|i| self.devices.get(i)) }
     fn hit(&mut self, x: i32, y: i32) -> HomeAction {
@@ -293,17 +305,42 @@ fn dot(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, x: i32, y: i32, c
     canvas.fill_rect(Rect::new(x - 2, y + 1, 5, 2)).ok();
 }
 
-fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>) {
+fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
     let (ww, wh) = canvas.window().size();
     canvas.set_draw_color(MAIN_BG);
     canvas.clear();
     home.hit_map.clear();
 
+    // 顶部标题栏（官方首页右上按钮组：无线副屏 / 消息中心 / 账户 / 更多 / 最小化 / 关闭）。
+    canvas.set_draw_color(Color::RGB(255, 255, 255));
+    canvas.fill_rect(Rect::new(0, 0, ww, TOPBAR_H as u32)).ok();
+    canvas.set_draw_color(Color::RGB(224, 228, 234));
+    canvas.fill_rect(Rect::new(0, TOPBAR_H - 1, ww, 1)).ok();
+    text(canvas, creator, font, cache, "网易UU远程", 16, 10, UI_BLUE);
+    let topbar: [(&[u8], HomeAction); 6] = [
+        (icons::TOP_SUBSCREEN, HomeAction::Stub("无线副屏".into())),
+        (icons::TOP_BELL, HomeAction::Stub("消息中心".into())),
+        (icons::TOP_USER, HomeAction::Stub("账户".into())),
+        (icons::TOP_MORE, HomeAction::Stub("更多".into())),
+        (icons::TOP_MINIMIZE, HomeAction::Minimize),
+        (icons::TOP_CLOSE, HomeAction::Close),
+    ];
+    for (i, (png, action)) in topbar.iter().enumerate() {
+        let r = Rect::new(ww as i32 - 6 - (6 - i as i32) * 36, (TOPBAR_H - 30) / 2, 34, 30);
+        if r.contains_point(Point::new(mx, my)) {
+            canvas.set_draw_color(ROW_HOVER);
+            canvas.fill_rect(r).ok();
+        }
+        if let Some(tex) = icon_texture(creator, png) {
+            canvas.copy(&tex, None, Rect::new(r.x() + 5, r.y() + 3, 24, 24)).ok();
+        }
+        home.hit_map.push((r, action.clone()));
+    }
+
     // 左侧栏。
     canvas.set_draw_color(SIDE_BG);
-    canvas.fill_rect(Rect::new(0, 0, 200, wh)).ok();
-    text(canvas, creator, font, cache, "网易UU远程", 16, 12, UI_BLUE);
-    let mut y = 46i32;
+    canvas.fill_rect(Rect::new(0, TOPBAR_H, 200, (wh as i32 - TOPBAR_H) as u32)).ok();
+    let mut y = TOPBAR_H + 10;
     canvas.set_draw_color(UI_BLUE);
     canvas.fill_rect(Rect::new(4, y + 1, 3, 16)).ok();
     text(canvas, creator, font, cache, "我的设备", 12, y + 2, TEXT_DARK);
@@ -338,27 +375,27 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     // 主区。
     let mx = 224i32;
     if !home.logged_in {
-        text(canvas, creator, font, cache, "全部设备", mx, 18, TEXT_DARK);
-        text(canvas, creator, font, cache, "随时访问个人设备，可用于办公、游戏、文件传输。", mx, 56, TEXT_MUT);
+        text(canvas, creator, font, cache, "全部设备", mx, TOPBAR_H as i32 + 18, TEXT_DARK);
+        text(canvas, creator, font, cache, "随时访问个人设备，可用于办公、游戏、文件传输。", mx, TOPBAR_H as i32 + 56, TEXT_MUT);
         if !home.login_open {
-            let r = Rect::new(mx + 60, 220, 200, 46);
+            let r = Rect::new(mx + 60, TOPBAR_H as i32 + 220, 200, 46);
             canvas.set_draw_color(UI_BLUE);
             canvas.fill_rect(r).ok();
             text_center(canvas, creator, font, cache, "立即登录", r, Color::RGB(255, 255, 255));
             home.hit_map.push((r, HomeAction::Login));
         } else {
-            draw_login_panel(canvas, creator, font, cache, home, qr, mx, 64);
+            draw_login_panel(canvas, creator, font, cache, home, qr, mx, TOPBAR_H as i32 + 64);
         }
     } else if home.session_busy {
         text(canvas, creator, font, cache, "远控会话进行中……", mx, 120, TEXT_MUT);
         text(canvas, creator, font, cache, "请在远程窗口断开后再连接其他设备。", mx, 150, TEXT_MUT);
     } else if let Some((alias, online, controllable)) = home.selected_device().map(|d| (d.alias.clone(), d.online, d.controllable)) {
-        dot(canvas, mx + 8, 30, if online { GREEN } else { Color::RGB(185, 188, 192) });
-        text(canvas, creator, font, cache, if online { "在线" } else { "离线" }, mx + 20, 22, if online { GREEN } else { TEXT_MUT });
-        text(canvas, creator, font, cache, &alias, mx + 62, 22, TEXT_DARK);
+        dot(canvas, mx + 8, TOPBAR_H as i32 + 30, if online { GREEN } else { Color::RGB(185, 188, 192) });
+        text(canvas, creator, font, cache, if online { "在线" } else { "离线" }, mx + 20, TOPBAR_H as i32 + 22, if online { GREEN } else { TEXT_MUT });
+        text(canvas, creator, font, cache, &alias, mx + 62, TOPBAR_H as i32 + 22, TEXT_DARK);
 
         // 蓝色大卡（进入桌面）。
-        let card = Rect::new(mx, 64, (ww as i32 - mx - 40).max(320) as u32, 300);
+        let card = Rect::new(mx, TOPBAR_H as i32 + 64, (ww as i32 - mx - 40).max(320) as u32, 300);
         for k in 0..30u32 {
             let t = k as f64 / 29.0;
             let c = if online {
@@ -408,7 +445,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         text_center(canvas, creator, font, cache, "+ 添加", qb, TEXT_MUT);
         home.hit_map.push((qb, HomeAction::Stub("快速启动".into())));
     } else {
-        text(canvas, creator, font, cache, "选择左侧的设备后点「进入桌面」。", mx, 60, TEXT_MUT);
+        text(canvas, creator, font, cache, "选择左侧的设备后点「进入桌面」。", mx, TOPBAR_H as i32 + 60, TEXT_MUT);
     }
 
     if !home.status_msg.is_empty() {
@@ -857,6 +894,36 @@ fn run_ui_preview() {
         ui.draw(&mut canvas, &creator, font.as_ref(), ww, wh);
         canvas.present();
         std::thread::sleep(Duration::from_millis(33));
+    }
+}
+
+/// --home-preview：合成设备列表，渲染主页若干帧后抓一张 RGBA 快照（验证顶栏按钮组排版）。
+fn run_home_preview(snap: Option<&str>) {
+    let sdl = sdl2::init().expect("SDL 初始化失败");
+    let video = sdl.video().expect("视频子系统失败");
+    let font = load_font();
+    let mut canvas = video.window("UU 远程 · 主页预览", 1100, 700).position_centered().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    set_app_icon(canvas.window_mut());
+    let creator = canvas.texture_creator();
+    let mut home = Home::new(true);
+    home.devices = vec![
+        DeviceRow { id: "d1".into(), alias: "Dev-Box".into(), online: true, controllable: true },
+        DeviceRow { id: "d2".into(), alias: "Backup".into(), online: false, controllable: true },
+    ];
+    home.selected = Some(1);
+    home.mouse = (1000, 20); // 悬停模拟
+    let mut text_cache: HashMap<String, Texture> = HashMap::new();
+    for _ in 0..8 {
+        let (hx, hy) = home.mouse;
+        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, None, hx, hy);
+        canvas.present();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    if let Some(path) = snap {
+        let (w, h) = canvas.window().size();
+        if let Ok(surf) = canvas.read_pixels(Rect::new(0, 0, w, h), PixelFormatEnum::RGBA32) {
+            std::fs::write(path, surf).ok();
+        }
     }
 }
 
