@@ -95,6 +95,11 @@ struct Session {
     /// 还没拿到会议路由时收集到的本地 candidate：带 ice_id=null 客户端对不上号，
     /// 先攒着，采纳路由（来自客户端 candidate 或 offer）后统一补发。
     pending_local: Vec<(String, Option<String>, Option<u32>)>,
+    /// 本会话已产出的全部本地 candidate。客户端每重试一次换一个 ice_id，
+    /// 按旧 ice_id 发的它收不到 → 每次采纳新路由要按新路由整体重发。
+    local_candidates: Vec<(String, Option<String>, Option<u32>)>,
+    /// 上一次把 candidate 发在哪个 ice_id 下；同一条路由不重发，换路由才整体重发。
+    sent_under: Option<String>,
     /// 连接阶段计时（"连接半分钟"的账要能算）：be-controlled 到达的时刻。
     t_be_controlled: std::time::Instant,
     /// 上一路会话的出帧与光标任务句柄：新拉流请求来了必须掐掉，否则每重连一次
@@ -436,7 +441,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             }
                         };
                         match Peer::new(config, peer_tx.clone()).await {
-                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
+                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), local_candidates: Vec::new(), sent_under: None, video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
                             Err(e) => eprintln!("   建会话失败：{e}"),
                         }
                     }
@@ -501,7 +506,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     // trickle 出去的 candidate 全是 ice_id=null → 客户端对不上号 → 一直等 →
                     // 十几秒后放弃重来。提前采纳路由，并把已收集的本地 candidate 补发一遍。
                     if let Some(session) = session.as_mut() {
-                        if session.route.get("ice_id").and_then(Value::as_str).is_none() && ice_id.is_some() {
+                        let same = session.route.get("ice_id").and_then(Value::as_str).is_some()
+                            && session.route.get("ice_id") == ice_id.as_ref();
+                        if !same && ice_id.is_some() {
                             session.route = json!({
                                 "ice_id": ice_id,
                                 "client_id": client_id.clone(),
@@ -633,6 +640,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 Some(PeerEvent::IceCandidate { candidate, sdp_mid, sdp_mline_index }) => {
                     // 还没会议路由就先攒着：带 ice_id=null 的 candidate 客户端对不上号，
                     // 白发一条还占信令额度；采纳路由（candidate 或 offer）后统一补发。
+                    if let Some(s) = session.as_mut() {
+                        s.local_candidates.push((candidate.clone(), sdp_mid.clone(), sdp_mline_index));
+                    }
                     match session.as_mut() {
                         Some(s) if s.route.get("ice_id").and_then(Value::as_str).is_some() => {
                             send_candidate(&emit_tx, &s.route, &candidate, sdp_mid.as_deref(), sdp_mline_index).await;
@@ -698,19 +708,29 @@ async fn send_candidate(
     emit_tx.send(("soac".to_string(), Some(payload))).ok();
 }
 
-/// 会议路由到手（无论是从客户端 candidate 还是 offer 采纳）就把攒下的本地 candidate
-/// 全部补发：首连慢的一半原因是这些 candidate 早早就收集好了，却因为没路由发不出去。
+/// 会议路由到手（无论是从客户端 candidate 还是 offer 采纳）就把本地 candidate
+/// 按这条路由整体发一遍：客户端每重试一次换一个 ice_id，按旧 ice_id 发的它收不到，
+/// 不重发它就永远凑不出可用的 candidate 对 → 十几秒一轮地干等。
 async fn flush_local_candidates(session: &mut Session, emit_tx: &mpsc::UnboundedSender<(String, Option<Value>)>) {
-    if session.pending_local.is_empty() {
+    if session.route.get("ice_id").and_then(Value::as_str).is_none() {
         return;
     }
     let route = session.route.clone();
-    let items = std::mem::take(&mut session.pending_local);
+    let ice_id = route.get("ice_id").and_then(Value::as_str).unwrap_or("").to_owned();
+    session.pending_local.clear();
+    if session.sent_under.as_deref() == Some(ice_id.as_str()) {
+        return; // 这条路由下发过了，别刷信令
+    }
+    let items = session.local_candidates.clone();
+    if items.is_empty() {
+        return;
+    }
     let n = items.len();
     for (candidate, sdp_mid, sdp_mline_index) in items {
         send_candidate(emit_tx, &route, &candidate, sdp_mid.as_deref(), sdp_mline_index).await;
     }
-    hostlog::log(&format!("补发攒下的本地 candidate {n} 条（路由已采纳）"));
+    session.sent_under = Some(ice_id);
+    hostlog::log(&format!("按会议路由发出本地 candidate {n} 条"));
 }
 
 /// 每次拉流会话只打前 8 条 soac 的完整形状：连接慢时要知道客户端到底发了什么
