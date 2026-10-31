@@ -74,6 +74,11 @@ name = "uu-viewer"
 path = "src/bin/uu-viewer.rs"
 
 
+[dev-dependencies]
+# 直接对着真正上网的那层验证 padding 载体（见 tests/padding_carrier.rs）。
+rtp = "0.10.0"
+bytes = "1"
+
 [patch.crates-io]
 webrtc = { path = "vendor/webrtc" }
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
