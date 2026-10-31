@@ -49,6 +49,7 @@ pub fn input_summary_of(message: &ControlMessage) -> &'static str {
         ControlMessage::KeyboardHeartbeat => "kbd_heartbeat",
         ControlMessage::Action(_) => "simple_action",
         ControlMessage::Rpc(_) => "rpc_request",
+        ControlMessage::Clipboard(_) => "clipboard_change",
         ControlMessage::Unsupported(_) => "unsupported",
     }
 }
@@ -65,6 +66,8 @@ pub enum ControlMessage {
     Action(SimpleAction),
     /// 画质/帧率/分辨率设置 RPC（Message 21）。
     Rpc(RpcRequest),
+    /// 剪贴板流（Message 17，分段拼接见 clipboard::Assembly）。
+    Clipboard(ClipboardChange),
 }
 
 /// `Message.simpleAction`（field 3）解出来的东西。
@@ -104,10 +107,13 @@ pub fn decode_control(data: &[u8]) -> Result<ControlMessage, String> {
         if nested(&fields, 3).is_some() {
             return decode_action(data).map(ControlMessage::Action);
         }
+        if nested(&fields, 17).is_some() {
+            return decode_clipboard(data).map(ControlMessage::Clipboard);
+        }
         if let Some(request) = decode_rpc_fields(&fields) {
             return Ok(ControlMessage::Rpc(request));
         }
-        return Err("CONTROL protobuf 里既没有 simpleAction(3) 也没有 RpcRequest(21)".into());
+        return Err("CONTROL protobuf 里没有 simpleAction(3)、clipboard_change(17) 或 RpcRequest(21)".into());
     }
     let v: Value = serde_json::from_slice(data).map_err(|_| "CONTROL 载荷不是合法 JSON")?;
     if v.get("heartbeat").and_then(Value::as_str) == Some("kbd_heartbeat") {
@@ -204,6 +210,10 @@ pub struct RpcRequest {
     /// Message 21 body 里出现过的 bytes 字段号（照参照实现区分会话/插件 RPC 用）。
     pub kinds: Vec<u32>,
     pub patch: SettingPatch,
+    /// 富媒体/文件剪贴板请求（RpcRequest field 9）：本机只支持文本，回空格式清单。
+    pub clip_request: bool,
+    /// 文本剪贴板 RPC（RpcRequest field 10 ClipboardTextChangeRequest）：(format_id, data)。
+    pub text_change: Option<(u64, String)>,
 }
 
 /// fps 菜单序号（field 1）→ 真实帧率。菜单发的是**序号不是帧率**；field 18 fpsCount 优先。
@@ -284,7 +294,35 @@ fn decode_rpc_fields(fields: &[WireField<'_>]) -> Option<RpcRequest> {
     } else {
         case = 0;
     }
-    Some(RpcRequest { request_id, case, kinds, patch })
+    let clip_request = nested(&body, 9).is_some();
+    let text_change = crate::clipboard::read_text_change_request(&body);
+    Some(RpcRequest { request_id, case, kinds, patch, clip_request, text_change })
+}
+
+/// `Message.clipboard_change`（field 17）解出来的一段剪贴板流。
+/// 分段拼接与上限见 `clipboard::Assembly`；内容属用户数据，绝不进日志。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipboardChange {
+    pub seq: u64,
+    pub timestamp: u64,
+    pub content_id: u32,
+    pub content: String,
+    pub to_be_continued: bool,
+}
+
+/// 解 protobuf `Message{seq,timestamp,clipboard_change{1 content_id,2 content,3 to_be_continued}}`。
+pub fn decode_clipboard(data: &[u8]) -> Result<ClipboardChange, String> {
+    let fields = decode_wire(data).map_err(|e| format!("CONTROL protobuf 解不开: {e:?}"))?;
+    let inner = nested(&fields, 17).ok_or("Message 里没有 clipboard_change(field 17)")?;
+    let content_id = u32::try_from(varint(&inner, 1).unwrap_or(0)).map_err(|_| "content_id 超出 u32")?;
+    let content = string_field(&inner, 2).ok_or("clipboard_change 缺 content(field 2) 或类型不对")?;
+    Ok(ClipboardChange {
+        seq: varint(&fields, 1).unwrap_or(0),
+        timestamp: varint(&fields, 2).unwrap_or(0),
+        content_id,
+        content,
+        to_be_continued: varint(&inner, 3).unwrap_or(0) != 0,
+    })
 }
 
 fn put_int(number: u32, value: u64, out: &mut Vec<u8>) {
@@ -413,15 +451,20 @@ pub fn capture_setting_feature_version() -> u8 {
 /// 回 `echo_response`：官方形状是 `Message{seq, timestamp, simpleAction{actionType=1, args="{\"seq\":N}"}}`。
 ///
 /// args 里的 `seq` 是**请求**的 seq，客户端靠它配对；自己的 seq 与时间戳另算。
-pub fn encode_echo_response(request_seq: u64, own_seq: u64, timestamp: u64) -> Vec<u8> {
+/// `clipboard` = X11 剪贴板桥活着才声明 ff_clipboard=3（FF_CLIPBOARD_SUPPORT_TEXT_CHANGE）。
+pub fn encode_echo_response(request_seq: u64, own_seq: u64, timestamp: u64, clipboard: bool) -> Vec<u8> {
     let args = format!(r#"{{"seq":{request_seq}}}"#);
     let mut action = vec![8, 1, 18];
     put_varint(args.len() as u64, &mut action);
     action.extend_from_slice(args.as_bytes());
     // FeatureFlag（SimpleAction field 4）：1 ff_capture_setting = 4。声明了就必须每条 21 都回 22，
     // 客户端画质菜单才开得起来；不声明它一条 RPC 都不发。
-    // 照参照实现的完整声明：2 ff_simple_action=2、3 ff_system_metrics=2、6 ff_file_transfer_ftp=2。
-    let flags = [8u8, capture_setting_feature_version(), 16, 2, 24, 2, 48, 2];
+    // 照参照实现的完整声明：2 ff_simple_action=2、3 ff_system_metrics=2、6 ff_file_transfer_ftp=2；
+    // 桥就绪时加 8 ff_clipboard=3（只声明文本档，文件/富媒体不吹）。
+    let mut flags = vec![8u8, capture_setting_feature_version(), 16, 2, 24, 2, 48, 2];
+    if clipboard {
+        flags.extend_from_slice(&[64, 3]);
+    }
     action.push(34);
     action.push(flags.len() as u8);
     action.extend_from_slice(&flags);
@@ -771,13 +814,20 @@ mod tests {
 
     #[test]
     fn echo_response_shape_matches_official() {
-        let reply = encode_echo_response(200, 1, 2);
+        let reply = encode_echo_response(200, 1, 2, false);
         let outer = decode_wire(&reply).unwrap();
         let inner = nested(&outer, 3).expect("simpleAction");
         assert_eq!(varint(&outer, 1), Some(1));
         assert_eq!(varint(&outer, 2), Some(2));
         assert_eq!(varint(&inner, 1), Some(1), "actionType = echo_response");
         assert_eq!(string_field(&inner, 2).unwrap(), r#"{"seq":200}"#, "args 带请求 seq");
+        // ff_clipboard 只在桥就绪时声明（field 8 = FF_CLIPBOARD_SUPPORT_TEXT_CHANGE=3）。
+        let flags = nested(&inner, 4).expect("FeatureFlag");
+        assert_eq!(varint(&flags, 8), None, "桥不可用不声明 ff_clipboard");
+        let binding = encode_echo_response(200, 1, 2, true);
+        let on = nested(&decode_wire(&binding).unwrap(), 3).unwrap();
+        let flags_on = nested(&on, 4).unwrap();
+        assert_eq!(varint(&flags_on, 8), Some(3), "桥就绪声明 ff_clipboard=3");
     }
 
     #[test]

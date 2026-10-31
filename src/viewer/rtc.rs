@@ -74,6 +74,10 @@ pub struct Host {
     pub audio: Arc<Mutex<std::collections::VecDeque<f32>>>,
     /// 我们发出的 ping echo（seq → 发出时刻），回包按 seq 对上就算 RTT。
     pub pings: Arc<Mutex<HashMap<u64, Instant>>>,
+    /// 剪贴板桥句柄（本机的 X11 CLIPBOARD；起不来则 None，不同步）。
+    pub clipboard: Option<std::sync::Arc<crate::clipboard::Handle>>,
+    /// 入站 Message 17 分段拼接状态。
+    pub clip_asm: Mutex<crate::clipboard::Assembly>,
 }
 
 pub fn configuration(result: &Value) -> Result<RTCConfiguration, String> {
@@ -285,6 +289,23 @@ impl Peer {
                     if let Some((codecs, chroma)) = wire::media_control_note(&data) {
                         if let Some(chroma) = chroma { h.stats.chroma.store(chroma as u64, Ordering::Relaxed); }
                         if let Some(codecs) = codecs { println!("   被控端编码能力清单：H264={} HEVC={}", codecs & 1 != 0, codecs & 2 != 0); }
+                    }
+                    // Message 17（剪贴板分段流）：拼完写本机 CLIPBOARD。内容不进日志。
+                    if let Ok(change) = crate::control::decode_clipboard(&data) {
+                        let mut asm = h.clip_asm.lock().unwrap_or_else(|e| e.into_inner());
+                        match asm.accept(&change) {
+                            Ok(None) => {}
+                            Ok(Some(text)) => match &h.clipboard {
+                                Some(cb) if cb.ready => {
+                                    if cb.set.send(text.clone()).is_ok() {
+                                        println!("   剪贴板入站：被控端 {} 字节已写入本机 CLIPBOARD", text.len());
+                                    }
+                                }
+                                Some(_) => println!("   剪贴板入站：{} 字节，本机桥不可用，丢弃", text.len()),
+                                None => println!("   剪贴板入站：{} 字节，本端无剪贴板桥", text.len()),
+                            },
+                            Err(e) => println!("   剪贴板分段丢弃：{e}"),
+                        }
                     }
                 })
             })

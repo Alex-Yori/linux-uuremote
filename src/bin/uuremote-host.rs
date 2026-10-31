@@ -100,6 +100,12 @@ struct Session {
     local_candidates: Vec<(String, Option<String>, Option<u32>)>,
     /// 上一次把 candidate 发在哪个 ice_id 下；同一条路由不重发，换路由才整体重发。
     sent_under: Option<String>,
+    /// 剪贴板桥（宿主进程一份，句柄克隆进会话）。
+    clipboard: Option<std::sync::Arc<linux_uuremote::clipboard::Handle>>,
+    /// 入站剪贴板分段拼接状态。
+    clip_assembly: linux_uuremote::clipboard::Assembly,
+    /// 本会话剪贴板出帧任务句柄：关会话必须掐掉（同出帧任务纪律）。
+    clip_abort: Option<tokio::task::AbortHandle>,
     /// 连接阶段计时（"连接半分钟"的账要能算）：be-controlled 到达的时刻。
     t_be_controlled: std::time::Instant,
     /// 上一路会话的出帧与光标任务句柄：新拉流请求来了必须掐掉，否则每重连一次
@@ -202,11 +208,18 @@ fn main() {
         }
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    // 剪贴板桥：宿主进程一份，句柄克隆进会话。X11 桥线程独立跑，重建房间不重开。
+    let clipboard: Option<std::sync::Arc<linux_uuremote::clipboard::Handle>> =
+        linux_uuremote::clipboard::start_x11(display.as_deref()).map(std::sync::Arc::new);
+    match &clipboard {
+        Some(h) if h.ready => println!("剪贴板桥：X11 CLIPBOARD 已就绪（文本同步开启）"),
+        _ => println!("剪贴板桥：不可用（不声明 ff_clipboard，剪贴板同步关闭）"),
+    }
     // 信令断线是常态（云端闲时关连）：就地退避重建房间，只有登录态失效才退出交给 systemd/人。
     let mut fail_streak = 0u32;
     loop {
         let t0 = std::time::Instant::now();
-        match rt.block_on(run(display.clone(), fps, still_fps, bitrate_kbps, gop)) {
+        match rt.block_on(run(display.clone(), fps, still_fps, bitrate_kbps, gop, clipboard.clone())) {
             Ok(()) => println!("信令通道结束，重建房间…"),
             Err(e) => {
                 println!("宿主退出：{e}");
@@ -220,7 +233,14 @@ fn main() {
     }
 }
 
-async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u32, gop: u32) -> Result<(), String> {
+async fn run(
+    display: Option<String>,
+    fps: u32,
+    still_fps: u32,
+    bitrate_kbps: u32,
+    gop: u32,
+    clipboard: Option<std::sync::Arc<linux_uuremote::clipboard::Handle>>,
+) -> Result<(), String> {
     // 回收上次崩溃残留的虚拟音频路由；进程退出时恢复默认输出。
     linux_uuremote::virtual_audio::init();
     let _audio_cleanup = linux_uuremote::virtual_audio::Cleanup;
@@ -457,7 +477,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             }
                         };
                         match Peer::new(config, peer_tx.clone()).await {
-                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), local_candidates: Vec::new(), sent_under: None, video_abort: None, shape_abort: None, t_be_controlled: t0, t_answer: None }),
+                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), local_candidates: Vec::new(), sent_under: None, video_abort: None, shape_abort: None, clipboard: clipboard.clone(), clip_assembly: Default::default(), clip_abort: None, t_be_controlled: t0, t_answer: None }),
                             Err(e) => { eprintln!("   建会话失败：{e}"); continue; }
                         }
                     }
@@ -666,6 +686,9 @@ async fn stop_session(session: Session) {
     if let Some(h) = &session.shape_abort {
         h.abort();
     }
+    if let Some(h) = &session.clip_abort {
+        h.abort();
+    }
     if let Some(handle) = &session.capture {
         // 采集线程会在 frames_tx 关闭后退出，这里先不等它，避免卡死在 blocking_send。
         let _ = handle;
@@ -814,7 +837,8 @@ async fn handle_control(
             // echo_request：官方客户端靠它确认宿主活着，args 里的 seq 必须原样回。
             // FeatureFlag（encode_echo_response 里带 ff_capture_setting）决定客户端发不发设置 RPC。
             if action.action == 0 {
-                let reply = encode_echo_response(action.seq, next_sequence(), now_secs());
+                let clip_on = session.clipboard.as_ref().is_some_and(|h| h.ready);
+                let reply = encode_echo_response(action.seq, next_sequence(), now_secs(), clip_on);
                 if let Err(e) = session.peer.send_on(reply_label, &reply).await {
                     eprintln!("   echo 回包失败：{e}");
                 }
@@ -824,7 +848,24 @@ async fn handle_control(
             if request.case == 0 {
                 println!("   RpcRequest 形状 {}", linux_uuremote::wire::wire_shape(data, 3));
             }
-            apply_rpc(request, &session.peer, settings, reply_label, display).await;
+            apply_rpc(request, &session.peer, settings, reply_label, display, &session.clipboard).await;
+        }
+        ControlMessage::Clipboard(change) => {
+            // 客户端复制 → 写本机 CLIPBOARD。内容属用户数据，日志只报字节数。
+            match session.clip_assembly.accept(&change) {
+                Ok(None) => {} // 续段还没收全，不表态
+                Ok(Some(text)) => match &session.clipboard {
+                    Some(h) if h.ready => {
+                        if h.set.send(text.clone()).is_ok() {
+                            println!("   剪贴板入站：远端 {} 字节已写入本机 CLIPBOARD", text.len());
+                        } else {
+                            println!("   剪贴板入站：{} 字节，但桥线程已退出", text.len());
+                        }
+                    }
+                    _ => println!("   剪贴板入站：{} 字节，桥不可用，丢弃", text.len()),
+                },
+                Err(e) => println!("   剪贴板分段丢弃：{e}"),
+            }
         }
         ControlMessage::Input(ref input) => {
             // 鼠标移动是洪水（每秒几十条），每 64 条打一条；键盘/按钮/滚轮必须全打——
@@ -873,7 +914,34 @@ async fn apply_rpc(
     settings: &Arc<RemoteSettings>,
     reply_label: &str,
     display: &Option<String>,
+    clipboard: &Option<std::sync::Arc<linux_uuremote::clipboard::Handle>>,
 ) {
+    let now_secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    // 剪贴板 RPC（官方 rpc_main.proto 描述符：请求 9 ↔ 响应 5、请求 10 ↔ 响应 6）先接，
+    // 别落到通用空 ack——客户端按响应字段号判成败。
+    if request.clip_request {
+        println!("   剪贴板 RPC：收到富媒体/文件清单请求 → 回空格式清单（本机只支持文本）");
+        let reply = linux_uuremote::clipboard::encode_clip_response(request.request_id, next_sequence(), now_secs());
+        if let Err(e) = peer.send_on(reply_label, &reply).await {
+            eprintln!("   剪贴板 RPC 回包失败：{e}");
+        }
+        return;
+    }
+    if let Some((format, text)) = request.text_change {
+        let applied = format == linux_uuremote::clipboard::FORMAT_TEXT
+            && text.len() <= linux_uuremote::clipboard::MAX_TEXT
+            && clipboard.as_ref().is_some_and(|h| h.ready && h.set.send(text.clone()).is_ok());
+        println!(
+            "   剪贴板 RPC：format={format} {} 字节 {}",
+            text.len(),
+            if applied { "已写入本机 CLIPBOARD" } else { "不支持或桥不可用" }
+        );
+        let reply = linux_uuremote::clipboard::encode_text_change_response(request.request_id, next_sequence(), now_secs(), applied);
+        if let Err(e) = peer.send_on(reply_label, &reply).await {
+            eprintln!("   剪贴板 RPC 回包失败：{e}");
+        }
+        return;
+    }
     let p = request.patch;
     if request.case == 0 {
         println!("   未识别的 RpcRequest case={}（照参照实现只回空 22，不改状态）", request.case);
@@ -1302,6 +1370,48 @@ fn start_video(
         }
     });
     session.shape_abort = Some(shape_task.abort_handle());
+    // 剪贴板推流：本机 CLIPBOARD 变化 → Message 17 分段发 CONTROL。只发本机来源的变化
+    // （远端写入的内容不再弹回去）；会话建立时先推一次现值，客户端连上就拿到基准。
+    if let Some(cb) = session.clipboard.clone() {
+        if cb.ready {
+            let peer_clip = session.peer.clone();
+            let clip_task = tokio::spawn(async move {
+                let ids = linux_uuremote::clipboard::ChunkIds::default();
+                let mut last_sent: Option<u64> = None;
+                let mut first = true;
+                loop {
+                    let snap = cb.state.lock().unwrap().clone();
+                    let send_now = snap.text.clone().filter(|_| first || (Some(snap.version) != last_sent && !snap.from_remote));
+                    if let Some(text) = send_now {
+                        first = false;
+                        last_sent = Some(snap.version);
+                        match linux_uuremote::clipboard::chunks(&text) {
+                            Ok(parts) => {
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let id = ids.next(); // 同一次发送的所有分段共用一个 content_id
+                                let mut ok = true;
+                                for (i, part) in parts.iter().enumerate() {
+                                    let msg = linux_uuremote::clipboard::encode_clipboard_message(
+                                        next_sequence(), ts, id, part, i + 1 < parts.len(),
+                                    );
+                                    if peer_clip.send_control(&msg).await.is_err() {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                if ok {
+                                    println!("   剪贴板出站：本机 {} 字节（{}/1 段）→ 客户端", text.len(), parts.len());
+                                }
+                            }
+                            Err(e) => println!("   剪贴板推流跳过：{e}"),
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            });
+            session.clip_abort = Some(clip_task.abort_handle());
+        }
+    }
 }
 
 /// 采集 → 编码 → 送帧。NVENC（FFmpeg 子进程，参照实现在本机的方式）优先，

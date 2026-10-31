@@ -93,6 +93,12 @@ impl Session {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
         let mut ping = tokio::time::interval(Duration::from_secs(1));
         let mut ping_id: u64 = 0;
+        // 本机剪贴板推流节拍（只推本机来源的变化，远端写回来的不再弹回）。
+        let mut clip_tick = tokio::time::interval(Duration::from_millis(250));
+        let mut clip_last: Option<u64> = None;
+        let mut clip_first = true;
+        let clip_ids = crate::clipboard::ChunkIds::default();
+        let mut clip_seq: u64 = 2_000_000_000;
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
         loop {
@@ -123,6 +129,30 @@ impl Session {
                     let seq = 1_000_000_000 + ping_id;
                     host.pings.lock().unwrap_or_else(|e| e.into_inner()).insert(seq, std::time::Instant::now());
                     let _ = self.peer.send_control(&wire::echo_request(seq)).await;
+                }
+                _ = clip_tick.tick(), if host.clipboard.as_ref().is_some_and(|cb| cb.ready) && host.stats.control_open.load(Ordering::Acquire) => {
+                    // 本机 CLIPBOARD 变化 → Message 17 分段推给被控端（长文本同一 content_id）。
+                    let Some(cb) = host.clipboard.clone() else { continue };
+                    let snap = cb.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let push = snap.text.clone().filter(|_| clip_first || (Some(snap.version) != clip_last && !snap.from_remote));
+                    let Some(text) = push else { continue };
+                    clip_first = false;
+                    clip_last = Some(snap.version);
+                    match crate::clipboard::chunks(&text) {
+                        Ok(parts) => {
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let id = clip_ids.next();
+                            let mut ok = true;
+                            for (i, part) in parts.iter().enumerate() {
+                                clip_seq += 1;
+                                let msg = crate::clipboard::encode_clipboard_message(clip_seq, ts, id, part, i + 1 < parts.len());
+                                if self.peer.send_control(&msg).await.is_err() { ok = false; break; }
+                            }
+                            // 内容属用户数据，日志只报字节数与段数。
+                            if ok { println!("   剪贴板出站：本机 {} 字节（{} 段）→ 被控端", text.len(), parts.len()); }
+                        }
+                        Err(e) => println!("   剪贴板推流跳过：{e}"),
+                    }
                 }
                 candidate = self.candidates.recv() => if let Some(candidate) = candidate { self.signal.soac(candidate).await? },
                 event = self.signal.event() => {

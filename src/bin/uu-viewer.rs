@@ -35,23 +35,31 @@ use sdl2::video::{FullscreenType, Window, WindowContext, WindowPos};
 use sdl2::Sdl;
 use serde_json::{json, Value};
 
-// ---- 原版配色（从 GameViewer.exe 逆向 + 官方截图逐像素取样）----
-const BRAND_BLUE: Color = Color::RGB(58, 123, 252); // QSS kFillTheme/kFillLink = #3A7BFC
+// ---- 配色：桌面 ~/桌面/uu.html「UI 还原」稿的 CSS 变量照搬（图标资产与显示尺寸不动）----
+const BRAND_BLUE: Color = Color::RGB(22, 93, 255);   // --primary-blue #165DFF
 const UI_BLUE: Color = BRAND_BLUE;
-const GREEN: Color = Color::RGB(97, 186, 98);       // 在线绿点实测
-const PANEL_BG: Color = Color::RGB(239, 244, 247);  // kFillWindowPanel（顶栏+侧栏）实测
-const SIDE_BG: Color = PANEL_BG;
-const MAIN_BG: Color = Color::RGB(247, 251, 254);   // 主区底 kFillGray249Blue 实测
-const CARD_BG: Color = Color::RGB(249, 251, 253);   // 卡片底
-const CARD_BORDER: Color = Color::RGB(217, 217, 217); // kBorderGray217
-const SEP: Color = Color::RGB(224, 229, 233);       // 分隔线
-const SELECTED: Color = Color::RGB(228, 233, 236);  // 选中行底实测
+const GREEN: Color = Color::RGB(0, 180, 42);         // --green-online #00B42A
+const SIDE_BG: Color = Color::RGB(245, 246, 248);    // --bg-sidebar #F5F6F8
+const PANEL_BG: Color = SIDE_BG;
+const MAIN_BG: Color = Color::RGB(255, 255, 255);    // --bg-main #FFFFFF
+const CARD_BG: Color = MAIN_BG;
+const CARD_BORDER: Color = Color::RGB(229, 230, 235); // --border-color #E5E6EB
+const SEP: Color = CARD_BORDER;
+const SELECTED: Color = Color::RGB(232, 235, 240);   // --hover-bg #E8EBF0（选中行底）
 const ROW_HOVER: Color = SELECTED;
-const INK: Color = Color::RGB(96, 101, 104);        // 图标/正文笔画实测中位
-const TEXT_DARK: Color = Color::RGB(98, 100, 102);  // 设备名笔画实测
-const TEXT_MUT: Color = Color::RGB(104, 103, 106);  // 胶囊文字实测
+const HOVER_ROW: Color = Color::RGB(242, 243, 245);  // .menu-item:hover rgba(0,0,0,.03)
+const INK: Color = Color::RGB(96, 101, 104);         // 线条图标笔画色（图标不动）
+const TEXT_MAIN: Color = Color::RGB(29, 33, 41);     // --text-main #1D2129
+const TEXT_DARK: Color = Color::RGB(78, 89, 105);    // --text-secondary #4E5969
+const TEXT_MUT: Color = Color::RGB(134, 144, 156);   // --text-tertiary #86909C
+const PILL_DARK: Color = Color::RGB(29, 33, 41);     // .status-tag 深底白字
+const PREVIEW_BG: Color = Color::RGB(229, 230, 235); // .preview-container 底
+const DASH: Color = Color::RGB(201, 205, 212);       // .dashed-box 虚线
+const ADD_BG: Color = Color::RGB(242, 243, 245);     // .add-btn 圆底
+const WHITE: Color = Color::RGB(255, 255, 255);
 const TOPBAR_H: i32 = 40;
-const SIDE_W: i32 = 280;                            // 官方侧栏宽度实测
+const SIDE_W: i32 = 232;                             // .sidebar 宽（HTML）
+const PAD: i32 = 32;                                 // .content-body 内边距（HTML）
 
 
 fn main() {
@@ -107,7 +115,8 @@ fn main() {
     force_argb();
     let sdl = sdl2::init().expect("SDL 初始化失败");
     let video = sdl.video().expect("视频子系统失败");
-    let font = load_font();
+    let fonts = load_fonts();
+    let font = fonts.r16.as_ref();
     if font.is_none() {
         println!("警告：没找到可用字体，界面文字将不可见（装 fonts-noto-cjk 试试）");
     }
@@ -122,7 +131,7 @@ fn main() {
         let target = resolve_device(&devs, &creds, &w).unwrap_or(w);
         println!("连接目标：{target}");
         let mut pump = sdl.event_pump().expect("事件泵");
-        match run_session(&sdl, &video, font.as_ref(), &creds, &target, "", quality, fps, win_w, win_h, view_only, no_audio, &mut pump) {
+        match run_session(&sdl, &video, font, &creds, &target, "", quality, fps, win_w, win_h, view_only, no_audio, &mut pump) {
             Ok(()) => println!("已断开。"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         }
@@ -163,8 +172,8 @@ fn main() {
     let mut qr_tex: Option<Texture> = None;
 
     let shadow_tex = shadow_texture(&creator);
-    let corner_tl = corner_texture(&creator, PANEL_BG, true, true);
-    let corner_tr = corner_texture(&creator, PANEL_BG, false, true);
+    let corner_tl = corner_texture(&creator, SIDE_BG, true, true);
+    let corner_tr = corner_texture(&creator, MAIN_BG, false, true);
     let corner_bl = corner_texture(&creator, SIDE_BG, true, false);
     let corner_br = corner_texture(&creator, MAIN_BG, false, false);
     let corners = [&corner_tl, &corner_tr, &corner_bl, &corner_br];
@@ -207,7 +216,7 @@ fn main() {
                             // 顶栏空白区按下 = 拖动整窗（borderless 后没有系统标题栏，这里就是标题栏）。
                             // 抓鼠 + 全局指针真值：拖动量 = 服务器指针当前位置 - 按下时的指针位置，
                             // 与窗口相对坐标/搬窗延迟完全解耦，出界、积压、mutter 排队都不会跑偏。
-                            if y - MARGIN < TOPBAR_H && y >= 0 && x - MARGIN < CARD_W - 222 && x >= MARGIN {
+                            if y - MARGIN < TOPBAR_H && y >= 0 && x >= MARGIN {
                                 // 按下瞬间的指针真值取 SDL 事件自带的相对坐标 + 当时窗口位置（零竞态）。
                                 let (px, py) = canvas.window().position();
                                 if std::env::var_os("UU_DRAG_DEBUG").is_some() { eprintln!("press: root=({},{}) win=({px},{py})", px + x, py + y); }
@@ -235,7 +244,7 @@ fn main() {
                                     Some(creds) => {
                                         home.session_busy = true;
                                         canvas.window_mut().hide();
-                                        let res = run_session(&sdl, &video, font.as_ref(), &creds, &id, &alias, quality, fps, win_w, win_h, view_only_click || view_only, no_audio, &mut event_pump);
+                                        let res = run_session(&sdl, &video, font, &creds, &id, &alias, quality, fps, win_w, win_h, view_only_click || view_only, no_audio, &mut event_pump);
                                         canvas.window_mut().show();
                                         home.session_busy = false;
                                         home.status_msg = match res { Ok(()) => "已断开。".to_owned(), Err(e) => format!("会话结束：{e}") };
@@ -301,7 +310,7 @@ fn main() {
         if login_thread.as_ref().is_some_and(|h| h.is_finished()) { login_thread = None; }
 
         let (hm_x, hm_y) = home.mouse;
-        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, qr_tex.as_ref(), &shadow_tex, corners, hm_x, hm_y);
+        draw_home(&mut canvas, &creator, &fonts, &mut home, &mut text_cache, qr_tex.as_ref(), &shadow_tex, corners, hm_x, hm_y);
         canvas.present();
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -372,6 +381,15 @@ fn dot(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, x: i32, y: i32, c
     circle(canvas, x, y, 4, c);
 }
 
+/// 真胶囊（两端半圆）：中间填矩形 + 左右两个半圆，替代 card 的方角擦除近似。
+fn capsule(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color) {
+    canvas.set_draw_color(fill);
+    let rad = (r.height() as i32 / 2).max(1);
+    canvas.fill_rect(Rect::new(r.x() + rad, r.y(), (r.width() as i32 - 2 * rad).max(1) as u32, r.height())).ok();
+    circle(canvas, r.x() + rad, r.y() + rad, rad, fill);
+    circle(canvas, r.x() + r.width() as i32 - rad - 1, r.y() + rad, rad, fill);
+}
+
 /// 圆角卡：填充 + 用背景色擦角近似圆角，再画直边描线。
 fn card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color, bg: Color, rad: i32, border: Option<Color>) {
     canvas.set_draw_color(fill);
@@ -394,15 +412,15 @@ fn card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: C
 }
 
 /// 虚线圆角框（官方快速启动区：dash 6px gap 4px）。
-fn dash_card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color, bg: Color, dash: Color) {
-    card(canvas, r, fill, bg, 6, None);
+fn dash_card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color, bg: Color, dash: Color, rad: i32) {
+    card(canvas, r, fill, bg, rad, None);
     canvas.set_draw_color(dash);
     let (x, y, w, h) = (r.x(), r.y(), r.width() as i32, r.height() as i32);
     let mut seg = |a: i32, b: i32, c: i32, d: i32| canvas.draw_line(Point::new(a, b), Point::new(c, d)).ok();
-    let mut p = x + 8;
-    while p < x + w - 8 { let q = (p + 6).min(x + w - 8); seg(p, y, q, y); seg(p, y + h - 1, q, y + h - 1); p += 10; }
-    let mut p = y + 8;
-    while p < y + h - 8 { let q = (p + 6).min(y + h - 8); seg(x, p, x, q); seg(x + w - 1, p, x + w - 1, q); p += 10; }
+    let mut p = x + rad + 2;
+    while p < x + w - rad - 2 { let q = (p + 6).min(x + w - rad - 2); seg(p, y, q, y); seg(p, y + h - 1, q, y + h - 1); p += 10; }
+    let mut p = y + rad + 2;
+    while p < y + h - rad - 2 { let q = (p + 6).min(y + h - rad - 2); seg(x, p, x, q); seg(x + w - 1, p, x + w - 1, q); p += 10; }
 }
 
 /// 折叠箭头（官方圆形箭头按钮近似：两条线拼的 V / ^）。
@@ -524,7 +542,7 @@ fn corner_texture(creator: &TextureCreator<WindowContext>, bg: Color, tl: bool, 
     tex
 }
 
-fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, shadow: &Texture<'a>, corners: [&Texture<'a>; 4], mx: i32, my: i32) {
+fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, fonts: &Fonts, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, shadow: &Texture<'a>, corners: [&Texture<'a>; 4], mx: i32, my: i32) {
     let (ww, wh) = (CARD_W as u32, CARD_H as u32);
     // SDL 的绘制命令按视口变换，但 clear() 无视视口 → 全程用 fill_rect。
     // 整窗先刷全透明（BlendMode::None 直写 alpha），再铺官方阴影（0 8px 24px rgba(0,0,0,0.08)，偏移 y+8）。
@@ -540,15 +558,15 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     canvas.fill_rect(Rect::new(0, 0, ww, wh)).ok();
     home.hit_map.clear();
 
-    // ---- 顶部标题栏（kFillWindowPanel 浅灰底 + 官方 logo + 灰字标题 + 右侧按钮组）----
-    canvas.set_draw_color(PANEL_BG);
-    canvas.fill_rect(Rect::new(0, 0, ww, TOPBAR_H as u32)).ok();
-    canvas.set_draw_color(SEP);
-    canvas.fill_rect(Rect::new(0, TOPBAR_H - 1, ww, 1)).ok();
-    // 官方品牌图 1a7ddd73c74d.svg（logo+「网易UU远程」字标合体），顶栏只放这一个，不再单独画文字
+    // ---- 左侧栏 232px 全高（HTML .sidebar：#F5F6F8 底，logo 在侧栏顶部，与主区无边框线）----
+    canvas.set_draw_color(SIDE_BG);
+    canvas.fill_rect(Rect::new(0, 0, SIDE_W as u32, wh)).ok();
+    // 官方品牌图 1a7ddd73c74d.svg（logo+「网易UU远程」字标合体）＝HTML .logo-area（padding 0 8 16 8）
     if let Some(tex) = icon_texture(creator, icons::BRAND) {
-        canvas.copy(&tex, None, Rect::new(14, (TOPBAR_H - 32) / 2, 94, 32)).ok();
+        canvas.copy(&tex, None, Rect::new(8, 14, 94, 32)).ok();
     }
+
+    // ---- 主区顶栏（HTML .top-bar：40px、右对齐、gap 16、padding 0 16；侧栏不加顶条）----
     let topbar: [(&[u8], HomeAction); 6] = [
         (icons::TOP_SUBSCREEN, HomeAction::Stub("无线副屏".into())),
         (icons::TOP_BELL, HomeAction::Stub("消息中心".into())),
@@ -558,121 +576,97 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         (icons::TOP_CLOSE, HomeAction::Close),
     ];
     for (i, (png, action)) in topbar.iter().enumerate() {
-        let r = Rect::new(ww as i32 - 8 - (6 - i as i32) * 40, (TOPBAR_H - 32) / 2, 38, 32);
+        // 图标显示尺寸保持 24（图标不动），最右贴边 16，步进 40（= gap 16 + 24）
+        let ix = ww as i32 - PAD / 2 - 24 - (5 - i as i32) * 40;
+        let r = Rect::new(ix - 4, TOPBAR_H / 2 - 16, 32, 32);
         if r.contains_point(Point::new(mx, my)) {
-            canvas.set_draw_color(SELECTED);
-            canvas.fill_rect(r).ok();
+            card(canvas, r, SELECTED, MAIN_BG, 4, None);
         }
         if let Some(tex) = icon_texture(creator, png) {
-            canvas.copy(&tex, None, Rect::new(r.x() + (38 - 24) / 2, r.y() + (32 - 24) / 2, 24, 24)).ok();
+            canvas.copy(&tex, None, Rect::new(ix, TOPBAR_H / 2 - 12, 24, 24)).ok();
         }
         home.hit_map.push((r, action.clone()));
     }
 
-    // ---- 左侧栏 242px（官方：折叠分组 + 状态点 + 着色设备图标 + 选中行浅灰底 + 蓝竖条）----
-    canvas.set_draw_color(PANEL_BG);
-    canvas.fill_rect(Rect::new(0, TOPBAR_H, SIDE_W as u32, (wh as i32 - TOPBAR_H) as u32)).ok();
-    canvas.set_draw_color(SEP);
-    canvas.fill_rect(Rect::new(SIDE_W - 1, TOPBAR_H, 1, (wh as i32 - TOPBAR_H) as u32)).ok();
-
-    let mut y = TOPBAR_H + 12;
-    let hdr = Rect::new(0, y, SIDE_W as u32, 30);
-    text(canvas, creator, font, cache, "我的设备", 14, y + 6, INK);
-    chevron(canvas, SIDE_W - 22, y + 15, home.groups_open[0], INK);
+    // ---- 侧栏菜单（HTML：.menu-group margin-top 12；.menu-title 12px 三级灰 + 折叠箭头；.menu-item inset 8、高 32、圆角 6、行距 2）----
+    let mut y = 14 + 32 + 12;
+    let hdr = Rect::new(0, y, SIDE_W as u32, 28);
+    htext(canvas, creator, fonts.r12.as_ref(), cache, "我的设备", 12, 20, hdr.y() + 14, TEXT_MUT);
+    chevron(canvas, SIDE_W - 22, hdr.y() + 14, !home.groups_open[0], TEXT_MUT);
     home.hit_map.push((hdr, HomeAction::ToggleGroup(0)));
-    y += 34;
+    y += 32;
     if home.groups_open[0] {
         for (i, d) in home.devices.iter().enumerate() {
-            let sel = home.selected == Some(i);
-            let r = Rect::new(0, y, SIDE_W as u32, 36);
-            if sel {
-                canvas.set_draw_color(SELECTED);
-                canvas.fill_rect(r).ok();
-                canvas.set_draw_color(BRAND_BLUE);
-                canvas.fill_rect(Rect::new(0, y + 8, 3, 20)).ok();
-            } else if r.contains_point(Point::new(mx, my)) {
-                canvas.set_draw_color(Color::RGB(233, 238, 242));
-                canvas.fill_rect(r).ok();
-            }
-            dot(canvas, 20, y + 18, if d.online { GREEN } else { Color::RGB(176, 180, 183) });
-            let icon = if d.online { icons::HOME_MONITOR_ON } else { icons::HOME_MONITOR_OFF };
-            if let Some(tex) = icon_texture(creator, icon) {
-                canvas.copy(&tex, None, Rect::new(32, y + 7, 22, 22)).ok();
-            }
-            text(canvas, creator, font, cache, &d.alias, 58, y + 10, TEXT_DARK);
+            let r = Rect::new(8, y, (SIDE_W - 16) as u32, 32);
+            side_row(canvas, creator, fonts.r13.as_ref(), cache, Some(if d.online { icons::HOME_MONITOR_ON } else { icons::HOME_MONITOR_OFF }), &d.alias, r, home.selected == Some(i), r.contains_point(Point::new(mx, my)));
             home.hit_map.push((r, HomeAction::Select(i)));
-            y += 38;
+            y += 34;
         }
-        if home.devices.is_empty() { text(canvas, creator, font, cache, if home.logged_in { "（无设备）" } else { "（未登录）" }, 30, y + 6, TEXT_MUT); y += 30; }
-        let r_all = Rect::new(0, y, SIDE_W as u32, 36);
-        if r_all.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_all).ok(); }
-        if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
-            canvas.copy(&tex, None, Rect::new(32, y + 7, 22, 22)).ok();
+        if home.devices.is_empty() {
+            htext(canvas, creator, fonts.r13.as_ref(), cache, if home.logged_in { "（无设备）" } else { "（未登录）" }, 13, 20, y + 16, TEXT_MUT);
+            y += 34;
         }
-        text(canvas, creator, font, cache, "全部设备", 58, y + 10, TEXT_DARK);
+        let r_all = Rect::new(8, y, (SIDE_W - 16) as u32, 32);
+        side_row(canvas, creator, fonts.r13.as_ref(), cache, Some(icons::HOME_GRID_BLUE), "全部设备", r_all, false, r_all.contains_point(Point::new(mx, my)));
         home.hit_map.push((r_all, HomeAction::Stub("全部设备".into())));
-        y += 44;
+        y += 34;
     }
-    let hdr2 = Rect::new(0, y, SIDE_W as u32, 30);
-    text(canvas, creator, font, cache, "远程协助", 14, y + 6, INK);
-    chevron(canvas, SIDE_W - 22, y + 15, home.groups_open[1], INK);
+    let hdr2 = Rect::new(0, y + 12, SIDE_W as u32, 28);
+    htext(canvas, creator, fonts.r12.as_ref(), cache, "远程协助", 12, 20, hdr2.y() + 14, TEXT_MUT);
+    chevron(canvas, SIDE_W - 22, hdr2.y() + 14, !home.groups_open[1], TEXT_MUT);
     home.hit_map.push((hdr2, HomeAction::ToggleGroup(1)));
-    y += 34;
+    y = hdr2.y() + 32;
     if home.groups_open[1] {
         for (label, icon, act) in [("开始协助", icons::HOME_USER_BLUE, HomeAction::Stub("远程协助".into())), ("收藏设备", icons::HOME_STAR_BLUE, HomeAction::Stub("收藏设备".into()))] {
-            let r = Rect::new(0, y, SIDE_W as u32, 36);
-            if r.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r).ok(); }
-            if let Some(tex) = icon_texture(creator, icon) {
-                canvas.copy(&tex, None, Rect::new(32, y + 7, 22, 22)).ok();
-            }
-            text(canvas, creator, font, cache, label, 58, y + 10, TEXT_DARK);
+            let r = Rect::new(8, y, (SIDE_W - 16) as u32, 32);
+            side_row(canvas, creator, fonts.r13.as_ref(), cache, Some(icon), label, r, false, r.contains_point(Point::new(mx, my)));
             home.hit_map.push((r, act));
-            y += 38;
+            y += 34;
         }
     }
-    let r_set = Rect::new(0, wh as i32 - 42, SIDE_W as u32, 36);
-    if r_set.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_set).ok(); }
-    if let Some(tex) = icon_texture(creator, icons::HOME_GEAR) {
-        canvas.copy(&tex, None, Rect::new(32, wh as i32 - 33, 22, 22)).ok();
-    }
-    text(canvas, creator, font, cache, "设置", 58, wh as i32 - 32, TEXT_DARK);
+    // .sidebar-bottom：margin-top auto → 钉在侧栏底部（padding 16）。
+    let r_set = Rect::new(8, wh as i32 - 16 - 32, (SIDE_W - 16) as u32, 32);
+    side_row(canvas, creator, fonts.r13.as_ref(), cache, Some(icons::HOME_GEAR), "设置", r_set, false, r_set.contains_point(Point::new(mx, my)));
     home.hit_map.push((r_set, HomeAction::Stub("设置".into())));
 
-    // ---- 主区 ----
-    let mx = SIDE_W + 16i32;
-    let cw = (ww as i32 - mx - 16).max(320) as u32;
+    // ---- 主区（HTML .content-body：padding 32）----
+    let cx = SIDE_W + PAD;
+    let cw = (ww as i32 - cx - PAD).max(320) as u32;
+    let cy = TOPBAR_H + PAD;
     if !home.logged_in {
-        text(canvas, creator, font, cache, "全部设备", mx, TOPBAR_H as i32 + 18, TEXT_DARK);
-        text(canvas, creator, font, cache, "随时访问个人设备，可用于办公、游戏、文件传输。", mx, TOPBAR_H as i32 + 56, TEXT_MUT);
+        htext(canvas, creator, fonts.s20.as_ref(), cache, "全部设备", 20, cx, cy + 10, TEXT_MAIN);
+        htext(canvas, creator, fonts.r13.as_ref(), cache, "随时访问个人设备，可用于办公、游戏、文件传输。", 13, cx, cy + 46, TEXT_MUT);
         if !home.login_open {
-            let r = Rect::new(mx + 60, TOPBAR_H as i32 + 220, 200, 46);
-            card(canvas, r, BRAND_BLUE, MAIN_BG, 22, None);
-            text_center(canvas, creator, font, cache, "立即登录", r, Color::RGB(255, 255, 255));
+            let r = pill(canvas, creator, fonts.r13.as_ref(), cache, "立即登录", 13, cx + 90, cy + 150, BRAND_BLUE, WHITE, 28, 10, MAIN_BG);
             home.hit_map.push((r, HomeAction::Login));
         } else {
-            draw_login_panel(canvas, creator, font, cache, home, qr, mx, TOPBAR_H as i32 + 64);
+            draw_login_panel(canvas, creator, fonts.r16.as_ref(), cache, home, qr, cx, cy + 40);
         }
     } else if home.session_busy {
-        text(canvas, creator, font, cache, "远控会话进行中……", mx, 120, TEXT_MUT);
-        text(canvas, creator, font, cache, "请在远程窗口断开后再连接其他设备。", mx, 150, TEXT_MUT);
+        htext(canvas, creator, fonts.r13.as_ref(), cache, "远控会话进行中……", 13, cx, cy + 12, TEXT_MUT);
+        htext(canvas, creator, fonts.r13.as_ref(), cache, "请在远程窗口断开后再连接其他设备。", 13, cx, cy + 40, TEXT_MUT);
     } else if let Some((alias, online, controllable)) = home.selected_device().map(|d| (d.alias.clone(), d.online, d.controllable)) {
-        // 状态行：灰胶囊 + 设备名 + 右侧竖三点。
-        let pill = Rect::new(mx + 4, TOPBAR_H + 16, 56, 24);
-        card(canvas, pill, Color::RGB(227, 229, 231), MAIN_BG, 12, None);
-        text_center(canvas, creator, font, cache, if online { "在线" } else { "离线" }, pill, if online { GREEN } else { TEXT_MUT });
-        text(canvas, creator, font, cache, &alias, mx + 76, TOPBAR_H + 18, TEXT_DARK);
-        let vr = Rect::new(ww as i32 - 46, TOPBAR_H + 10, 30, 36);
-        vdots(canvas, vr.x() + 15, vr.y() + 18, INK);
-        home.hit_map.push((vr, HomeAction::Stub("设备菜单".into())));
-        canvas.set_draw_color(SEP);
-        canvas.fill_rect(Rect::new(mx, TOPBAR_H + 56, cw, 1)).ok();
+        // ---- .device-header：深色胶囊（绿点 + 白字 12px、padding 4 10）+ 设备名 20px/600 + 竖三点，gap 12 ----
+        let hc = cy + 11;
+        let tag_label = if online { "在线" } else { "离线" };
+        let (tw, th) = measure(creator, fonts.r12.as_ref(), cache, tag_label, 12, WHITE);
+        let tag = Rect::new(cx, hc - (th + 8) / 2, (tw + 32) as u32, (th + 8) as u32);
+        capsule(canvas, tag, PILL_DARK);
+        circle(canvas, tag.x() + 13, hc, 3, GREEN);
+        if let Some(tex) = cache.get(&format!("{tag_label}|12|{}|{}|{}", WHITE.r, WHITE.g, WHITE.b)) {
+            canvas.copy(tex, None, Rect::new(tag.x() + 22, hc - th / 2, tw as u32, th as u32)).ok();
+        }
+        let name_x = tag.x() + tag.width() as i32 + 12;
+        let nw = htext(canvas, creator, fonts.s20.as_ref(), cache, &alias, 20, name_x, hc, TEXT_MAIN);
+        let dots_x = name_x + nw + 16;
+        vdots(canvas, dots_x, hc, TEXT_MUT);
+        home.hit_map.push((Rect::new(dots_x - 10, hc - 12, 20, 24), HomeAction::Stub("设备菜单".into())));
 
-        // 预览卡：在线=官方蓝色 hero 渐变 + 白色圆角按钮；离线=浅灰渐变占位。
-        let card_top = TOPBAR_H + 68;
-        let preview_h = 200u32;
-        let pv = Rect::new(mx, card_top, cw, preview_h);
-        card(canvas, pv, CARD_BG, MAIN_BG, 7, Some(CARD_BORDER));
+        // ---- .preview-container：高 248、圆角 8、#E5E6EB 底（壁纸位：在线蓝色 hero / 离线灰渐变）----
+        let pv = Rect::new(cx, tag.y() + tag.height() as i32 + 24, cw, 248);
+        card(canvas, pv, PREVIEW_BG, MAIN_BG, 8, None);
         let inner = Rect::new(pv.x() + 1, pv.y() + 1, pv.width() - 2, pv.height() - 2);
+        let mid = if online { Color::RGB(108, 160, 233) } else { Color::RGB(215, 223, 231) };
         for k in 0..40u32 {
             let t = k as f64 / 39.0;
             let c = if online {
@@ -684,69 +678,91 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
             let yy = inner.y() + (k as i32 * inner.height() as i32 / 40);
             canvas.fill_rect(Rect::new(inner.x(), yy, inner.width(), inner.height() / 40 + 1)).ok();
         }
+        // ---- .enter-desktop：居中半透明黑胶囊（rgba(0,0,0,.5)、radius 16、padding 6 16、白字 13）----
         if online && controllable {
-            let r = Rect::new(pv.x() + pv.width() as i32 / 2 - 90, pv.y() + pv.height() as i32 / 2 - 20, 180, 40);
-            card(canvas, r, Color::RGB(255, 255, 255), MAIN_BG, 20, None);
-            text_center(canvas, creator, font, cache, "进入桌面 →", r, INK);
+            let r = pill(canvas, creator, fonts.r13.as_ref(), cache, "进入桌面 →", 13, pv.x() + pv.width() as i32 / 2, pv.y() + pv.height() as i32 / 2, Color::RGBA(0, 0, 0, 127), WHITE, 16, 6, mid);
             home.hit_map.push((r, HomeAction::Enter(false)));
-        } else if online {
-            text_center(canvas, creator, font, cache, "该设备不可远控", pv, Color::RGB(255, 255, 255));
         } else {
-            text_center(canvas, creator, font, cache, "设备离线", pv, TEXT_MUT);
+            let (s, c) = if online { ("该设备不可远控", WHITE) } else { ("设备离线", TEXT_MUT) };
+            let w = measure(creator, fonts.r13.as_ref(), cache, s, 13, c).0;
+            htext(canvas, creator, fonts.r13.as_ref(), cache, s, 13, pv.x() + pv.width() as i32 / 2 - w / 2, pv.y() + pv.height() as i32 / 2, c);
         }
 
-        // 操作条卡片：图标在上文字在下，按钮间细分隔线，最右四宫格。
-        let band = Rect::new(mx, card_top + preview_h as i32 + 10, cw, 72);
-        card(canvas, band, CARD_BG, MAIN_BG, 7, Some(CARD_BORDER));
+        // ---- .action-bar：紧贴预览下方、48px、border 1px 但 border-top: none、底部圆角 8 ----
+        let band = Rect::new(cx, pv.y() + pv.height() as i32, cw, 48);
+        canvas.set_draw_color(MAIN_BG);
+        canvas.fill_rect(band).ok();
+        canvas.set_draw_color(CARD_BORDER);
+        canvas.draw_line(Point::new(band.x(), band.y()), Point::new(band.x(), band.y() + band.height() as i32 - 1)).ok();
+        canvas.draw_line(Point::new(band.x() + band.width() as i32 - 1, band.y()), Point::new(band.x() + band.width() as i32 - 1, band.y() + band.height() as i32 - 1)).ok();
+        canvas.draw_line(Point::new(band.x() + 8, band.y() + band.height() as i32 - 1), Point::new(band.x() + band.width() as i32 - 9, band.y() + band.height() as i32 - 1)).ok();
+        for k in 0..8 {
+            let s = 8 - k;
+            canvas.set_draw_color(MAIN_BG);
+            canvas.fill_rect(Rect::new(band.x(), band.y() + band.height() as i32 - 1 - k, s as u32, 1)).ok();
+            canvas.fill_rect(Rect::new(band.x() + band.width() as i32 - s, band.y() + band.height() as i32 - 1 - k, s as u32, 1)).ok();
+        }
+        // 右侧九宫格单元（HTML：padding-left 16 + border-left 1px）；图标与尺寸不动。
+        let grid_x = band.x() + band.width() as i32 - 16 - 22;
+        canvas.set_draw_color(CARD_BORDER);
+        canvas.fill_rect(Rect::new(grid_x - 16, band.y() + 16, 1, 16)).ok();
+        if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
+            canvas.copy(&tex, None, Rect::new(grid_x, band.y() + 24 - 11, 22, 22)).ok();
+        }
+        home.hit_map.push((Rect::new(grid_x - 16, band.y(), (band.x() + band.width() as i32 - grid_x + 16) as u32, band.height()), HomeAction::Stub("快捷工具".into())));
+        // 四个功能项 .action-items（space-around）：图标 + gap 6 + 13px 文字；项间 .action-divider 1x16；hover 文字变主色。
         let feats: Vec<(&[u8], String, HomeAction, bool)> = vec![
             (icons::HOME_FOLDER, "文件传输".into(), HomeAction::Stub("文件传输".into()), true),
             (icons::HOME_EYE, "观看模式".into(), HomeAction::Enter(true), online && controllable),
             (icons::HOME_POWER, "关机".into(), HomeAction::Stub("关机".into()), online),
             (icons::HOME_TERMINAL, "终端".into(), HomeAction::Stub("终端".into()), online),
         ];
-        let n = feats.len() + 1;
-        let cell = band.width() as i32 / n as i32;
+        let widths: Vec<i32> = feats.iter().map(|(_, label, _, _)| 22 + 6 + measure(creator, fonts.r13.as_ref(), cache, label, 13, TEXT_DARK).0).collect();
+        let (avail_x, avail_right) = (band.x() + 16, grid_x - 32);
+        let sum: i32 = widths.iter().sum();
+        let gap = ((avail_right - avail_x - sum) / (feats.len() as i32 + 1)).max(6);
+        let mut px = avail_x + gap;
+        let mut prev_right = avail_x;
         for (i, (icon, label, action, enabled)) in feats.into_iter().enumerate() {
-            let cx0 = band.x() + i as i32 * cell;
+            let w = widths[i];
+            let ir = Rect::new(px, band.y(), w as u32, band.height());
             if i > 0 {
-                canvas.set_draw_color(SEP);
-                canvas.fill_rect(Rect::new(cx0, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
+                canvas.set_draw_color(CARD_BORDER);
+                canvas.fill_rect(Rect::new((prev_right + px) / 2, band.y() + 16, 1, 16)).ok();
             }
-            let ccx = cx0 + cell / 2;
             if let Some(mut tex) = icon_texture(creator, icon) {
                 if !enabled { tex.set_color_mod(200, 204, 209); }
-                canvas.copy(&tex, None, Rect::new(ccx - 14, band.y() + 6, 28, 28)).ok();
+                canvas.copy(&tex, None, Rect::new(px, band.y() + 24 - 11, 22, 22)).ok();
             }
-            text(canvas, creator, font, cache, &label, ccx - 30, band.y() + 42, if enabled { TEXT_DARK } else { Color::RGB(190, 194, 199) });
-            if enabled { home.hit_map.push((Rect::new(cx0, band.y(), cell as u32, band.height()), action)); }
+            let color = if !enabled { Color::RGB(190, 194, 199) } else if ir.contains_point(Point::new(mx, my)) { BRAND_BLUE } else { TEXT_DARK };
+            htext(canvas, creator, fonts.r13.as_ref(), cache, &label, 13, px + 22 + 6, band.y() + 24, color);
+            if enabled { home.hit_map.push((ir, action)); }
+            prev_right = px + w;
+            px += w + gap;
         }
-        let gx = band.x() + (n as i32 - 1) * cell;
-        canvas.set_draw_color(SEP);
-        canvas.fill_rect(Rect::new(gx, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
-        if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
-            canvas.copy(&tex, None, Rect::new(gx + cell / 2 - 14, band.y() + 18, 28, 28)).ok();
-        }
-        home.hit_map.push((Rect::new(gx, band.y(), (band.x() + band.width() as i32 - gx) as u32, band.height()), HomeAction::Stub("快捷工具".into())));
 
-        // 快速启动：标题 + 虚线框 + 灰色圆形加号 + "添加"。
-        let qy = band.y() + band.height() as i32 + 20;
-        text(canvas, creator, font, cache, "快速启动", mx + 4, qy, INK);
-        let qb = Rect::new(mx, qy + 34, cw, (wh as i32 - qy - 58).max(90) as u32);
-        dash_card(canvas, qb, CARD_BG, MAIN_BG, Color::RGB(205, 210, 216));
+        // ---- .quick-start：margin-top 24；.section-title 13px/600；.dashed-box 高 184、虚线 #C9CDD4、圆角 8 ----
+        let qy = band.y() + band.height() as i32 + 24;
+        htext(canvas, creator, fonts.s13.as_ref(), cache, "快速启动", 13, cx, qy + 10, TEXT_MAIN);
+        let qb = Rect::new(cx, qy + 20 + 12, cw, 184);
+        dash_card(canvas, qb, MAIN_BG, MAIN_BG, DASH, 8);
         let ccx = qb.x() + qb.width() as i32 / 2;
-        let ccy = qb.y() + qb.height() as i32 / 2 - 12;
-        circle(canvas, ccx, ccy, 16, Color::RGB(226, 230, 235));
-        canvas.set_draw_color(Color::RGB(255, 255, 255));
-        canvas.fill_rect(Rect::new(ccx - 7, ccy - 2, 14, 4)).ok();
-        canvas.fill_rect(Rect::new(ccx - 2, ccy - 7, 4, 14)).ok();
-        text(canvas, creator, font, cache, "添加", ccx - 14, ccy + 26, TEXT_MUT);
+        let box_cy = qb.y() + qb.height() as i32 / 2;
+        // .add-btn：32px 圆 #F2F3F5 + 16px 加号；margin-bottom 8 → .add-text 12px 三级灰
+        let ccy = box_cy - 11;
+        circle(canvas, ccx, ccy, 16, ADD_BG);
+        canvas.set_draw_color(TEXT_DARK);
+        canvas.fill_rect(Rect::new(ccx - 8, ccy - 1, 16, 2)).ok();
+        canvas.fill_rect(Rect::new(ccx - 1, ccy - 8, 2, 16)).ok();
+        let aw = measure(creator, fonts.r12.as_ref(), cache, "添加", 12, TEXT_MUT).0;
+        htext(canvas, creator, fonts.r12.as_ref(), cache, "添加", 12, ccx - aw / 2, box_cy + 20, TEXT_MUT);
         home.hit_map.push((qb, HomeAction::Stub("快速启动".into())));
     } else {
-        text(canvas, creator, font, cache, "选择左侧的设备后点「进入桌面」。", mx, TOPBAR_H as i32 + 60, TEXT_MUT);
+        htext(canvas, creator, fonts.r13.as_ref(), cache, "选择左侧的设备后点「进入桌面」。", 13, cx, cy + 20, TEXT_MUT);
     }
 
     if !home.status_msg.is_empty() {
-        text(canvas, creator, font, cache, &home.status_msg, SIDE_W + 16, wh as i32 - 26, TEXT_MUT);
+        htext(canvas, creator, fonts.r12.as_ref(), cache, &home.status_msg, 12, cx, wh as i32 - 20, TEXT_MUT);
     }
 
 
@@ -844,6 +860,105 @@ fn text_center<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creat
         let q = tex.query();
         canvas.copy(tex, None, Rect::new(r.x() + (r.width() - q.width) as i32 / 2, r.y() + (r.height() - q.height) as i32 / 2, q.width, q.height)).ok();
     }
+}
+
+/// 主页字号集（HTML 排版规格：12/13 正文 + 13/20 的 600 字重标题；16 常规给远程窗口与登录面板）。
+/// SDL2_ttf 的 init() 是全局单例，一个进程只能初始化一次，所以主页要的字号全在这一处加载。
+struct Fonts {
+    r12: Option<sdl2::ttf::Font<'static, 'static>>,
+    r13: Option<sdl2::ttf::Font<'static, 'static>>,
+    r16: Option<sdl2::ttf::Font<'static, 'static>>,
+    s13: Option<sdl2::ttf::Font<'static, 'static>>,
+    s20: Option<sdl2::ttf::Font<'static, 'static>>,
+}
+
+fn load_font_at(ctx: &'static sdl2::ttf::Sdl2TtfContext, paths: &[(&str, Option<u32>)], size: u16) -> Option<sdl2::ttf::Font<'static, 'static>> {
+    for (path, index) in paths {
+        let font = match index {
+            Some(i) => ctx.load_font_at_index(path, *i, size),
+            None => ctx.load_font(path, size),
+        };
+        if let Ok(font) = font { return Some(font); }
+    }
+    None
+}
+
+fn load_fonts() -> Fonts {
+    let empty = || Fonts { r12: None, r13: None, r16: None, s13: None, s20: None };
+    let Ok(ctx) = sdl2::ttf::init() else { return empty() };
+    let ctx: &'static sdl2::ttf::Sdl2TtfContext = Box::leak(Box::new(ctx));
+    const REG: [(&str, Option<u32>); 3] = [
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", Some(0)),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc", Some(0)),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", None),
+    ];
+    // HTML 的 600 字重 → Noto Sans CJK Medium（没有 SemiBold，Medium 最接近；再退 Bold）。
+    const SEMI: [(&str, Option<u32>); 3] = [
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", Some(0)),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", Some(0)),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", None),
+    ];
+    Fonts {
+        r12: load_font_at(ctx, &REG, 12),
+        r13: load_font_at(ctx, &REG, 13),
+        r16: load_font_at(ctx, &REG, 16),
+        s13: load_font_at(ctx, &SEMI, 13),
+        s20: load_font_at(ctx, &SEMI, 20),
+    }
+}
+
+/// 取（并缓存）指定字号/颜色的文字纹理，返回占宽占高——HTML 的 flex/gap 排布要先量再画。
+fn measure<'a>(creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, s: &str, size: u16, color: Color) -> (i32, i32) {
+    let key = format!("{s}|{size}|{}|{}|{}", color.r, color.g, color.b);
+    if !cache.contains_key(&key) {
+        if let Some(tex) = font.and_then(|f| f.render(s).blended(color).ok()).and_then(|surf| creator.create_texture_from_surface(&surf).ok()) {
+            cache.insert(key.clone(), tex);
+        }
+    }
+    cache.get(&key).map(|tex| { let q = tex.query(); (q.width as i32, q.height as i32) }).unwrap_or((s.len() as i32 * size as i32 / 2 + 4, size as i32 + 2))
+}
+
+/// 主页文本：显式字号，垂直居中于 `y_center`，返回占宽（便于接着排下一个元素）。
+fn htext<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, s: &str, size: u16, x: i32, y_center: i32, color: Color) -> i32 {
+    let (w, h) = measure(creator, font, cache, s, size, color);
+    let key = format!("{s}|{size}|{}|{}|{}", color.r, color.g, color.b);
+    if let Some(tex) = cache.get(&key) {
+        canvas.copy(tex, None, Rect::new(x, y_center - h / 2, w as u32, h as u32)).ok();
+    }
+    w
+}
+
+/// 胶囊按钮（HTML padding/radius 规格）：胶囊宽按文字实际宽度算，返回命中矩形。
+fn pill<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, label: &str, size: u16, cx: i32, cy: i32, bg: Color, fg: Color, padx: i32, pady: i32, corner_bg: Color) -> Rect {
+    let (w, h) = measure(creator, font, cache, label, size, fg);
+    let r = Rect::new(cx - (w + 2 * padx) / 2, cy - (h + 2 * pady) / 2, (w + 2 * padx) as u32, (h + 2 * pady) as u32);
+    capsule(canvas, r, bg);
+    let key = format!("{label}|{size}|{}|{}|{}", fg.r, fg.g, fg.b);
+    if let Some(tex) = cache.get(&key) {
+        canvas.copy(tex, None, Rect::new(r.x() + padx, r.y() + pady, w as u32, h as u32)).ok();
+    }
+    r
+}
+
+/// 侧栏一行（HTML .menu-item：inset 8、高 32、圆角 6、hover 浅底；选中＝浅底＋左 3px 蓝条）。
+/// 图标保持原线条图与 22px 显示尺寸不动，文字用 13px 二级色。
+fn side_row<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, png: Option<&[u8]>, label: &str, r: Rect, selected: bool, hovered: bool) {
+    if selected {
+        card(canvas, r, SELECTED, SIDE_BG, 6, None);
+        canvas.set_draw_color(BRAND_BLUE);
+        canvas.fill_rect(Rect::new(r.x(), r.y() + 8, 3, (r.height() as i32 - 16) as u32)).ok();
+    } else if hovered {
+        card(canvas, r, HOVER_ROW, SIDE_BG, 6, None);
+    }
+    let cy = r.y() + r.height() as i32 / 2;
+    let mut text_x = r.x() + 12;
+    if let Some(png) = png {
+        if let Some(tex) = icon_texture(creator, png) {
+            canvas.copy(&tex, None, Rect::new(r.x() + 12, cy - 11, 22, 22)).ok();
+        }
+        text_x = r.x() + 12 + 22 + 8;
+    }
+    htext(canvas, creator, font, cache, label, 13, text_x, cy, TEXT_DARK);
 }
 
 enum LoginUpdate { Qr(String), Status(String), LoggedIn, Failed(String) }
@@ -949,7 +1064,10 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);
     let (cursor_tx, cursor_rx) = std::sync::mpsc::sync_channel::<CursorImage>(2);
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
-    let host = Arc::new(Host { stats: stats.clone(), frames: frame_tx, cursor: cursor_tx, audio: audio_ring.clone(), pings: Arc::new(Mutex::new(HashMap::new())) });
+    // 剪贴板桥（控制端本机 X11）：远端复制→写本机 CLIPBOARD，本机复制→推给被控端。
+    let disp = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty());
+    let clip = linux_uuremote::clipboard::start_x11(disp.as_deref()).map(Arc::new);
+    let host = Arc::new(Host { stats: stats.clone(), frames: frame_tx, cursor: cursor_tx, audio: audio_ring.clone(), pings: Arc::new(Mutex::new(HashMap::new())), clipboard: clip, clip_asm: Default::default() });
 
     // 自连：控制端换用注册的虚拟第二机身份（云端不许同设备控制自己）。
     let mut creds = clone_creds(creds);
@@ -1247,7 +1365,7 @@ fn run_home_preview(snap: Option<&str>) {
     force_argb();
     let sdl = sdl2::init().expect("SDL 初始化失败");
     let video = sdl.video().expect("视频子系统失败");
-    let font = load_font();
+    let fonts = load_fonts();
     let mut canvas = video.window("UU 远程 · 主页预览", WIN_W, WIN_H).position_centered().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
     set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
@@ -1260,14 +1378,14 @@ fn run_home_preview(snap: Option<&str>) {
     home.mouse = (CARD_W - 20, 20); // 悬停模拟（卡片坐标）
     let mut text_cache: HashMap<String, Texture> = HashMap::new();
     let shadow_tex = shadow_texture(&creator);
-    let corner_tl = corner_texture(&creator, PANEL_BG, true, true);
-    let corner_tr = corner_texture(&creator, PANEL_BG, false, true);
+    let corner_tl = corner_texture(&creator, SIDE_BG, true, true);
+    let corner_tr = corner_texture(&creator, MAIN_BG, false, true);
     let corner_bl = corner_texture(&creator, SIDE_BG, true, false);
     let corner_br = corner_texture(&creator, MAIN_BG, false, false);
     let corners = [&corner_tl, &corner_tr, &corner_bl, &corner_br];
     for _ in 0..8 {
         let (hx, hy) = home.mouse;
-        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, None, &shadow_tex, corners, hx, hy);
+        draw_home(&mut canvas, &creator, &fonts, &mut home, &mut text_cache, None, &shadow_tex, corners, hx, hy);
         canvas.present();
         std::thread::sleep(Duration::from_millis(30));
     }

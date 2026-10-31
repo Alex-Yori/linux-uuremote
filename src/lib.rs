@@ -8,6 +8,7 @@ pub mod api;
 pub mod capability;
 pub mod capture;
 pub mod capture_setting;
+pub mod clipboard;
 pub mod config;
 pub mod content;
 pub mod control;
