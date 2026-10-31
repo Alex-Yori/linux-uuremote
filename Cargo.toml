@@ -73,3 +73,8 @@ path = "src/bin/uu-audio-probe.rs"
 name = "uu-viewer"
 path = "src/bin/uu-viewer.rs"
 
+
+[patch.crates-io]
+webrtc = { path = "vendor/webrtc" }
+webrtc-dtls = { path = "vendor/webrtc-dtls" }
+webrtc-srtp = { path = "vendor/webrtc-srtp" }
