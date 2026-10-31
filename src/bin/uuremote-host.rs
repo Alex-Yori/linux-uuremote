@@ -1194,6 +1194,7 @@ fn start_video(
         "带宽地板 padding：{}（UU_PAD_KBPS=0 关闭）",
         if pad_kbps > 0 { format!("{pad_kbps} kbps") } else { "关闭".into() }
     ));
+    let mut floor = linux_uuremote::padding::RateFloor::new(pad_kbps, Instant::now());
     let mut pad_win_start = Instant::now();
     let mut pad_win_bytes: u64 = 0;
     let mut pad_win_pad_bytes: u64 = 0;
@@ -1210,10 +1211,7 @@ fn start_video(
                 s.pipe_n.fetch_add(1, Ordering::Relaxed);
             }
             let mut data = frame.data;
-            let added = linux_uuremote::padding::pad_au_to(
-                &mut data,
-                linux_uuremote::padding::frame_budget(pad_kbps, frame.duration),
-            );
+            let added = floor.pad(&mut data, Instant::now());
             pad_win_bytes += data.len() as u64;
             pad_win_pad_bytes += added as u64;
             pad_win_frames += 1;
