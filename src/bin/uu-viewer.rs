@@ -35,15 +35,24 @@ use sdl2::video::{FullscreenType, Window, WindowContext, WindowPos};
 use sdl2::Sdl;
 use serde_json::{json, Value};
 
-// ---- 原版配色 ----
-const UI_BLUE: Color = Color::RGB(31, 111, 229);
-const GREEN: Color = Color::RGB(52, 192, 100);
-const SIDE_BG: Color = Color::RGB(245, 246, 248);
-const MAIN_BG: Color = Color::RGB(252, 253, 254);
-const ROW_HOVER: Color = Color::RGB(235, 238, 242);
-const TEXT_DARK: Color = Color::RGB(48, 52, 58);
-const TEXT_MUT: Color = Color::RGB(140, 145, 152);
+// ---- 原版配色（从 GameViewer.exe 逆向 + 官方截图逐像素取样）----
+const BRAND_BLUE: Color = Color::RGB(58, 123, 252); // QSS kFillTheme/kFillLink = #3A7BFC
+const UI_BLUE: Color = BRAND_BLUE;
+const GREEN: Color = Color::RGB(97, 186, 98);       // 在线绿点实测
+const PANEL_BG: Color = Color::RGB(239, 244, 247);  // kFillWindowPanel（顶栏+侧栏）实测
+const SIDE_BG: Color = PANEL_BG;
+const MAIN_BG: Color = Color::RGB(247, 251, 254);   // 主区底 kFillGray249Blue 实测
+const CARD_BG: Color = Color::RGB(249, 251, 253);   // 卡片底
+const CARD_BORDER: Color = Color::RGB(217, 217, 217); // kBorderGray217
+const SEP: Color = Color::RGB(224, 229, 233);       // 分隔线
+const SELECTED: Color = Color::RGB(228, 233, 236);  // 选中行底实测
+const ROW_HOVER: Color = SELECTED;
+const INK: Color = Color::RGB(96, 101, 104);        // 图标/正文笔画实测中位
+const TEXT_DARK: Color = Color::RGB(98, 100, 102);  // 设备名笔画实测
+const TEXT_MUT: Color = Color::RGB(104, 103, 106);  // 胶囊文字实测
 const TOPBAR_H: i32 = 40;
+const SIDE_W: i32 = 242;                            // 官方侧栏宽度实测
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -195,6 +204,7 @@ fn main() {
                                 }
                             }
                         }
+                        HomeAction::ToggleGroup(g) => home.groups_open[g as usize] ^= true,
                         HomeAction::Minimize => canvas.window_mut().minimize(),
                         HomeAction::Close => break 'home,
                         HomeAction::Stub(label) => home.status_msg = format!("{label}（暂未实现）"),
@@ -276,7 +286,7 @@ impl DeviceRow {
 }
 
 #[derive(Clone, PartialEq)]
-enum HomeAction { None, Select(usize), Login, Enter(bool), Minimize, Close, Stub(String) }
+enum HomeAction { None, Select(usize), Login, Enter(bool), Minimize, Close, Stub(String), ToggleGroup(u8) }
 
 struct Home {
     devices: Vec<DeviceRow>,
@@ -288,11 +298,12 @@ struct Home {
     session_busy: bool,
     mouse: (i32, i32),
     drag: Option<(i32, i32)>,
+    groups_open: [bool; 2],
     hit_map: Vec<(Rect, HomeAction)>,
 }
 impl Home {
     fn new(logged_in: bool) -> Self {
-        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, mouse: (-1, -1), drag: None, hit_map: Vec::new() }
+        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, mouse: (-1, -1), drag: None, groups_open: [true, true], hit_map: Vec::new() }
     }
     fn selected_device(&self) -> Option<&DeviceRow> { self.selected.and_then(|i| self.devices.get(i)) }
     fn hit(&mut self, x: i32, y: i32) -> HomeAction {
@@ -310,12 +321,77 @@ impl Home {
     }
 }
 
-/// 在线圆点（没有圆形 API，三行横条拼一个近似的圆）。
-fn dot(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, x: i32, y: i32, c: Color) {
+/// 填充圆（扫描行近似）。
+fn circle(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, cx: i32, cy: i32, r: i32, c: Color) {
     canvas.set_draw_color(c);
-    canvas.fill_rect(Rect::new(x - 2, y - 3, 5, 2)).ok();
-    canvas.fill_rect(Rect::new(x - 3, y - 1, 7, 2)).ok();
-    canvas.fill_rect(Rect::new(x - 2, y + 1, 5, 2)).ok();
+    for dy in -r..=r {
+        let w = ((r * r - dy * dy) as f64).sqrt() as i32;
+        canvas.fill_rect(Rect::new(cx - w, cy + dy, (2 * w + 1) as u32, 1)).ok();
+    }
+}
+
+/// 在线圆点（保留旧名，等价小圆）。
+fn dot(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, x: i32, y: i32, c: Color) {
+    circle(canvas, x, y, 4, c);
+}
+
+/// 圆角卡：填充 + 用背景色擦角近似圆角，再画直边描线。
+fn card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color, bg: Color, rad: i32, border: Option<Color>) {
+    canvas.set_draw_color(fill);
+    canvas.fill_rect(r).ok();
+    canvas.set_draw_color(bg);
+    for k in 0..rad {
+        let s = rad - k;
+        canvas.fill_rect(Rect::new(r.x(), r.y() + k, s as u32, 1)).ok();
+        canvas.fill_rect(Rect::new(r.x() + r.width() as i32 - s, r.y() + k, s as u32, 1)).ok();
+        canvas.fill_rect(Rect::new(r.x(), r.y() + r.height() as i32 - 1 - k, s as u32, 1)).ok();
+        canvas.fill_rect(Rect::new(r.x() + r.width() as i32 - s, r.y() + r.height() as i32 - 1 - k, s as u32, 1)).ok();
+    }
+    if let Some(b) = border {
+        canvas.set_draw_color(b);
+        canvas.draw_line(Point::new(r.x() + rad, r.y()), Point::new(r.x() + r.width() as i32 - rad - 1, r.y())).ok();
+        canvas.draw_line(Point::new(r.x() + rad, r.y() + r.height() as i32 - 1), Point::new(r.x() + r.width() as i32 - rad - 1, r.y() + r.height() as i32 - 1)).ok();
+        canvas.draw_line(Point::new(r.x(), r.y() + rad), Point::new(r.x(), r.y() + r.height() as i32 - rad - 1)).ok();
+        canvas.draw_line(Point::new(r.x() + r.width() as i32 - 1, r.y() + rad), Point::new(r.x() + r.width() as i32 - 1, r.y() + r.height() as i32 - rad - 1)).ok();
+    }
+}
+
+/// 虚线圆角框（官方快速启动区：dash 6px gap 4px）。
+fn dash_card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color, bg: Color, dash: Color) {
+    card(canvas, r, fill, bg, 6, None);
+    canvas.set_draw_color(dash);
+    let (x, y, w, h) = (r.x(), r.y(), r.width() as i32, r.height() as i32);
+    let mut seg = |a: i32, b: i32, c: i32, d: i32| canvas.draw_line(Point::new(a, b), Point::new(c, d)).ok();
+    let mut p = x + 8;
+    while p < x + w - 8 { let q = (p + 6).min(x + w - 8); seg(p, y, q, y); seg(p, y + h - 1, q, y + h - 1); p += 10; }
+    let mut p = y + 8;
+    while p < y + h - 8 { let q = (p + 6).min(y + h - 8); seg(x, p, x, q); seg(x + w - 1, p, x + w - 1, q); p += 10; }
+}
+
+/// 折叠箭头（官方圆形箭头按钮近似：两条线拼的 V / ^）。
+fn chevron(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, cx: i32, cy: i32, down: bool, c: Color) {
+    canvas.set_draw_color(c);
+    if down {
+        canvas.draw_line(Point::new(cx - 5, cy - 2), Point::new(cx, cy + 3)).ok();
+        canvas.draw_line(Point::new(cx, cy + 3), Point::new(cx + 5, cy - 2)).ok();
+    } else {
+        canvas.draw_line(Point::new(cx - 5, cy + 2), Point::new(cx, cy - 3)).ok();
+        canvas.draw_line(Point::new(cx, cy - 3), Point::new(cx + 5, cy + 2)).ok();
+    }
+}
+
+/// 竖三点（官方右上角"更多"图标）。
+fn vdots(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, cx: i32, cy: i32, c: Color) {
+    circle(canvas, cx, cy - 6, 2, c);
+    circle(canvas, cx, cy, 2, c);
+    circle(canvas, cx, cy + 6, 2, c);
+}
+
+/// 着色图标（白底剪影 PNG × color modulate）。
+fn tinted_icon<'a>(creator: &'a TextureCreator<WindowContext>, png: &[u8], c: Color) -> Option<Texture<'a>> {
+    let mut tex = icon_texture(creator, png)?;
+    tex.set_color_mod(c.r, c.g, c.b);
+    Some(tex)
 }
 
 fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
@@ -324,12 +400,15 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     canvas.clear();
     home.hit_map.clear();
 
-    // 顶部标题栏（官方首页右上按钮组：无线副屏 / 消息中心 / 账户 / 更多 / 最小化 / 关闭）。
-    canvas.set_draw_color(Color::RGB(255, 255, 255));
+    // ---- 顶部标题栏（kFillWindowPanel 浅灰底 + 官方 logo + 灰字标题 + 右侧按钮组）----
+    canvas.set_draw_color(PANEL_BG);
     canvas.fill_rect(Rect::new(0, 0, ww, TOPBAR_H as u32)).ok();
-    canvas.set_draw_color(Color::RGB(224, 228, 234));
+    canvas.set_draw_color(SEP);
     canvas.fill_rect(Rect::new(0, TOPBAR_H - 1, ww, 1)).ok();
-    text(canvas, creator, font, cache, "网易UU远程", 16, 10, UI_BLUE);
+    if let Some(tex) = icon_texture(creator, icons::APP) {
+        canvas.copy(&tex, None, Rect::new(14, (TOPBAR_H - 22) / 2, 22, 22)).ok();
+    }
+    text(canvas, creator, font, cache, "网易UU远程", 42, 11, TEXT_DARK);
     let topbar: [(&[u8], HomeAction); 6] = [
         (icons::TOP_SUBSCREEN, HomeAction::Stub("无线副屏".into())),
         (icons::TOP_BELL, HomeAction::Stub("消息中心".into())),
@@ -341,7 +420,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     for (i, (png, action)) in topbar.iter().enumerate() {
         let r = Rect::new(ww as i32 - 6 - (6 - i as i32) * 36, (TOPBAR_H - 30) / 2, 34, 30);
         if r.contains_point(Point::new(mx, my)) {
-            canvas.set_draw_color(ROW_HOVER);
+            canvas.set_draw_color(SELECTED);
             canvas.fill_rect(r).ok();
         }
         if let Some(tex) = icon_texture(creator, png) {
@@ -350,50 +429,84 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         home.hit_map.push((r, action.clone()));
     }
 
-    // 左侧栏。
-    canvas.set_draw_color(SIDE_BG);
-    canvas.fill_rect(Rect::new(0, TOPBAR_H, 200, (wh as i32 - TOPBAR_H) as u32)).ok();
-    let mut y = TOPBAR_H + 10;
-    canvas.set_draw_color(UI_BLUE);
-    canvas.fill_rect(Rect::new(4, y + 1, 3, 16)).ok();
-    text(canvas, creator, font, cache, "我的设备", 12, y + 2, TEXT_DARK);
-    y += 30;
-    for (i, d) in home.devices.iter().enumerate() {
-        let sel = home.selected == Some(i);
-        let r = Rect::new(6, y, 188, 34);
-        if sel {
-            canvas.set_draw_color(ROW_HOVER);
-            canvas.fill_rect(r).ok();
-            canvas.set_draw_color(UI_BLUE);
-            canvas.fill_rect(Rect::new(6, y + 6, 3, 22)).ok();
+    // ---- 左侧栏 242px（官方：折叠分组 + 状态点 + 着色设备图标 + 选中行浅灰底 + 蓝竖条）----
+    canvas.set_draw_color(PANEL_BG);
+    canvas.fill_rect(Rect::new(0, TOPBAR_H, SIDE_W as u32, (wh as i32 - TOPBAR_H) as u32)).ok();
+    canvas.set_draw_color(SEP);
+    canvas.fill_rect(Rect::new(SIDE_W - 1, TOPBAR_H, 1, (wh as i32 - TOPBAR_H) as u32)).ok();
+
+    let mut y = TOPBAR_H + 12;
+    let hdr = Rect::new(0, y, SIDE_W as u32, 30);
+    text(canvas, creator, font, cache, "我的设备", 14, y + 6, INK);
+    chevron(canvas, SIDE_W - 22, y + 15, home.groups_open[0], INK);
+    home.hit_map.push((hdr, HomeAction::ToggleGroup(0)));
+    y += 34;
+    if home.groups_open[0] {
+        for (i, d) in home.devices.iter().enumerate() {
+            let sel = home.selected == Some(i);
+            let r = Rect::new(0, y, SIDE_W as u32, 36);
+            if sel {
+                canvas.set_draw_color(SELECTED);
+                canvas.fill_rect(r).ok();
+                canvas.set_draw_color(BRAND_BLUE);
+                canvas.fill_rect(Rect::new(0, y + 8, 3, 20)).ok();
+            } else if r.contains_point(Point::new(mx, my)) {
+                canvas.set_draw_color(Color::RGB(233, 238, 242));
+                canvas.fill_rect(r).ok();
+            }
+            dot(canvas, 20, y + 18, if d.online { GREEN } else { Color::RGB(176, 180, 183) });
+            let icon = if d.online { icons::MONITOR_BLUE } else { icons::MONITOR_GRAY };
+            if let Some(tex) = icon_texture(creator, icon) {
+                canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
+            }
+            text(canvas, creator, font, cache, &d.alias, 58, y + 10, TEXT_DARK);
+            home.hit_map.push((r, HomeAction::Select(i)));
+            y += 38;
         }
-        dot(canvas, 30, y + 17, if d.online { GREEN } else { Color::RGB(185, 188, 192) });
-        text(canvas, creator, font, cache, &d.alias, 40, y + 8, TEXT_DARK);
-        home.hit_map.push((r, HomeAction::Select(i)));
-        y += 36;
+        if home.devices.is_empty() { text(canvas, creator, font, cache, if home.logged_in { "（无设备）" } else { "（未登录）" }, 30, y + 6, TEXT_MUT); y += 30; }
+        let r_all = Rect::new(0, y, SIDE_W as u32, 36);
+        if r_all.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_all).ok(); }
+        if let Some(tex) = icon_texture(creator, icons::GRID_BLUE) {
+            canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
+        }
+        text(canvas, creator, font, cache, "全部设备", 58, y + 10, TEXT_DARK);
+        home.hit_map.push((r_all, HomeAction::Stub("全部设备".into())));
+        y += 44;
     }
-    if home.devices.is_empty() { text(canvas, creator, font, cache, if home.logged_in { "（无设备）" } else { "（未登录）" }, 30, y + 6, TEXT_MUT); y += 30; }
-    y += 6;
-    let r_all = Rect::new(6, y, 188, 34);
-    text(canvas, creator, font, cache, "全部设备", 30, y + 8, TEXT_MUT);
-    home.hit_map.push((r_all, HomeAction::Stub("全部设备".into())));
-    y += 40;
-    let r_help = Rect::new(6, y, 188, 34);
-    text(canvas, creator, font, cache, "远程协助", 30, y + 8, TEXT_MUT);
-    home.hit_map.push((r_help, HomeAction::Stub("远程协助".into())));
-    let r_set = Rect::new(6, wh as i32 - 40, 188, 34);
-    text(canvas, creator, font, cache, "设置", 30, wh as i32 - 32, TEXT_MUT);
+    let hdr2 = Rect::new(0, y, SIDE_W as u32, 30);
+    text(canvas, creator, font, cache, "远程协助", 14, y + 6, INK);
+    chevron(canvas, SIDE_W - 22, y + 15, home.groups_open[1], INK);
+    home.hit_map.push((hdr2, HomeAction::ToggleGroup(1)));
+    y += 34;
+    if home.groups_open[1] {
+        for (label, icon, act) in [("开始协助", icons::USER_BLUE, HomeAction::Stub("远程协助".into())), ("收藏设备", icons::STAR_BLUE, HomeAction::Stub("收藏设备".into()))] {
+            let r = Rect::new(0, y, SIDE_W as u32, 36);
+            if r.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r).ok(); }
+            if let Some(tex) = icon_texture(creator, icon) {
+                canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
+            }
+            text(canvas, creator, font, cache, label, 58, y + 10, TEXT_DARK);
+            home.hit_map.push((r, act));
+            y += 38;
+        }
+    }
+    let r_set = Rect::new(0, wh as i32 - 42, SIDE_W as u32, 36);
+    if r_set.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_set).ok(); }
+    if let Some(tex) = icon_texture(creator, icons::GEAR_GRAY) {
+        canvas.copy(&tex, None, Rect::new(32, wh as i32 - 32, 17, 17)).ok();
+    }
+    text(canvas, creator, font, cache, "设置", 58, wh as i32 - 32, TEXT_DARK);
     home.hit_map.push((r_set, HomeAction::Stub("设置".into())));
 
-    // 主区。
-    let mx = 224i32;
+    // ---- 主区 ----
+    let mx = SIDE_W + 16i32;
+    let cw = (ww as i32 - mx - 16).max(320) as u32;
     if !home.logged_in {
         text(canvas, creator, font, cache, "全部设备", mx, TOPBAR_H as i32 + 18, TEXT_DARK);
         text(canvas, creator, font, cache, "随时访问个人设备，可用于办公、游戏、文件传输。", mx, TOPBAR_H as i32 + 56, TEXT_MUT);
         if !home.login_open {
             let r = Rect::new(mx + 60, TOPBAR_H as i32 + 220, 200, 46);
-            canvas.set_draw_color(UI_BLUE);
-            canvas.fill_rect(r).ok();
+            card(canvas, r, BRAND_BLUE, MAIN_BG, 22, None);
             text_center(canvas, creator, font, cache, "立即登录", r, Color::RGB(255, 255, 255));
             home.hit_map.push((r, HomeAction::Login));
         } else {
@@ -403,75 +516,102 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         text(canvas, creator, font, cache, "远控会话进行中……", mx, 120, TEXT_MUT);
         text(canvas, creator, font, cache, "请在远程窗口断开后再连接其他设备。", mx, 150, TEXT_MUT);
     } else if let Some((alias, online, controllable)) = home.selected_device().map(|d| (d.alias.clone(), d.online, d.controllable)) {
-        dot(canvas, mx + 8, TOPBAR_H as i32 + 30, if online { GREEN } else { Color::RGB(185, 188, 192) });
-        text(canvas, creator, font, cache, if online { "在线" } else { "离线" }, mx + 20, TOPBAR_H as i32 + 22, if online { GREEN } else { TEXT_MUT });
-        text(canvas, creator, font, cache, &alias, mx + 62, TOPBAR_H as i32 + 22, TEXT_DARK);
+        // 状态行：灰胶囊 + 设备名 + 右侧竖三点。
+        let pill = Rect::new(mx + 4, TOPBAR_H + 16, 56, 24);
+        card(canvas, pill, Color::RGB(227, 229, 231), MAIN_BG, 12, None);
+        text_center(canvas, creator, font, cache, if online { "在线" } else { "离线" }, pill, if online { GREEN } else { TEXT_MUT });
+        text(canvas, creator, font, cache, &alias, mx + 76, TOPBAR_H + 18, TEXT_DARK);
+        let vr = Rect::new(ww as i32 - 46, TOPBAR_H + 10, 30, 36);
+        vdots(canvas, vr.x() + 15, vr.y() + 18, INK);
+        home.hit_map.push((vr, HomeAction::Stub("设备菜单".into())));
+        canvas.set_draw_color(SEP);
+        canvas.fill_rect(Rect::new(mx, TOPBAR_H + 56, cw, 1)).ok();
 
-        // 蓝色大卡（进入桌面）。
-        let card = Rect::new(mx, TOPBAR_H as i32 + 64, (ww as i32 - mx - 40).max(320) as u32, 300);
-        for k in 0..30u32 {
-            let t = k as f64 / 29.0;
+        // 预览卡：在线=官方蓝色 hero 渐变 + 白色圆角按钮；离线=浅灰渐变占位。
+        let card_top = TOPBAR_H + 68;
+        let preview_h = 200u32;
+        let pv = Rect::new(mx, card_top, cw, preview_h);
+        card(canvas, pv, CARD_BG, MAIN_BG, 7, Some(CARD_BORDER));
+        let inner = Rect::new(pv.x() + 1, pv.y() + 1, pv.width() - 2, pv.height() - 2);
+        for k in 0..40u32 {
+            let t = k as f64 / 39.0;
             let c = if online {
-                Color::RGB(lerp(31, 78, t) as u8, lerp(111, 165, t) as u8, lerp(229, 245, t) as u8)
+                Color::RGB(lerp(150, 66, t) as u8, lerp(210, 110, t) as u8, lerp(250, 216, t) as u8)
             } else {
-                Color::RGB(lerp(150, 185, t) as u8, lerp(156, 190, t) as u8, lerp(166, 198, t) as u8)
+                Color::RGB(lerp(232, 198, t) as u8, lerp(238, 208, t) as u8, lerp(244, 218, t) as u8)
             };
             canvas.set_draw_color(c);
-            let yy = card.y() + (k as i32 * card.height() as i32 / 30);
-            canvas.fill_rect(Rect::new(card.x(), yy, card.width(), card.height() / 30 + 1)).ok();
+            let yy = inner.y() + (k as i32 * inner.height() as i32 / 40);
+            canvas.fill_rect(Rect::new(inner.x(), yy, inner.width(), inner.height() / 40 + 1)).ok();
         }
         if online && controllable {
-            let r = Rect::new(card.x() + card.width() as i32 / 2 - 90, card.y() + card.height() as i32 / 2 - 24, 180, 48);
-            canvas.set_draw_color(Color::RGB(255, 255, 255));
-            canvas.fill_rect(r).ok();
-            text_center(canvas, creator, font, cache, "进入桌面 →", r, UI_BLUE);
+            let r = Rect::new(pv.x() + pv.width() as i32 / 2 - 90, pv.y() + pv.height() as i32 / 2 - 20, 180, 40);
+            card(canvas, r, Color::RGB(255, 255, 255), MAIN_BG, 20, None);
+            text_center(canvas, creator, font, cache, "进入桌面 →", r, INK);
             home.hit_map.push((r, HomeAction::Enter(false)));
         } else if online {
-            text_center(canvas, creator, font, cache, "该设备不可远控", card, Color::RGB(255, 255, 255));
+            text_center(canvas, creator, font, cache, "该设备不可远控", pv, Color::RGB(255, 255, 255));
         } else {
-            text_center(canvas, creator, font, cache, "设备离线", card, Color::RGB(255, 255, 255));
+            text_center(canvas, creator, font, cache, "设备离线", pv, TEXT_MUT);
         }
 
-        // 功能按钮行。
-        let by = card.y() + card.height() as i32 + 14;
-        let feats: Vec<(String, HomeAction)> = vec![
-            ("文件传输".into(), HomeAction::Stub("文件传输".into())),
-            ("观看模式".into(), HomeAction::Enter(true)),
-            ("终端".into(), HomeAction::Stub("终端".into())),
-            ("端口映射".into(), HomeAction::Stub("端口映射".into())),
+        // 操作条卡片：图标在上文字在下，按钮间细分隔线，最右四宫格。
+        let band = Rect::new(mx, card_top + preview_h as i32 + 10, cw, 64);
+        card(canvas, band, CARD_BG, MAIN_BG, 7, Some(CARD_BORDER));
+        let feats: Vec<(&[u8], String, HomeAction, bool)> = vec![
+            (icons::FOLDER_INK, "文件传输".into(), HomeAction::Stub("文件传输".into()), true),
+            (icons::EYE_INK, "观看模式".into(), HomeAction::Enter(true), online && controllable),
+            (icons::POWER_INK, "关机".into(), HomeAction::Stub("关机".into()), online),
+            (icons::TERMINAL_INK, "终端".into(), HomeAction::Stub("终端".into()), online),
         ];
-        for (i, (label, action)) in feats.into_iter().enumerate() {
-            let r = Rect::new(mx + (i as i32) * 138, by, 130, 40);
-            let enabled = !matches!(action, HomeAction::Enter(_)) || (online && controllable);
-            canvas.set_draw_color(if enabled { ROW_HOVER } else { Color::RGB(243, 244, 246) });
-            canvas.fill_rect(r).ok();
-            text_center(canvas, creator, font, cache, &label, r, if enabled { TEXT_DARK } else { TEXT_MUT });
-            if enabled { home.hit_map.push((r, action)); }
+        let n = feats.len() + 1;
+        let cell = band.width() as i32 / n as i32;
+        for (i, (icon, label, action, enabled)) in feats.into_iter().enumerate() {
+            let cx0 = band.x() + i as i32 * cell;
+            if i > 0 {
+                canvas.set_draw_color(SEP);
+                canvas.fill_rect(Rect::new(cx0, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
+            }
+            let ccx = cx0 + cell / 2;
+            if let Some(tex) = tinted_icon(creator, icon, if enabled { INK } else { Color::RGB(190, 194, 199) }) {
+                canvas.copy(&tex, None, Rect::new(ccx - 9, band.y() + 10, 18, 18)).ok();
+            }
+            text(canvas, creator, font, cache, &label, ccx - 28, band.y() + 38, if enabled { TEXT_DARK } else { Color::RGB(190, 194, 199) });
+            if enabled { home.hit_map.push((Rect::new(cx0, band.y(), cell as u32, band.height()), action)); }
         }
+        let gx = band.x() + (n as i32 - 1) * cell;
+        canvas.set_draw_color(SEP);
+        canvas.fill_rect(Rect::new(gx, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
+        if let Some(tex) = icon_texture(creator, icons::GRID_BLUE) {
+            canvas.copy(&tex, None, Rect::new(gx + cell / 2 - 9, band.y() + 22, 18, 18)).ok();
+        }
+        home.hit_map.push((Rect::new(gx, band.y(), (band.x() + band.width() as i32 - gx) as u32, band.height()), HomeAction::Stub("快捷工具".into())));
 
-        // 快速启动。
-        let qb = Rect::new(mx, by + 56, card.width(), 120);
-        canvas.set_draw_color(Color::RGB(248, 249, 251));
-        canvas.fill_rect(qb).ok();
-        canvas.set_draw_color(Color::RGB(210, 214, 220));
-        canvas.draw_rect(qb).ok();
-        text_center(canvas, creator, font, cache, "+ 添加", qb, TEXT_MUT);
+        // 快速启动：标题 + 虚线框 + 灰色圆形加号 + "添加"。
+        let qy = band.y() + band.height() as i32 + 20;
+        text(canvas, creator, font, cache, "快速启动", mx + 4, qy, INK);
+        let qb = Rect::new(mx, qy + 34, cw, (wh as i32 - qy - 58).max(90) as u32);
+        dash_card(canvas, qb, CARD_BG, MAIN_BG, Color::RGB(205, 210, 216));
+        let ccx = qb.x() + qb.width() as i32 / 2;
+        let ccy = qb.y() + qb.height() as i32 / 2 - 12;
+        circle(canvas, ccx, ccy, 16, Color::RGB(226, 230, 235));
+        canvas.set_draw_color(Color::RGB(255, 255, 255));
+        canvas.fill_rect(Rect::new(ccx - 7, ccy - 2, 14, 4)).ok();
+        canvas.fill_rect(Rect::new(ccx - 2, ccy - 7, 4, 14)).ok();
+        text(canvas, creator, font, cache, "添加", ccx - 14, ccy + 26, TEXT_MUT);
         home.hit_map.push((qb, HomeAction::Stub("快速启动".into())));
     } else {
         text(canvas, creator, font, cache, "选择左侧的设备后点「进入桌面」。", mx, TOPBAR_H as i32 + 60, TEXT_MUT);
     }
 
     if !home.status_msg.is_empty() {
-        text(canvas, creator, font, cache, &home.status_msg, 216, wh as i32 - 26, TEXT_MUT);
+        text(canvas, creator, font, cache, &home.status_msg, SIDE_W + 16, wh as i32 - 26, TEXT_MUT);
     }
 }
 
 fn draw_login_panel<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, home: &mut Home, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
     let panel = Rect::new(mx, my, 520, 340);
-    canvas.set_draw_color(Color::RGB(255, 255, 255));
-    canvas.fill_rect(panel).ok();
-    canvas.set_draw_color(Color::RGB(214, 218, 224));
-    canvas.draw_rect(panel).ok();
+    card(canvas, panel, Color::RGB(252, 253, 255), MAIN_BG, 10, Some(CARD_BORDER));
     text(canvas, creator, font, cache, "网易UU远程", panel.x() + 16, panel.y() + 12, TEXT_DARK);
     let close = Rect::new(panel.x() + panel.width() as i32 - 34, panel.y() + 8, 26, 26);
     text(canvas, creator, font, cache, "×", close.x() + 7, close.y() + 3, TEXT_MUT);
