@@ -30,7 +30,7 @@ use sdl2::event::{Event, WindowEvent};
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::{Point, Rect};
-use sdl2::render::{Texture, TextureCreator};
+use sdl2::render::{Texture, TextureCreator, TextureAccess};
 use sdl2::video::{FullscreenType, Window, WindowContext, WindowPos};
 use sdl2::Sdl;
 use serde_json::{json, Value};
@@ -104,6 +104,7 @@ fn main() {
     let view_only = flag("--view-only") || std::env::var("UU_VIEWER_VIEW_ONLY").is_ok_and(|v| v == "1");
     let no_audio = flag("--no-audio");
 
+    force_argb();
     let sdl = sdl2::init().expect("SDL 初始化失败");
     let video = sdl.video().expect("视频子系统失败");
     let font = load_font();
@@ -129,7 +130,7 @@ fn main() {
     }
 
     // ---- 主页 ----
-    let mut canvas = video.window("网易UU远程", 1280, 800).position_centered().resizable().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    let mut canvas = video.window("网易UU远程", WIN_W, WIN_H).position_centered().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
     canvas.window_mut().set_bordered(false);
     set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
@@ -160,6 +161,13 @@ fn main() {
     let mut home = Home::new(logged);
     let mut text_cache: HashMap<String, Texture> = HashMap::new();
     let mut qr_tex: Option<Texture> = None;
+
+    let shadow_tex = shadow_texture(&creator);
+    let corner_tl = corner_texture(&creator, PANEL_BG, true, true);
+    let corner_tr = corner_texture(&creator, PANEL_BG, false, true);
+    let corner_bl = corner_texture(&creator, SIDE_BG, true, false);
+    let corner_br = corner_texture(&creator, MAIN_BG, false, false);
+    let corners = [&corner_tl, &corner_tr, &corner_bl, &corner_br];
 
     let mut event_pump = sdl.event_pump().expect("事件泵");
     let xconn = x_connect();
@@ -194,13 +202,12 @@ fn main() {
                 Event::Quit { .. } => break 'home,
                 Event::Window { win_event: WindowEvent::Close, .. } => break 'home,
                 Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
-                    match home.hit(x, y) {
+                    match home.hit(x - MARGIN, y - MARGIN) {
                         HomeAction::None => {
                             // 顶栏空白区按下 = 拖动整窗（borderless 后没有系统标题栏，这里就是标题栏）。
                             // 抓鼠 + 全局指针真值：拖动量 = 服务器指针当前位置 - 按下时的指针位置，
                             // 与窗口相对坐标/搬窗延迟完全解耦，出界、积压、mutter 排队都不会跑偏。
-                            let (ww, _) = canvas.window().size();
-                            if y < TOPBAR_H && x < ww as i32 - 222 {
+                            if y - MARGIN < TOPBAR_H && y >= 0 && x - MARGIN < CARD_W - 222 && x >= MARGIN {
                                 // 按下瞬间的指针真值取 SDL 事件自带的相对坐标 + 当时窗口位置（零竞态）。
                                 let (px, py) = canvas.window().position();
                                 if std::env::var_os("UU_DRAG_DEBUG").is_some() { eprintln!("press: root=({},{}) win=({px},{py})", px + x, py + y); }
@@ -244,7 +251,7 @@ fn main() {
                     }
                 }
                 Event::MouseMotion { x, y, .. } => {
-                    home.mouse = (x, y);
+                    home.mouse = (x - MARGIN, y - MARGIN);
                 }
                 Event::MouseButtonUp { .. } => home.drag = None,
                 _ => {}
@@ -294,7 +301,7 @@ fn main() {
         if login_thread.as_ref().is_some_and(|h| h.is_finished()) { login_thread = None; }
 
         let (hm_x, hm_y) = home.mouse;
-        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, qr_tex.as_ref(), hm_x, hm_y);
+        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, qr_tex.as_ref(), &shadow_tex, corners, hm_x, hm_y);
         canvas.present();
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -417,10 +424,112 @@ fn vdots(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, cx: i32, cy: i3
     circle(canvas, cx, cy + 6, 2, c);
 }
 
-fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
-    let (ww, wh) = canvas.window().size();
+
+/// 找带 alpha 通道的 32-bit ARGB visual；SDL 用该 hint 建窗后 mutter 按 alpha 合成（圆角/阴影必需）。
+fn argb_visual_id() -> Option<String> {
+    use x11rb::connection::Connection;
+    let (conn, scr_idx) = x11rb::connect(None).ok()?;
+    let fmts = x11rb::protocol::render::query_pict_formats(&conn).ok()?.reply().ok()?;
+    let argb_ids: Vec<u32> = fmts.formats.iter().filter(|f| f.depth == 32 && f.direct.alpha_mask != 0).map(|f| f.id).collect();
+    for depth in conn.setup().roots[scr_idx].allowed_depths.iter() {
+        if depth.depth != 32 { continue; }
+        for v in depth.visuals.iter() {
+            if argb_ids.contains(&v.visual_id) { return Some(v.visual_id.to_string()); }
+        }
+    }
+    None
+}
+
+fn force_argb() {
+    sdl2::hint::set("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
+    if let Some(vid) = std::env::var("UU_VISUALID").ok().or_else(argb_visual_id) {
+        if !vid.is_empty() { sdl2::hint::set("SDL_VIDEO_X11_WINDOW_VISUALID", &vid); }
+    }
+}
+
+// 主页卡片几何：官方 920x700，四周 30px 阴影带（0 8px 24px rgba(0,0,0,0.08)），圆角 8。
+const CARD_W: i32 = 920;
+const CARD_H: i32 = 700;
+const MARGIN: i32 = 30;
+const WIN_W: u32 = (CARD_W + 2 * MARGIN) as u32;
+const WIN_H: u32 = (CARD_H + 2 * MARGIN) as u32;
+const CORNER_R: f32 = 8.0;
+
+/// 圆角卡片到 (px,py) 的带符号距离（负=内部）。
+fn rounded_sdf(px: f32, py: f32, ox: f32, oy: f32, w: f32, h: f32, r: f32) -> f32 {
+    let qx = (px - (ox + w / 2.0)).abs() - (w / 2.0 - r);
+    let qy = (py - (oy + h / 2.0)).abs() - (h / 2.0 - r);
+    let oxv = qx.max(0.0);
+    let oyv = qy.max(0.0);
+    (oxv * oxv + oyv * oyv).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+/// 预生成阴影纹理（整窗 RGBA）：卡片外像素 = 黑 alpha 高斯衰减（σ=12≈blur 24，偏移 y+8）。
+fn shadow_texture(creator: &TextureCreator<WindowContext>) -> Texture {
+    let (w, h) = (WIN_W as usize, WIN_H as usize);
+    let mut px = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let d = rounded_sdf(x as f32 + 0.5, y as f32 + 0.5, MARGIN as f32, (MARGIN + 8) as f32, CARD_W as f32, CARD_H as f32, CORNER_R);
+            if d > 0.0 {
+                let a = 255.0 * 0.08 * (-d * d / (2.0 * 12.0 * 12.0)).exp();
+                if a > 0.5 {
+                    let i = (y * w + x) * 4;
+                    px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = a as u8;
+                }
+            }
+        }
+    }
+    let mut tex = creator.create_texture_streaming(PixelFormatEnum::RGBA32, w as u32, h as u32).expect("阴影纹理失败");
+    tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+    tex.with_lock(None, |buf, pitch| {
+        for row in 0..h {
+            buf[row * pitch..row * pitch + w * 4].copy_from_slice(&px[row * w * 4..(row + 1) * w * 4]);
+        }
+    }).expect("阴影写入失败");
+    tex
+}
+
+/// 圆角四角蒙版（8x8）：弧内=背景色不透明，弧外 alpha 0；配合擦除+阴影重放裁圆角。
+fn corner_texture(creator: &TextureCreator<WindowContext>, bg: Color, tl: bool, tr: bool) -> Texture {
+    // (tl,tr) = (1,0)左上 (0,1)右上 (1,1)左下 (0,0)右下；弧内背景色，弧外 alpha 0。
+    let n = (CORNER_R.ceil() as usize) + 1;
+    let mut px = vec![0u8; n * n * 4];
+    for y in 0..n {
+        for x in 0..n {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let cx = if tl { CORNER_R } else { n as f32 - CORNER_R };
+            let cy = if tr { CORNER_R } else { n as f32 - CORNER_R };
+            if (fx - cx).powi(2) + (fy - cy).powi(2) <= CORNER_R * CORNER_R {
+                let i = (y * n + x) * 4;
+                px[i] = bg.r; px[i + 1] = bg.g; px[i + 2] = bg.b; px[i + 3] = 255;
+            }
+        }
+    }
+    let mut tex = creator.create_texture_streaming(PixelFormatEnum::RGBA32, n as u32, n as u32).expect("角蒙版失败");
+    tex.with_lock(None, |buf, pitch| {
+        for row in 0..n {
+            buf[row * pitch..row * pitch + n * 4].copy_from_slice(&px[row * n * 4..(row + 1) * n * 4]);
+        }
+    }).ok();
+    tex
+}
+
+fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, shadow: &Texture<'a>, corners: [&Texture<'a>; 4], mx: i32, my: i32) {
+    let (ww, wh) = (CARD_W as u32, CARD_H as u32);
+    // SDL 的绘制命令按视口变换，但 clear() 无视视口 → 全程用 fill_rect。
+    // 整窗先刷全透明（BlendMode::None 直写 alpha），再铺官方阴影（0 8px 24px rgba(0,0,0,0.08)，偏移 y+8）。
+    canvas.set_viewport(None);
+    canvas.set_blend_mode(sdl2::render::BlendMode::None);
+    canvas.set_draw_color(Color::RGBA(0, 0, 0, 0));
+    canvas.fill_rect(Rect::new(0, 0, WIN_W, WIN_H)).ok();
+    canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+    canvas.copy(shadow, None, Rect::new(0, 0, WIN_W, WIN_H)).ok();
+    // 卡片视口：以下所有绘制坐标 = 920x700 卡片坐标
+    canvas.set_viewport(Rect::new(MARGIN, MARGIN, CARD_W as u32, CARD_H as u32));
     canvas.set_draw_color(MAIN_BG);
-    canvas.clear();
+    canvas.fill_rect(Rect::new(0, 0, ww, wh)).ok();
     home.hit_map.clear();
 
     // ---- 顶部标题栏（kFillWindowPanel 浅灰底 + 官方 logo + 灰字标题 + 右侧按钮组）----
@@ -631,7 +740,28 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     if !home.status_msg.is_empty() {
         text(canvas, creator, font, cache, &home.status_msg, SIDE_W + 16, wh as i32 - 26, TEXT_MUT);
     }
+
+
+    // ---- 圆角 8px：擦掉四角像素 → 重放该角阴影 → 铺背景弧内像素（fill_rect，不用 clear）----
+    canvas.set_viewport(None);
+    let n = CORNER_R.ceil() as u32 + 1;
+    let rects = [
+        Rect::new(MARGIN, MARGIN, n, n),
+        Rect::new(WIN_W as i32 - MARGIN - n as i32, MARGIN, n, n),
+        Rect::new(MARGIN, WIN_H as i32 - MARGIN - n as i32, n, n),
+        Rect::new(WIN_W as i32 - MARGIN - n as i32, WIN_H as i32 - MARGIN - n as i32, n, n),
+    ];
+    for (i, r) in rects.iter().enumerate() {
+        canvas.set_blend_mode(sdl2::render::BlendMode::None);
+        canvas.set_draw_color(Color::RGBA(0, 0, 0, 0));
+        canvas.fill_rect(*r).ok();
+        canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+        canvas.copy(shadow, *r, *r).ok();
+        canvas.copy(corners[i], None, *r).ok();
+    }
+    canvas.set_viewport(Rect::new(MARGIN, MARGIN, CARD_W as u32, CARD_H as u32));
 }
+
 
 fn draw_login_panel<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, home: &mut Home, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
     let panel = Rect::new(mx, my, 520, 340);
@@ -1106,10 +1236,11 @@ fn run_ui_preview() {
 
 /// --home-preview：合成设备列表，渲染主页若干帧后抓一张 RGBA 快照（验证顶栏按钮组排版）。
 fn run_home_preview(snap: Option<&str>) {
+    force_argb();
     let sdl = sdl2::init().expect("SDL 初始化失败");
     let video = sdl.video().expect("视频子系统失败");
     let font = load_font();
-    let mut canvas = video.window("UU 远程 · 主页预览", 1280, 800).position_centered().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    let mut canvas = video.window("UU 远程 · 主页预览", WIN_W, WIN_H).position_centered().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
     set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
     let mut home = Home::new(true);
@@ -1118,11 +1249,17 @@ fn run_home_preview(snap: Option<&str>) {
         DeviceRow { id: "d2".into(), alias: "Backup".into(), online: false, controllable: true },
     ];
     home.selected = Some(1);
-    home.mouse = (1000, 20); // 悬停模拟
+    home.mouse = (CARD_W - 20, 20); // 悬停模拟（卡片坐标）
     let mut text_cache: HashMap<String, Texture> = HashMap::new();
+    let shadow_tex = shadow_texture(&creator);
+    let corner_tl = corner_texture(&creator, PANEL_BG, true, true);
+    let corner_tr = corner_texture(&creator, PANEL_BG, false, true);
+    let corner_bl = corner_texture(&creator, SIDE_BG, true, false);
+    let corner_br = corner_texture(&creator, MAIN_BG, false, false);
+    let corners = [&corner_tl, &corner_tr, &corner_bl, &corner_br];
     for _ in 0..8 {
         let (hx, hy) = home.mouse;
-        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, None, hx, hy);
+        draw_home(&mut canvas, &creator, font.as_ref(), &mut home, &mut text_cache, None, &shadow_tex, corners, hx, hy);
         canvas.present();
         std::thread::sleep(Duration::from_millis(30));
     }
