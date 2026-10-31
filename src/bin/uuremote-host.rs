@@ -1169,9 +1169,12 @@ fn start_video(
 
     let peer = session.peer.clone();
     let settings_pipe = Some(settings.clone());
+    // 首帧时刻是用户体感「连接时长」的终点：客户端从点连接到看见画面全靠它。
+    let t_connect_start = session.t_be_controlled;
     let video_task = tokio::spawn(async move {
         let _ = init_done_rx.await;
         let mut write_fails = 0u32;
+        let mut first_written = false;
         while let Some(frame) = frames_rx.recv().await {
             let pipeline_us = frame.t_out.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             let pipeline_ms = (pipeline_us / 1000).min(65_535) as u64;
@@ -1189,6 +1192,13 @@ fn start_video(
                 }
             } else {
                 write_fails = 0;
+                if !first_written {
+                    first_written = true;
+                    hostlog::log(&format!(
+                        "首帧已发出（be-controlled → 首帧 {} ms）",
+                        t_connect_start.elapsed().as_millis()
+                    ));
+                }
             }
         }
     });
