@@ -145,6 +145,15 @@ impl NvencH264 {
                 ["-profile:v", "high", "-pix_fmt", "yuv420p"].as_slice()
             })
             .args(["-g", &format!("{}", (fps.max(1) * 2).max(2))])
+            // 心跳 IDR：NVENC 在 rc=vbr 下根本不重复 IDR（实测 21s 流只有首帧一个，
+            // -g/-strict_gop 全被驱动无视），带宽完全内容驱动 → 客户端带宽显示在
+            // 静止 ~170K 与活动 ~3M 之间闪烁。官方引擎静止时按 1~3 fps 整屏刷新，
+            // 这里每 2 s 强制一个 IDR（mod(n,2fps)），驱动会连吐
+                        // 2~3 个全尺寸 intra AU（一次性整屏刷新，实测一坨 ~1.2MB），摊出来
+                        // 空闲带宽 ≈ 4~6M，与官方恒 5M 同量级；
+            // 与官方同量级；发送端把 <700B 的静止小帧旁路掉，闪烁源消除。
+            .args(["-force_key_frames", &format!("expr:eq(mod(n,{}),0)", (fps.max(1) * 2).max(2))])
+            .args(["-forced-idr", "1"])
             // 质量优先：vbr + cq，码率只当上限（target = 3/4 上限，留突发余量）。
             .args([
                 "-rc", "vbr",

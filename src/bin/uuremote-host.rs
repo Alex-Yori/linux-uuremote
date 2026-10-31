@@ -1230,6 +1230,32 @@ fn start_video(
     session.shape_abort = Some(shape_task.abort_handle());
 }
 
+/// AU 里是否含 IDR（NAL type 5）：起始码 3/4 字节都认。旁路判据用它兜底，
+/// 保证关键帧永不被当静止微帧丢掉。
+fn au_is_idr(unit: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < unit.len() {
+        if unit[i] == 0 && unit[i + 1] == 0 {
+            if unit[i + 2] == 1 {
+                if unit[i + 3] & 0x1f == 5 {
+                    return true;
+                }
+                i += 3;
+                continue;
+            }
+            if i + 4 < unit.len() && unit[i + 3] == 1 {
+                if unit[i + 4] & 0x1f == 5 {
+                    return true;
+                }
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// 采集 → 编码 → 送帧。NVENC（FFmpeg 子进程，参照实现在本机的方式）优先，
 /// openh264 软编兜底。NVENC 模式恒帧率恒码率（CBR），不做内容门控——
 /// 客户端右下角 10–40 fps 横跳、几百 Kbps–几 Mbps 横跳正是软编 + 静止门控的产物。
@@ -1367,6 +1393,9 @@ fn capture_loop(
     let mut last_unit = Instant::now();
     let mut last_au: Option<Vec<u8>> = None;
     let mut last_emit = Instant::now();
+    let mut gated: u64 = 0;
+    // 最近一个静止微帧（空闲保活重发用，比 250KB 的 IDR 便宜三个数量级）。
+    let mut last_small: Option<Vec<u8>> = None;
     let started = Instant::now();
 
     loop {
@@ -1484,11 +1513,12 @@ fn capture_loop(
             let n = settings.pipe_n.swap(0, Ordering::Relaxed);
             let sum = settings.pipe_sum_us.swap(0, Ordering::Relaxed);
             hostlog::log(&format!(
-                "周期统计：{:.1} fps ≈ {:.0} kbps，管线滞留均值 {:.1} ms（{n} 帧）",
+                "周期统计：{:.1} fps ≈ {:.0} kbps，管线滞留均值 {:.1} ms（{n} 帧，旁路静止微帧 {gated}）",
                 since_last as f64 / secs,
                 win_bytes as f64 * 8.0 / win_start.elapsed().as_secs_f64().max(0.1) / 1000.0,
                 sum as f64 / n.max(1) as f64 / 1000.0
             ));
+            gated = 0;
             frames_sent = 0;
             acc_grab = Duration::ZERO;
             acc_diff = Duration::ZERO;
@@ -1557,6 +1587,18 @@ fn capture_loop(
                 };
                 let unit_len = unit.len() as u64;
                 let keep = unit.clone();
+                // 静止微帧旁路：画面没变时 NVENC 仍按帧率吐 130B 的空 P 帧，
+                // 直接灌进带宽统计就是"170K ↔ 3M 来回闪"的下半段闪烁源。
+                // 非 IDR 且 <700B 的 AU 不发（心跳 IDR 每 1.5s 兜底画面新鲜度）；
+                // 但 2s 没发过东西就照发，防止编码器状态被拉太远。
+                if unit_len < 700 && !au_is_idr(&unit) && last_emit.elapsed() < Duration::from_secs(2) {
+                    gated += 1;
+                    drained += 1;
+                    win_frames += 1;
+                    last_unit = Instant::now();
+                    last_small = Some(keep);
+                    continue;
+                }
                 let s0 = Instant::now();
                 if frames_tx.blocking_send(Encoded { data: unit, duration: timeline.duration_after(Instant::now()), t_out: s0 }).is_err() {
                     return;
@@ -1602,7 +1644,9 @@ fn capture_loop(
             // x11grab 空闲不产帧，重发上一个 AU 让客户端解码器活着、状态条 frm
             // 不至于显示几万毫秒。多 AUD 的 AU（起始码成串）不重发，避免双起始码。
             if self_capture && backend_nvenc && still_fps > 0 {
-                if let Some(last) = last_au.as_ref() {
+                // 空闲保活优先重发最近一个静止微帧（130B），没有才退到上一个发出
+                // 的 AU —— 后者可能是 250KB 的 IDR，×12 fps 就是一场人为带宽风暴。
+                if let Some(last) = last_small.as_ref().or(last_au.as_ref()) {
                     let aus = last.windows(4).filter(|w| *w == [0, 0, 0, 1]).count();
                     if aus <= 1 && now.duration_since(last_emit) >= Duration::from_millis(1_000 / still_fps as u64) {
                         if frames_tx.blocking_send(Encoded { data: last.clone(), duration: Duration::from_millis(1_000 / still_fps as u64), t_out: now }).is_ok() {
