@@ -1199,6 +1199,8 @@ fn start_video(
     let mut pad_win_bytes: u64 = 0;
     let mut pad_win_pad_bytes: u64 = 0;
     let mut pad_win_frames: u64 = 0;
+    let mut pad_win_max_au: usize = 0;
+    let mut pad_win_idr: u64 = 0;
     let video_task = tokio::spawn(async move {
         let _ = init_done_rx.await;
         let mut write_fails = 0u32;
@@ -1211,6 +1213,40 @@ fn start_video(
                 s.pipe_n.fetch_add(1, Ordering::Relaxed);
             }
             let mut data = frame.data;
+            // 每窗诊断：单帧最大字节 + IDR（NAL type 5）计数，用于区分
+            // 「IDR 尖峰」与「画面内容本身波动」两种振荡来源。
+            let raw_len = data.len();
+            let has_idr = {
+                let b = data.as_slice();
+                let mut found = false;
+                let mut i = 0usize;
+                while i + 4 < b.len() {
+                    if b[i] == 0 && b[i + 1] == 0 {
+                        let hdr = if b[i + 2] == 1 {
+                            i + 3
+                        } else if b[i + 2] == 0 && b[i + 3] == 1 {
+                            i + 4
+                        } else {
+                            i += 1;
+                            continue;
+                        };
+                        if hdr < b.len() && (b[hdr] & 0x1F) == 5 {
+                            found = true;
+                            break;
+                        }
+                        i = hdr + 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                found
+            };
+            if raw_len > pad_win_max_au {
+                pad_win_max_au = raw_len;
+            }
+            if has_idr {
+                pad_win_idr += 1;
+            }
             let added = floor.pad(&mut data, Instant::now());
             pad_win_bytes += data.len() as u64;
             pad_win_pad_bytes += added as u64;
@@ -1218,15 +1254,19 @@ fn start_video(
             if pad_win_start.elapsed() >= Duration::from_secs(5) {
                 let secs = pad_win_start.elapsed().as_secs_f64().max(0.5);
                 hostlog::log(&format!(
-                    "发送带宽 {:.0} kbps（其中 padding {:.0} kbps，窗口 {} 帧）",
+                    "发送带宽 {:.0} kbps（其中 padding {:.0} kbps，窗口 {} 帧，单帧峰值 {} B，IDR {} 个）",
                     pad_win_bytes as f64 * 8.0 / 1000.0 / secs,
                     pad_win_pad_bytes as f64 * 8.0 / 1000.0 / secs,
-                    pad_win_frames
+                    pad_win_frames,
+                    pad_win_max_au,
+                    pad_win_idr
                 ));
                 pad_win_start = Instant::now();
                 pad_win_bytes = 0;
                 pad_win_pad_bytes = 0;
                 pad_win_frames = 0;
+                pad_win_max_au = 0;
+                pad_win_idr = 0;
             }
             if let Err(e) = peer.write_video(data, frame.duration, pipeline_ms).await {
                 eprintln!("   写视频样本失败：{e}");
