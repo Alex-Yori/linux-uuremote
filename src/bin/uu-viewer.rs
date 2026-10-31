@@ -168,6 +168,7 @@ fn main() {
     let mut login_thread: Option<std::thread::JoinHandle<()>> = None;
 
     let mut home = Home::new(logged);
+    home.account_name = config::read().ok().flatten().and_then(|f| f.get("account_name").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
     let mut text_cache: HashMap<String, Texture> = HashMap::new();
     let mut qr_tex: Option<Texture> = None;
 
@@ -254,6 +255,23 @@ fn main() {
                             }
                         }
                         HomeAction::ToggleGroup(g) => home.groups_open[g as usize] ^= true,
+                        HomeAction::ToggleAccount => { home.account_open = !home.account_open; }
+                        HomeAction::Logout => {
+                            // 退出账户：只撤 token/csrf（设备身份留在 config，重新登录后还能找回这台机）。
+                            home.account_open = false;
+                            if let Some(mut f) = config::read().ok().flatten() {
+                                if let Some(map) = f.as_object_mut() {
+                                    map.remove("token");
+                                    map.remove("csrf");
+                                }
+                                match config::write(&f) {
+                                    Ok(_) => { home.logged_in = false; home.devices.clear(); home.selected = None; home.status_msg = "已退出账户。".into(); }
+                                    Err(e) => home.status_msg = format!("退出失败：{e}"),
+                                }
+                            } else {
+                                home.status_msg = "没有可退出的登录态。".into();
+                            }
+                        }
                         HomeAction::Minimize => canvas.window_mut().minimize(),
                         HomeAction::Close => break 'home,
                         HomeAction::Stub(label) => home.status_msg = format!("{label}（暂未实现）"),
@@ -331,7 +349,7 @@ impl DeviceRow {
 }
 
 #[derive(Clone, PartialEq)]
-enum HomeAction { None, Select(usize), Login, Enter(bool), Minimize, Close, Stub(String), ToggleGroup(u8) }
+enum HomeAction { None, Select(usize), Login, Enter(bool), Minimize, Close, Stub(String), ToggleGroup(u8), ToggleAccount, Logout }
 
 struct Home {
     devices: Vec<DeviceRow>,
@@ -340,6 +358,12 @@ struct Home {
     login_open: bool,
     login_status: String,
     status_msg: String,
+    /// 账户下拉面板开关（HTML .user-dropdown.show）。
+    account_open: bool,
+    /// config.json 的 account_name（脱敏手机号），面板里显示。
+    account_name: String,
+    /// 账户面板矩形（上一帧绘制记录，供"点外面关闭"判定）。
+    account_rect: Option<Rect>,
     session_busy: bool,
     mouse: (i32, i32),
     // 拖动锚点：按下瞬间的全局鼠标位置 + 窗口位置（增量直接由服务器指针真值驱动）。
@@ -349,7 +373,7 @@ struct Home {
 }
 impl Home {
     fn new(logged_in: bool) -> Self {
-        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, mouse: (-1, -1), drag: None, groups_open: [true, true], hit_map: Vec::new() }
+        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), account_open: false, account_name: String::new(), account_rect: None, session_busy: false, mouse: (-1, -1), drag: None, groups_open: [true, true], hit_map: Vec::new() }
     }
     fn selected_device(&self) -> Option<&DeviceRow> { self.selected.and_then(|i| self.devices.get(i)) }
     fn hit(&mut self, x: i32, y: i32) -> HomeAction {
@@ -358,6 +382,20 @@ impl Home {
             if self.hit_map.iter().any(|(r, a)| matches!(a, HomeAction::Stub(_)) && r.contains_point(Point::new(x, y))) {
                 self.login_open = false;
             }
+            return HomeAction::None;
+        }
+        if self.account_open {
+            // HTML 交互语义：面板内点击不关闭（面板里 logout 按钮照常处理）；点面板外 = 关闭。
+            let pt = Point::new(x, y);
+            if let Some(rect) = self.account_rect {
+                if rect.contains_point(pt) {
+                    for (r, a) in self.hit_map.iter() {
+                        if r.contains_point(pt) { return a.clone(); }
+                    }
+                    return HomeAction::None;
+                }
+            }
+            self.account_open = false;
             return HomeAction::None;
         }
         for (r, a) in self.hit_map.iter() {
@@ -408,6 +446,23 @@ fn card(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: C
         canvas.draw_line(Point::new(r.x() + rad, r.y() + r.height() as i32 - 1), Point::new(r.x() + r.width() as i32 - rad - 1, r.y() + r.height() as i32 - 1)).ok();
         canvas.draw_line(Point::new(r.x(), r.y() + rad), Point::new(r.x(), r.y() + r.height() as i32 - rad - 1)).ok();
         canvas.draw_line(Point::new(r.x() + r.width() as i32 - 1, r.y() + rad), Point::new(r.x() + r.width() as i32 - 1, r.y() + r.height() as i32 - rad - 1)).ok();
+    }
+}
+
+/// 圆角纯填充（无背景擦除版，供半透明阴影层用）：逐行按圆角内缩画水平条。
+fn card_fill_round(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, r: Rect, fill: Color) {
+    canvas.set_draw_color(fill);
+    let rad = 12f32;
+    let (w, h) = (r.width() as f32, r.height() as f32);
+    for dy in 0..r.height() as i32 {
+        let fy = dy as f32 + 0.5;
+        // 该行距最近圆角圆心的垂直距离
+        let cy = if fy < rad { rad } else if fy > h - rad { h - rad } else { fy };
+        let dyd = (fy - cy).abs();
+        let inset = if dyd <= rad - 1.0 { 0.0 } else { let t = dyd - (rad - 1.0); rad - (rad * rad - t * t).sqrt().max(0.0) };
+        let x0 = r.x() + inset.ceil() as i32;
+        let x1 = r.x() + r.width() as i32 - inset.ceil() as i32;
+        if x1 > x0 { canvas.fill_rect(Rect::new(x0, r.y() + dy, (x1 - x0) as u32, 1)).ok(); }
     }
 }
 
@@ -570,16 +625,17 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     let topbar: [(&[u8], HomeAction); 6] = [
         (icons::TOP_SUBSCREEN, HomeAction::Stub("无线副屏".into())),
         (icons::TOP_BELL, HomeAction::Stub("消息中心".into())),
-        (icons::TOP_USER, HomeAction::Stub("账户".into())),
+        (icons::TOP_USER, HomeAction::ToggleAccount),
         (icons::TOP_MORE, HomeAction::Stub("更多".into())),
         (icons::TOP_MINIMIZE, HomeAction::Minimize),
         (icons::TOP_CLOSE, HomeAction::Close),
     ];
     for (i, (png, action)) in topbar.iter().enumerate() {
-        // 顶栏细线图标资源是 96px 细线 PNG，缩太小笔画就糊；按用户要求逐步放大到 40px（资源不动）；步进 56。
+        // 顶栏细线图标源已换矢量重渲（icons.rs 120px 超采样），显示 40px；步进 56。
         let ix = ww as i32 - PAD / 2 - 40 - (5 - i as i32) * 56;
         let r = Rect::new(ix - 8, TOPBAR_H / 2 - 24, 56, 48);
-        if r.contains_point(Point::new(mx, my)) {
+        // .user-btn:hover / .active：面板展开时头像按钮保持灰底。
+        if r.contains_point(Point::new(mx, my)) || (matches!(action, HomeAction::ToggleAccount) && home.account_open) {
             card(canvas, r, SELECTED, MAIN_BG, 4, None);
         }
         if let Some(tex) = icon_texture(creator, png) {
@@ -765,6 +821,46 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         htext(canvas, creator, fonts.r12.as_ref(), cache, &home.status_msg, 12, cx, wh as i32 - 20, TEXT_MUT);
     }
 
+    // ---- 账户下拉面板（HTML .user-dropdown：top 45、right 0、宽 260、padding 16、圆角 12、
+    //      backdrop 白 .85 + blur(16)；SDL 无 backdrop-filter，白底上以不透明白近似）----
+    home.account_rect = None;
+    if home.account_open {
+        // 锚点 = 顶栏用户按钮（topbar 循环 i=2 的位置）。
+        let ux = ww as i32 - PAD / 2 - 40 - (5 - 2) * 56;
+        let pw = 260i32;
+        let panel = Rect::new((ux + 48 - pw).max(4), TOPBAR_H + 8, pw as u32, 168);
+        // box-shadow 0 8px 24px rgba(0,0,0,.12)：三层递减半透明圆角近似。
+        for (grow, a) in [(12u32, 12u8), (6, 18), (2, 26)] {
+            let s = Rect::new(panel.x() - grow as i32, panel.y() + grow as i32 - 2, (pw + 2 * grow as i32) as u32, (panel.height() as i32 + 2 * grow as i32) as u32);
+            canvas.set_draw_color(Color::RGBA(0, 0, 0, a));
+            card_fill_round(canvas, s, Color::RGBA(0, 0, 0, a));
+        }
+        card(canvas, panel, Color::RGBA(255, 255, 255, 242), MAIN_BG, 12, Some(Color::RGBA(255, 255, 255, 255)));
+        home.account_rect = Some(panel);
+
+        // .logout-btn：top 12 right 12、24x24、圆角 4、三级灰；hover 灰底深字。
+        let lb = Rect::new(panel.x() + panel.width() as i32 - 12 - 24, panel.y() + 12, 24, 24);
+        if lb.contains_point(Point::new(mx, my)) {
+            card(canvas, lb, HOVER_ROW, MAIN_BG, 4, None);
+        }
+        if let Some(tex) = icon_texture(creator, icons::LOGOUT) {
+            canvas.copy(&tex, None, Rect::new(lb.x() + 4, lb.y() + 4, 16, 16)).ok();
+        }
+        home.hit_map.push((lb, HomeAction::Logout));
+
+        // .big-avatar：56px 圆 #F0F5FF（margin-top 16 / margin-bottom 12）+ 32px 品牌蓝人像。
+        let acx = panel.x() + pw / 2;
+        let acy = panel.y() + 12 + 28 + 16;
+        circle(canvas, acx, acy, 28, Color::RGB(240, 245, 255));
+        if let Some(tex) = icon_texture(creator, icons::AVATAR_BLUE) {
+            canvas.copy(&tex, None, Rect::new(acx - 16, acy - 16, 32, 32)).ok();
+        }
+        // .user-phone：16px/600 主字色（脱敏手机号来自 config.json account_name）。
+        let phone = if home.account_name.is_empty() { "未命名账户".to_owned() } else { home.account_name.clone() };
+        let nw = measure(creator, fonts.s16.as_ref(), cache, &phone, 16, TEXT_MAIN).0;
+        htext(canvas, creator, fonts.s16.as_ref(), cache, &phone, 16, acx - nw / 2, acy + 28 + 12 + 10, TEXT_MAIN);
+    }
+
 
     // ---- 圆角 8px：擦掉四角像素 → 重放该角阴影 → 铺背景弧内像素（fill_rect，不用 clear）----
     canvas.set_viewport(None);
@@ -869,6 +965,7 @@ struct Fonts {
     r13: Option<sdl2::ttf::Font<'static, 'static>>,
     r16: Option<sdl2::ttf::Font<'static, 'static>>,
     s13: Option<sdl2::ttf::Font<'static, 'static>>,
+    s16: Option<sdl2::ttf::Font<'static, 'static>>,
     s20: Option<sdl2::ttf::Font<'static, 'static>>,
 }
 
@@ -884,7 +981,7 @@ fn load_font_at(ctx: &'static sdl2::ttf::Sdl2TtfContext, paths: &[(&str, Option<
 }
 
 fn load_fonts() -> Fonts {
-    let empty = || Fonts { r12: None, r13: None, r16: None, s13: None, s20: None };
+    let empty = || Fonts { r12: None, r13: None, r16: None, s13: None, s16: None, s20: None };
     let Ok(ctx) = sdl2::ttf::init() else { return empty() };
     let ctx: &'static sdl2::ttf::Sdl2TtfContext = Box::leak(Box::new(ctx));
     const REG: [(&str, Option<u32>); 3] = [
@@ -903,6 +1000,7 @@ fn load_fonts() -> Fonts {
         r13: load_font_at(ctx, &REG, 13),
         r16: load_font_at(ctx, &REG, 16),
         s13: load_font_at(ctx, &SEMI, 13),
+        s16: load_font_at(ctx, &SEMI, 16),
         s20: load_font_at(ctx, &SEMI, 20),
     }
 }
@@ -996,6 +1094,8 @@ async fn qr_login_flow(tx: std::sync::mpsc::Sender<LoginUpdate>) {
         map.insert("csrf".into(), json!(csrf));
         if let Some(u) = data.get("user_id").and_then(Value::as_str) { map.insert("user_id".into(), json!(u)); }
         if let Some(n) = data.get("nickname").and_then(Value::as_str) { map.insert("nickname".into(), json!(n)); }
+        // 脱敏手机号：官方登录应答里带 account_name 时顺手存下，供账户面板显示。
+        if let Some(a) = data.get("account_name").or(data.get("phone")).and_then(Value::as_str) { map.insert("account_name".into(), json!(a)); }
     }
     // 全新登录但没有设备身份：补注册（token 已写进 file，用合并后的凭证注册）。
     let mut c = Credentials::load(Some(&file)).unwrap_or_default();
@@ -1375,6 +1475,8 @@ fn run_home_preview(snap: Option<&str>) {
         DeviceRow { id: "d2".into(), alias: "Backup".into(), online: false, controllable: true },
     ];
     home.selected = Some(1);
+    home.account_open = std::env::var("UU_PREVIEW_ACCOUNT").is_ok();
+    home.account_name = "138****88".into();
     home.mouse = (CARD_W - 20, 20); // 悬停模拟（卡片坐标）
     let mut text_cache: HashMap<String, Texture> = HashMap::new();
     let shadow_tex = shadow_texture(&creator);
