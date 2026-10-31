@@ -149,6 +149,9 @@ pub enum Received {
 pub struct Signaling {
     ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     ping_window: Duration,
+    /// 附件窗口里读出来但还没处理的帧：客户端 offer 常紧跟 binary 事件同秒到达，
+    /// 直接丢弃会让 offer 永远"收不到"（2026-10-31 首连慢根因）。
+    pending: std::collections::VecDeque<Message>,
 }
 
 impl Signaling {
@@ -199,16 +202,22 @@ impl Signaling {
             }
             // 非 connect 帧继续循环（open 已处理）。
         }
-        Ok(Self { ws, ping_window })
+        Ok(Self { ws, ping_window, pending: Default::default() })
     }
 
     /// 发事件帧。
     pub async fn send(&mut self, event: &str, payload: Option<&Value>) -> Result<(), String> {
+        if std::env::var("UU_HOST_DEBUG").is_ok() {
+            crate::hostlog::log(&format!("sig TX {} {}", event, payload.map(|p| p.to_string().chars().take(200).collect::<String>()).unwrap_or_default()));
+        }
         self.ws.send(Message::Text(encode_event(event, payload).into())).await.map_err(|e| e.to_string())
     }
 
     /// 发带 ack id 的事件帧（room_info / refresh_reconnect_key 形态）。
     pub async fn send_with_ack(&mut self, ack_id: u64, event: &str, payload: Option<&Value>) -> Result<(), String> {
+        if std::env::var("UU_HOST_DEBUG").is_ok() {
+            crate::hostlog::log(&format!("sig TX ack{} {}", ack_id, event));
+        }
         self.ws.send(Message::Text(encode_event_with_ack(ack_id, event, payload).into())).await.map_err(|e| e.to_string())
     }
 
@@ -216,11 +225,26 @@ impl Signaling {
     /// binary 事件会顺带收完其附件帧（socket.io v5：header 后逐帧附件）。
     pub async fn recv(&mut self) -> Result<Received, String> {
         loop {
-            let msg = tokio::time::timeout(self.ping_window, self.ws.next())
-                .await
-                .map_err(|_| "信令心跳窗口内没有任何帧（判死）".to_string())?
-                .ok_or("signaling closed")?
-                .map_err(|e| e.to_string())?;
+            let msg = match self.pending.pop_front() {
+                Some(m) => m,
+                None => tokio::time::timeout(self.ping_window, self.ws.next())
+                    .await
+                    .map_err(|_| "信令心跳窗口内没有任何帧（判死）".to_string())?
+                    .ok_or("signaling closed")?
+                    .map_err(|e| e.to_string())?,
+            };
+            if std::env::var("UU_HOST_DEBUG").is_ok() {
+                // 原始帧落盘：查"客户端为何不发 offer"要看云端到底给我们路由了什么。
+                match &msg {
+                    Message::Text(t) => {
+                        let head: &str = &t[..t.len().min(220)];
+                        if head != "2" && head != "3" { crate::hostlog::log(&format!("sig RX {:?}", head)); }
+                    }
+                    Message::Binary(b) => crate::hostlog::log(&format!("sig RX bin {}B", b.len())),
+                    Message::Close(f) => crate::hostlog::log(&format!("sig RX close {:?}", f.as_ref().map(|x| u16::from(x.code)))),
+                    _ => {}
+                }
+            }
             match msg {
                 Message::Text(t) => match decode_frame(t.as_str()) {
                     Frame::Event(e, p) => return Ok(Received::Event(e, p)),
@@ -239,6 +263,9 @@ impl Signaling {
                                     }
                                     attachments.push(bytes);
                                 }
+                                // 非附件帧（尤其紧随其后的 soac offer 文本帧）必须留到下一轮
+                                // 正常处理，不能随窗口一起丢。
+                                Ok(Some(Ok(m))) => { self.pending.push_back(m); break; }
                                 _ => break,
                             }
                         }
