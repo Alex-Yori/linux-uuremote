@@ -1,5 +1,6 @@
 //! 控制端：join → 信令 control → offer/answer/candidates → 输入/设置 RPC → 保活。
 //! SDL 线程与 tokio 线程之间只走两条 std mpsc 通道（帧下行、命令上行）+ 一组原子量。
+pub mod icons;
 pub mod input;
 pub mod media;
 pub mod png;
@@ -29,6 +30,8 @@ struct JoinBody { data: Option<RoomData> }
 /// SDL → tokio 的命令。
 pub enum Cmd {
     MouseMove { fx: f64, fy: f64 },
+    /// 游戏鼠标档：SDL relative 模式采到的位移，按 Windows notch 语义原样投给被控端。
+    MouseRelative { dx: i32, dy: i32 },
     MouseButton { button: i32, pressed: bool },
     Scroll { dx: i32, dy: i32 },
     Key { vk: i32, pressed: bool },
@@ -102,6 +105,7 @@ impl Session {
                     let Some(cmd) = cmd else { return Ok(()); };
                             let payload = match cmd {
                                 Cmd::MouseMove { fx, fy } => json!({"action": "mouse_move_absolute", "abs_x": fx, "abs_y": fy}).to_string().into_bytes(),
+                                Cmd::MouseRelative { dx, dy } => json!({"action": "mouse_move_relative", "delta_x": dx, "delta_y": dy}).to_string().into_bytes(),
                                 Cmd::MouseButton { button, pressed } => json!({"action": if pressed { "mouse_press" } else { "mouse_release" }, "button": button}).to_string().into_bytes(),
                                 Cmd::Scroll { dx, dy } => json!({"action": "mouse_scroll", "delta_x": dx, "delta_y": dy}).to_string().into_bytes(),
                                 Cmd::Key { vk, pressed } => json!({"action": if pressed { "kbd_press" } else { "kbd_release" }, "key": vk}).to_string().into_bytes(),

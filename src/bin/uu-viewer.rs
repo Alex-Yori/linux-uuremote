@@ -23,6 +23,7 @@ use linux_uuremote::api::{self, api_data, ApiClient, Credentials, QrPollAction};
 use linux_uuremote::config;
 use linux_uuremote::viewer::rtc::{CursorImage, Frame, Host, Stats};
 use linux_uuremote::viewer::wire;
+use linux_uuremote::viewer::icons;
 use linux_uuremote::viewer::{join, Cmd, Session};
 
 use sdl2::event::{Event, WindowEvent};
@@ -580,7 +581,7 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
         });
     });
 
-    let mut ui = Ui::new(quality, fps);
+    let mut ui = Ui::new(quality, fps, view_only);
     let mut video_tex: Option<Texture> = None;
     let mut frame_size = (0usize, 0usize);
     let mut cursor_tex: Option<(Texture, i32, i32)> = None;
@@ -588,12 +589,12 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
     let mut resized = false;
     let mut seq: u64 = 5_000_000;
     let mut rpc_id: u64 = 1;
-    let mut stat_cache: Vec<(String, Option<Texture>)> = Vec::new();
     let mut last_frames = 0u64;
     let mut last_bytes = 0u64;
     let mut stat_since = Instant::now();
     let mut audio_next = Instant::now();
     let mut err: Option<String> = None;
+    let mut last_lag_toast = Instant::now() - Duration::from_secs(60);
 
     match conn_rx.recv_timeout(Duration::from_secs(40)) {
         Ok(Ok(())) => println!("已连接：键鼠已透传，F1 菜单，F11 全屏，关窗即断开。"),
@@ -603,21 +604,25 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
 
     'main: loop {
         for event in event_pump.poll_iter() {
+            let (_, wh0) = canvas.window().size();
             match event {
                 Event::Quit { .. } => break 'main,
                 Event::Window { win_event: WindowEvent::Close, .. } => break 'main,
-                Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::F1), repeat: false, .. } => { ui.menu_open = !ui.menu_open; ui.panel = None; }
+                Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::F1), repeat: false, .. } => { ui.toolbar_open = !ui.toolbar_open; ui.panel = None; }
                 Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::F11), repeat: false, .. } => { ui.fullscreen = !ui.fullscreen; canvas.window_mut().set_fullscreen(if ui.fullscreen { FullscreenType::Desktop } else { FullscreenType::Off }).ok(); }
-                Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::Escape), repeat: false, .. } if ui.menu_open => { ui.menu_open = false; ui.panel = None; }
-                Event::KeyDown { scancode: Some(sc), repeat: false, .. } if !ui.menu_open && !view_only => {
+                Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::Escape), repeat: false, .. } if ui.panel.is_some() => { ui.panel = None; }
+                Event::KeyDown { scancode: Some(sc), repeat: false, .. } if ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 2 => {
                     if let Some(vk) = linux_uuremote::viewer::input::windows_vk(sc as i32) { let _ = cmd_tx.send(Cmd::Key { vk, pressed: true }); }
                 }
-                Event::KeyUp { scancode: Some(sc), .. } if !ui.menu_open && !view_only => {
+                Event::KeyUp { scancode: Some(sc), .. } if ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 2 => {
                     if let Some(vk) = linux_uuremote::viewer::input::windows_vk(sc as i32) { let _ = cmd_tx.send(Cmd::Key { vk, pressed: false }); }
                 }
-                Event::MouseMotion { x, y, .. } => {
+                Event::MouseMotion { x, y, xrel, yrel, .. } => {
                     mouse_at = Point::new(x, y);
-                    if !ui.menu_open && !view_only && frame_size.0 > 0 {
+                    if ui.mouse_mode == 3 {
+                        // 游戏鼠标：relative 模式采到的增量按 Windows notch 语义原样投出。
+                        if !ui.view_only && (xrel != 0 || yrel != 0) { let _ = cmd_tx.send(Cmd::MouseRelative { dx: xrel, dy: yrel }); }
+                    } else if ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 2 && frame_size.0 > 0 {
                         let vp = linux_uuremote::viewer::input::Viewport::fit(canvas.window().size(), (frame_size.0.max(1) as u32, frame_size.1.max(1) as u32));
                         if vp.contains(x as f64, y as f64) {
                             if let Some(m) = vp.motion(x as f64, y as f64) {
@@ -628,28 +633,43 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
                 }
                 Event::MouseButtonDown { mouse_btn, x, y, .. } => {
                     mouse_at = Point::new(x, y);
-                    if ui.menu_open && ui.hit_menu(x, y) {
-                        if let Some(action) = ui.pick(x, y) {
+                    if ui.hit_menu(x, y, wh0) {
+                        if let Some(action) = ui.pick(x, y, wh0) {
                             match action {
-                                Action::Quality(q) => { ui.quality_label = quality_name(q).into(); let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_quality(seq, rpc_id, q))); seq += 1; rpc_id += 1; }
+                                Action::Quality(q) => {
+                                    ui.quality_label = quality_name(q).into();
+                                    if ui.chroma_label == "真彩" && q == 4 { ui.chroma_label = "常规色彩".into(); let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_chroma(seq, rpc_id, 1))); seq += 1; rpc_id += 1; ui.notify("真彩模式下不支持原画画质，已切回常规色彩"); }
+                                    let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_quality(seq, rpc_id, q))); seq += 1; rpc_id += 1;
+                                }
                                 Action::Fps(i) => { ui.fps_label = format!("{} 帧", [30u32, 60, 90, 144][(i as usize - 1).min(3)]); let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_fps(seq, rpc_id, i))); seq += 1; rpc_id += 1; }
-                                Action::Resolution(s) => { ui.res_label = match s { None => "跟随远程".into(), Some((w, h)) => format!("{w}x{h}") }; let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_resolution(seq, rpc_id, s))); seq += 1; rpc_id += 1; }
-                                Action::Chroma(c) => { ui.chroma_label = if c == 3 { "真彩开".into() } else { "真彩关".into() }; let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_chroma(seq, rpc_id, c))); seq += 1; rpc_id += 1; }
+                                Action::Resolution(s) => { ui.res_label = match s { None => "跟随被控端".into(), Some((w, h)) => format!("{w}x{h}") }; let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_resolution(seq, rpc_id, s))); seq += 1; rpc_id += 1; }
+                                Action::Chroma(c) => {
+                                    if c == 3 && ui.quality_label == "原画" { ui.quality_label = "超清".into(); let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_quality(seq, rpc_id, 3))); seq += 1; rpc_id += 1; ui.notify("真彩模式下不支持当前画质，已降到超清"); }
+                                    ui.chroma_label = if c == 3 { "真彩".into() } else { "常规色彩".into() };
+                                    let _ = cmd_tx.send(Cmd::Rpc(wire::rpc_chroma(seq, rpc_id, c))); seq += 1; rpc_id += 1;
+                                }
+                                Action::MouseMode(m) => {
+                                    ui.mouse_mode = m;
+                                    mouse_sys.set_relative_mouse_mode(m == 3);
+                                    ui.notify(match m { 1 => "已开启仿真鼠标", 2 => "正在使用被控端鼠标，F1 可解锁", 3 => "已开启游戏鼠标模式", _ => "已切回智能鼠标" });
+                                }
                                 Action::Sound => { let on = !stats.audio_enabled.load(Ordering::Relaxed); stats.audio_enabled.store(on, Ordering::Relaxed); ui.sound_on = on; }
+                                Action::ViewOnly => { ui.view_only = !ui.view_only; ui.notify(if ui.view_only { "当前为观看模式" } else { "已切回操控模式" }); }
                                 Action::Fullscreen => { ui.fullscreen = !ui.fullscreen; canvas.window_mut().set_fullscreen(if ui.fullscreen { FullscreenType::Desktop } else { FullscreenType::Off }).ok(); }
+                                Action::ToggleToolbar => { ui.toolbar_open = false; }
                                 Action::Quit => break 'main,
                             }
                         }
-                    } else if !view_only && frame_size.0 > 0 {
+                    } else if !ui.view_only && frame_size.0 > 0 {
                         if let Some(button) = map_button(mouse_btn) { let _ = cmd_tx.send(Cmd::MouseButton { button, pressed: true }); }
                     }
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => {
-                    if !ui.menu_open && !view_only && frame_size.0 > 0 {
+                    if !ui.view_only && frame_size.0 > 0 {
                         if let Some(button) = map_button(mouse_btn) { let _ = cmd_tx.send(Cmd::MouseButton { button, pressed: false }); }
                     }
                 }
-                Event::MouseWheel { x, y, .. } if !ui.menu_open && !view_only => {
+                Event::MouseWheel { x, y, .. } if !ui.view_only && ui.mouse_mode != 2 => {
                     let _ = cmd_tx.send(Cmd::Scroll { dx: x * 120, dy: y * 120 });
                 }
                 _ => {}
@@ -721,11 +741,11 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
         if let Some(tex) = &video_tex {
             canvas.copy(tex, None, Rect::new(vp.x as i32, vp.y as i32, vp.width as u32, vp.height as u32)).ok();
         }
-        if ui.menu_open {
-            ui.draw(&mut canvas, &texture_creator, font, ww);
+        if ui.toolbar_open || ui.panel.is_some() || !ui.hud.is_empty() || ui.toast.is_some() {
+            ui.draw(&mut canvas, &texture_creator, font, ww, wh);
         }
-        mouse_sys.show_cursor(ui.menu_open || view_only);
-        if !ui.menu_open && !view_only {
+        mouse_sys.show_cursor(ui.toolbar_open || ui.panel.is_some() || ui.view_only || ui.mouse_mode == 3);
+        if !ui.toolbar_open && ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 3 {
             if let Some((tex, hx, hy)) = &cursor_tex {
                 let scale = vp.width / frame_size.0.max(1) as f64;
                 let x = mouse_at.x as f64 - *hx as f64 * scale;
@@ -739,7 +759,7 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
             let bytes = stats.video_bytes.load(Ordering::Relaxed);
             let secs = stat_since.elapsed().as_secs_f64().max(0.2);
             let fps_now = (frames - last_frames) as f64 / secs;
-            let mbps = (bytes - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
+            let kbps = (bytes - last_bytes) as f64 * 8.0 / secs / 1_000.0;
             last_frames = frames;
             last_bytes = bytes;
             stat_since = Instant::now();
@@ -748,19 +768,14 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
             let rw = stats.remote_w.load(Ordering::Relaxed);
             let rh = stats.remote_h.load(Ordering::Relaxed);
             let chroma = stats.chroma.load(Ordering::Relaxed);
-            stat_cache = vec![(format!("{fps_now:.0} fps · {mbps:.1} Mbps · frm {frm} ms · {ping} ms · {rw}x{rh}{}", if chroma == 3 { " · 真彩" } else { "" }), None)];
-        }
-        for (textline, cache) in stat_cache.iter_mut() {
-            if cache.is_none() {
-                if let Some(tex) = text_texture(&texture_creator, font, textline, Color::RGB(230, 230, 230)) { *cache = Some(tex); }
-            }
-            if let Some(tex) = cache {
-                let q = tex.query();
-                let x = (ww - q.width - 12) as i32;
-                let y = (wh - q.height - 10) as i32;
-                canvas.set_draw_color(Color::RGBA(15, 15, 18, 200));
-                canvas.fill_rect(Rect::new(x - 8, y - 6, q.width + 16, q.height + 12)).ok();
-                canvas.copy(tex, None, Rect::new(x, y, q.width, q.height)).ok();
+            ui.hud = vec![
+                format!("帧率：{fps_now:.0} fps    带宽占用：{kbps:.0} Kbps"),
+                format!("frm：{frm} ms    延迟：{ping} ms    {rw}x{rh}{}", if chroma == 3 { "  真彩" } else { "" }),
+            ];
+            // 官方「检测到网络延迟高」提示（30s 内只提一次，不打断操作）。
+            if ping > 120 && last_lag_toast.elapsed() > Duration::from_secs(30) {
+                last_lag_toast = Instant::now();
+                ui.notify("检测到网络延迟高，请尝试降低画质或帧率，以改善远程控制体验");
             }
         }
         canvas.present();
@@ -850,44 +865,71 @@ enum Action {
     Fps(u64),
     Resolution(Option<(u32, u32)>),
     Chroma(u64),
+    MouseMode(i32),
     Sound,
+    ViewOnly,
     Fullscreen,
+    ToggleToolbar,
     Quit,
 }
 
+/// 官方 Windows 控制端底部悬浮工具栏 + 左上 HUD + 下拉菜单 + 降档提示（Toast）。
+/// 词表全部取自 GameViewer.exe 内嵌文案；图标取自同 exe 提取的内嵌 SVG（viewer::icons）。
+/// 鼠标模式四档（智能/仿真/被控端/游戏）与真彩互斥规则按官方菜单还原。
 struct Ui {
-    menu_open: bool,
+    toolbar_open: bool,
     panel: Option<usize>,
     fullscreen: bool,
     sound_on: bool,
+    view_only: bool,
+    mouse_mode: i32,
     quality_label: String,
     fps_label: String,
     res_label: String,
     chroma_label: String,
+    toast: Option<(String, Instant)>,
     rects: Vec<Rect>,
     option_rects: Vec<(Rect, Action)>,
+    hud: Vec<String>,
 }
 
+const MOUSE_MODES: [&str; 4] = ["智能鼠标", "仿真鼠标", "使用被控端鼠标", "游戏鼠标"];
+
 impl Ui {
-    fn new(quality: u64, fps: u32) -> Self {
+    fn new(quality: u64, fps: u32, view_only: bool) -> Self {
         Self {
-            menu_open: false,
+            toolbar_open: true,
             panel: None,
             fullscreen: false,
             sound_on: true,
+            view_only,
+            mouse_mode: 0,
             quality_label: quality_name(quality).to_owned(),
             fps_label: format!("{fps} 帧"),
-            res_label: "跟随远程".to_owned(),
-            chroma_label: "真彩关".to_owned(),
+            res_label: "跟随被控端".to_owned(),
+            chroma_label: "常规色彩".to_owned(),
+            toast: None,
             rects: Vec::new(),
             option_rects: Vec::new(),
+            hud: Vec::new(),
         }
     }
-    fn hit_menu(&self, x: i32, y: i32) -> bool {
-        y < 32 || self.option_rects.iter().any(|(r, _)| r.contains_point(Point::new(x, y)))
+    fn notify(&mut self, msg: &str) {
+        self.toast = Some((msg.to_owned(), Instant::now()));
     }
-    fn pick(&mut self, x: i32, y: i32) -> Option<Action> {
-        if y < 32 {
+    /// 工具栏占用高度（下拉面板在其上方，不在这高度里）。
+    fn bar_h(&self) -> i32 {
+        if self.toolbar_open { 40 } else { 0 }
+    }
+    /// 命中判定：底部工具栏条 或 下拉面板选项区。
+    fn hit_menu(&self, x: i32, y: i32, wh: u32) -> bool {
+        let h = self.bar_h();
+        if h > 0 && y >= wh as i32 - h { return true; }
+        self.option_rects.iter().any(|(r, _)| r.contains_point(Point::new(x, y)))
+    }
+    fn pick(&mut self, x: i32, y: i32, wh: u32) -> Option<Action> {
+        let h = self.bar_h();
+        if h > 0 && y >= wh as i32 - h {
             if let Some(i) = self.rects.iter().position(|r| r.contains_point(Point::new(x, y))) {
                 self.panel = if self.panel == Some(i) { None } else { Some(i) };
             } else {
@@ -899,60 +941,113 @@ impl Ui {
         if action.is_some() { self.panel = None; }
         action
     }
-    fn draw(&mut self, canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, width: u32) {
-        canvas.set_draw_color(Color::RGBA(18, 18, 22, 230));
-        canvas.fill_rect(Rect::new(0, 0, width, 32)).ok();
-        let buttons: Vec<String> = vec![
-            format!("画质 {}", self.quality_label),
-            self.fps_label.clone(),
-            format!("分辨率 {}", self.res_label),
-            self.chroma_label.clone(),
-            if self.sound_on { "声音 开".into() } else { "声音 关".into() },
-            if self.fullscreen { "退出全屏".into() } else { "全屏".into() },
-            "断开".into(),
-        ];
+    fn options(&self, i: usize) -> Vec<(String, Action)> {
+        match i {
+            0 => vec![("自动".into(), Action::Quality(5)), ("原画 30M".into(), Action::Quality(4)), ("超清 14M".into(), Action::Quality(3)), ("高清 8M".into(), Action::Quality(2)), ("流畅".into(), Action::Quality(1))],
+            1 => vec![("真彩".into(), Action::Chroma(3)), ("常规色彩".into(), Action::Chroma(1))],
+            2 => vec![("帧率上限 30".into(), Action::Fps(1)), ("帧率上限 60".into(), Action::Fps(2)), ("帧率上限 90".into(), Action::Fps(3)), ("帧率上限 144".into(), Action::Fps(4))],
+            3 => vec![("跟随被控端".into(), Action::Resolution(None)), ("2K 2560×1440".into(), Action::Resolution(Some((2560, 1440)))), ("1080P".into(), Action::Resolution(Some((1920, 1080)))), ("720P".into(), Action::Resolution(Some((1280, 720))))],
+            4 => MOUSE_MODES.iter().enumerate().map(|(m, s)| (s.to_string(), Action::MouseMode(m as i32))).collect(),
+            5 => vec![("开".into(), Action::Sound), ("关".into(), Action::Sound)],
+            6 => vec![("启用观看模式".into(), Action::ViewOnly)],
+            7 => vec![("全屏/退出全屏".into(), Action::Fullscreen)],
+            8 => vec![("隐藏工具栏".into(), Action::ToggleToolbar)],
+            _ => vec![("断开连接".into(), Action::Quit)],
+        }
+    }
+    /// 工具栏图标槽位（与 buttons 一一对应）。
+    fn icon_for(i: usize) -> &'static [u8] {
+        match i {
+            0 => icons::MONITOR,     // 画质
+            1 => icons::GEAR,        // 色彩
+            2 => icons::SPEED,       // 帧率
+            3 => icons::MONITOR,     // 分辨率
+            4 => icons::MOUSE,       // 鼠标模式
+            5 => icons::SPEAKER,     // 声音
+            6 => icons::EYE,         // 观看模式
+            7 => icons::EXPAND,      // 全屏
+            8 => icons::BALL,        // 悬浮球/工具栏
+            _ => icons::CLOSE,       // 断开
+        }
+    }
+    fn draw(&mut self, canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, width: u32, height: u32) {
+        let h = self.bar_h();
         self.rects.clear();
         self.option_rects.clear();
-        let mut x = 10i32;
-        for (i, label) in buttons.iter().enumerate() {
-            if let Some(tex) = text_texture(creator, font, label, Color::RGB(235, 235, 235)) {
-                let q = tex.query();
-                let w = q.width as i32 + 18;
-                let r = Rect::new(x, 4, w as u32, 24);
+        if h > 0 {
+            let by = height as i32 - h;
+            canvas.set_draw_color(Color::RGBA(20, 22, 28, 235));
+            canvas.fill_rect(Rect::new(0, by, width, h as u32)).ok();
+            let buttons: Vec<String> = vec![
+                format!("画质 {}", self.quality_label),
+                self.chroma_label.clone(),
+                self.fps_label.clone(),
+                format!("分辨率 {}", self.res_label),
+                MOUSE_MODES[self.mouse_mode as usize].to_owned(),
+                if self.sound_on { "声音 开".into() } else { "声音 关".into() },
+                if self.view_only { "观看模式".into() } else { "操控模式".into() },
+                if self.fullscreen { "退出全屏".into() } else { "全屏".into() },
+                "工具栏".into(),
+                "断开".into(),
+            ];
+            let mut x = 8i32;
+            for (i, label) in buttons.iter().enumerate() {
+                let tex = text_texture(creator, font, label, Color::RGB(235, 235, 235));
+                let tw = tex.as_ref().map(|t| t.query().width as i32).unwrap_or(70);
+                let w = tw + 30;
+                let r = Rect::new(x, by + 6, w as u32, (h - 12) as u32);
                 if self.panel == Some(i) {
-                    canvas.set_draw_color(Color::RGBA(80, 120, 220, 230));
+                    canvas.set_draw_color(Color::RGBA(80, 120, 220, 235));
                     canvas.fill_rect(r).ok();
                 }
-                canvas.copy(&tex, None, Rect::new(x + 9, 8, q.width, q.height)).ok();
+                if let Some(tex) = icon_texture(creator, Ui::icon_for(i)) { canvas.copy(&tex, None, Rect::new(x + 6, by + 12, 16, 16)).ok(); }
+                if let Some(tex) = tex { canvas.copy(&tex, None, Rect::new(x + 26, by + 12, tex.query().width, tex.query().height)).ok(); }
                 self.rects.push(r);
-                x += w + 6;
-            } else {
-                self.rects.push(Rect::new(x, 4, 90, 24));
-                x += 96;
+                x += w + 4;
             }
         }
         if let Some(i) = self.panel {
-            let options: Vec<(String, Action)> = match i {
-                0 => vec![("自动".into(), Action::Quality(5)), ("流畅".into(), Action::Quality(1)), ("高清".into(), Action::Quality(2)), ("超清".into(), Action::Quality(3)), ("原画".into(), Action::Quality(4))],
-                1 => vec![("30 帧".into(), Action::Fps(1)), ("60 帧".into(), Action::Fps(2)), ("90 帧".into(), Action::Fps(3)), ("144 帧".into(), Action::Fps(4))],
-                2 => vec![("跟随被控端".into(), Action::Resolution(None)), ("2K 2560×1440".into(), Action::Resolution(Some((2560, 1440)))), ("1080P".into(), Action::Resolution(Some((1920, 1080)))), ("720P".into(), Action::Resolution(Some((1280, 720))))],
-                3 => vec![("关".into(), Action::Chroma(1)), ("开".into(), Action::Chroma(3))],
-                4 => vec![("开".into(), Action::Sound), ("关".into(), Action::Sound)],
-                5 => vec![("切换".into(), Action::Fullscreen)],
-                _ => vec![("断开连接".into(), Action::Quit)],
-            };
-            let bx = self.rects.get(i).map(|r| r.x()).unwrap_or(10);
-            canvas.set_draw_color(Color::RGBA(24, 24, 30, 245));
-            canvas.fill_rect(Rect::new(bx, 32, 190, (options.len() as u32) * 26 + 6)).ok();
+            let options = self.options(i);
+            let bx = self.rects.get(i).map(|r| r.x()).unwrap_or(10).min(width as i32 - 200);
+            let ph = (options.len() as u32) * 26 + 8;
+            let py = height as i32 - h - ph as i32 - 2;
+            canvas.set_draw_color(Color::RGBA(28, 30, 36, 246));
+            canvas.fill_rect(Rect::new(bx, py, 200, ph)).ok();
             for (j, (label, action)) in options.iter().enumerate() {
-                let r = Rect::new(bx + 4, 35 + (j as i32) * 26, 182, 24);
-                canvas.set_draw_color(Color::RGBA(40, 44, 54, 245));
+                let r = Rect::new(bx + 4, py + 4 + (j as i32) * 26, 192, 24);
+                canvas.set_draw_color(Color::RGBA(44, 48, 58, 246));
                 canvas.fill_rect(r).ok();
                 if let Some(tex) = text_texture(creator, font, label, Color::RGB(235, 235, 235)) {
-                    let q = tex.query();
-                    canvas.copy(&tex, None, Rect::new(r.x() + 8, r.y() + 4, q.width, q.height)).ok();
+                    canvas.copy(&tex, None, Rect::new(r.x() + 10, r.y() + 4, tex.query().width, tex.query().height)).ok();
                 }
                 self.option_rects.push((r, *action));
+            }
+        }
+        // 左上 HUD：官方「帧率：/带宽占用：」两行 + frm/延迟。
+        if !self.hud.is_empty() {
+            let mut y = 8i32;
+            for line in &self.hud {
+                if let Some(tex) = text_texture(creator, font, line, Color::RGB(235, 235, 235)) {
+                    let q = tex.query();
+                    canvas.set_draw_color(Color::RGBA(15, 15, 18, 170));
+                    canvas.fill_rect(Rect::new(6, y - 4, q.width + 12, q.height + 8)).ok();
+                    canvas.copy(&tex, None, Rect::new(12, y, q.width, q.height)).ok();
+                    y += q.height as i32 + 4;
+                }
+            }
+        }
+        // Toast（降档/延迟高/观看模式提示）：居中偏上，4 秒消失。
+        if let Some((msg, since)) = self.toast.clone() {
+            if since.elapsed() < Duration::from_secs(4) {
+                if let Some(tex) = text_texture(creator, font, &msg, Color::RGB(255, 245, 230)) {
+                    let q = tex.query();
+                    let tx = (width as i32 - q.width as i32) / 2;
+                    canvas.set_draw_color(Color::RGBA(60, 55, 45, 220));
+                    canvas.fill_rect(Rect::new(tx - 14, 46, q.width + 28, q.height + 16)).ok();
+                    canvas.copy(&tex, None, Rect::new(tx, 54, q.width, q.height)).ok();
+                }
+            } else {
+                self.toast = None;
             }
         }
     }
@@ -961,10 +1056,26 @@ impl Ui {
 fn quality_name(q: u64) -> &'static str {
     match q {
         5 => "自动",
-        1 => "流畅",
-        2 => "高清",
-        3 => "超清",
         4 => "原画",
+        3 => "超清",
+        2 => "高清",
+        1 => "流畅",
         _ => "自动",
     }
+}
+
+/// 把内嵌的官方图标 PNG（白色 alpha）解成 SDL 纹理；每次新建（图标小、无缓存必要）。
+fn icon_texture<'a>(creator: &'a TextureCreator<WindowContext>, png: &[u8]) -> Option<Texture<'a>> {
+    let img = linux_uuremote::viewer::png::decode(png).ok()?;
+    let mut tex = creator.create_texture(PixelFormatEnum::RGBA32, sdl2::render::TextureAccess::Streaming, img.width, img.height).ok()?;
+    let pitch = img.width as usize * 4;
+    let rgba = img.rgba;
+    tex.with_lock(None, |buf, bp| {
+        for row in 0..img.height as usize {
+            buf[row * bp..row * bp + pitch].copy_from_slice(&rgba[row * pitch..row * pitch + pitch]);
+        }
+        Ok::<(), String>(())
+    })
+    .ok()?;
+    Some(tex)
 }

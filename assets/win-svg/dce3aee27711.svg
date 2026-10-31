@@ -1,0 +1,11 @@
+<svg width="60" height="60" viewBox="0 0 60 60" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M29 48H13C11.8954 48 11 47.1046 11 46C11 44.8954 11.8954 44 13 44H29V48ZM43 10C46.3137 10 49 12.6863 49 16V17.084C48.6747 17.0294 48.3408 17 48 17H35C31.6863 17 29 19.6863 29 23V40H9C5.68629 40 3 37.3137 3 34V16C3 12.6863 5.68629 10 9 10H43Z" fill="#ADD2FF"/>
+<foreignObject x="0" y="0" width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="backdrop-filter:blur(2.5px);clip-path:url(#bgblur_0_26029_37052_clip_path);height:100%;width:100%"></div></foreignObject><path data-figma-bg-blur-radius="5" d="M48 19C50.2091 19 52 20.7909 52 23V49C52 51.2091 50.2091 53 48 53H35C32.7909 53 31 51.2091 31 49V23C31 20.7909 32.7909 19 35 19H48ZM39 47C38.4477 47 38 47.4477 38 48C38 48.5523 38.4477 49 39 49H44C44.5523 49 45 48.5523 45 48C45 47.4477 44.5523 47 44 47H39Z" fill="url(#paint0_linear_26029_37052)"/>
+<defs>
+<clipPath id="bgblur_0_26029_37052_clip_path" transform="translate(0 0)"><path d="M48 19C50.2091 19 52 20.7909 52 23V49C52 51.2091 50.2091 53 48 53H35C32.7909 53 31 51.2091 31 49V23C31 20.7909 32.7909 19 35 19H48ZM39 47C38.4477 47 38 47.4477 38 48C38 48.5523 38.4477 49 39 49H44C44.5523 49 45 48.5523 45 48C45 47.4477 44.5523 47 44 47H39Z"/>
+</clipPath><linearGradient id="paint0_linear_26029_37052" x1="42.375" y1="53" x2="40.9114" y2="19.0505" gradientUnits="userSpaceOnUse">
+<stop stop-color="#267DFF"/>
+<stop offset="1" stop-color="#3292FF"/>
+</linearGradient>
+</defs>
+</svg>
