@@ -144,7 +144,10 @@ impl NvencH264 {
             } else {
                 ["-profile:v", "high", "-pix_fmt", "yuv420p"].as_slice()
             })
-            .args(["-g", &format!("{}", (fps.max(1) * 2).max(2))])
+            // 官方静态页恒 2M 无尖峰 = 稳态没有周期 IDR（逆向实锤：vbr+cq 只在会话
+            // 首帧出一个 IDR）。-g 拉到 1000s 量级：稳态不再有 538KB 关键帧尖峰，
+            // 带宽交给地板 padding 拉平；帧率与 CQP 画质不受影响。
+            .args(["-g", "100000"])
             // 质量优先：vbr + cq，码率只当上限（target = 3/4 上限，留突发余量）。
             .args([
                 "-rc", "vbr",
