@@ -972,6 +972,7 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
         while let Ok(cursor) = cursor_rx.try_recv() {
             match texture_creator.create_texture(PixelFormatEnum::RGBA32, sdl2::render::TextureAccess::Streaming, cursor.width, cursor.height) {
                 Ok(mut tex) => {
+                    tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                     let pitch = cursor.width as usize * 4;
                     let rgba = cursor.rgba.clone();
                     tex.with_lock(None, |buffer, bpitch| {
@@ -1427,6 +1428,8 @@ fn quality_name(q: u64) -> &'static str {
 fn icon_texture<'a>(creator: &'a TextureCreator<WindowContext>, png: &[u8]) -> Option<Texture<'a>> {
     let img = linux_uuremote::viewer::png::decode(png).ok()?;
     let mut tex = creator.create_texture(PixelFormatEnum::RGBA32, sdl2::render::TextureAccess::Streaming, img.width, img.height).ok()?;
+    // SDL 纹理默认不混合 alpha——不打开 Blend 的话透明像素按不透明黑渲染，图标就是一块黑底。
+    tex.set_blend_mode(sdl2::render::BlendMode::Blend);
     let pitch = img.width as usize * 4;
     let rgba = img.rgba;
     tex.with_lock(None, |buf, bp| {
