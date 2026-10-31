@@ -51,7 +51,7 @@ const INK: Color = Color::RGB(96, 101, 104);        // 图标/正文笔画实测
 const TEXT_DARK: Color = Color::RGB(98, 100, 102);  // 设备名笔画实测
 const TEXT_MUT: Color = Color::RGB(104, 103, 106);  // 胶囊文字实测
 const TOPBAR_H: i32 = 40;
-const SIDE_W: i32 = 242;                            // 官方侧栏宽度实测
+const SIDE_W: i32 = 280;                            // 官方侧栏宽度实测
 
 
 fn main() {
@@ -129,7 +129,7 @@ fn main() {
     }
 
     // ---- 主页 ----
-    let mut canvas = video.window("网易UU远程", 980, 640).position_centered().resizable().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    let mut canvas = video.window("网易UU远程", 1280, 800).position_centered().resizable().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
     canvas.window_mut().set_bordered(false);
     set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
@@ -441,13 +441,13 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         (icons::TOP_CLOSE, HomeAction::Close),
     ];
     for (i, (png, action)) in topbar.iter().enumerate() {
-        let r = Rect::new(ww as i32 - 6 - (6 - i as i32) * 36, (TOPBAR_H - 30) / 2, 34, 30);
+        let r = Rect::new(ww as i32 - 8 - (6 - i as i32) * 40, (TOPBAR_H - 32) / 2, 38, 32);
         if r.contains_point(Point::new(mx, my)) {
             canvas.set_draw_color(SELECTED);
             canvas.fill_rect(r).ok();
         }
         if let Some(tex) = icon_texture(creator, png) {
-            canvas.copy(&tex, None, Rect::new(r.x() + (34 - 20) / 2, r.y() + (30 - 20) / 2, 20, 20)).ok();
+            canvas.copy(&tex, None, Rect::new(r.x() + (38 - 24) / 2, r.y() + (32 - 24) / 2, 24, 24)).ok();
         }
         home.hit_map.push((r, action.clone()));
     }
@@ -480,7 +480,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
             dot(canvas, 20, y + 18, if d.online { GREEN } else { Color::RGB(176, 180, 183) });
             let icon = if d.online { icons::HOME_MONITOR_ON } else { icons::HOME_MONITOR_OFF };
             if let Some(tex) = icon_texture(creator, icon) {
-                canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
+                canvas.copy(&tex, None, Rect::new(32, y + 7, 22, 22)).ok();
             }
             text(canvas, creator, font, cache, &d.alias, 58, y + 10, TEXT_DARK);
             home.hit_map.push((r, HomeAction::Select(i)));
@@ -490,7 +490,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         let r_all = Rect::new(0, y, SIDE_W as u32, 36);
         if r_all.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_all).ok(); }
         if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
-            canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
+            canvas.copy(&tex, None, Rect::new(32, y + 7, 22, 22)).ok();
         }
         text(canvas, creator, font, cache, "全部设备", 58, y + 10, TEXT_DARK);
         home.hit_map.push((r_all, HomeAction::Stub("全部设备".into())));
@@ -506,7 +506,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
             let r = Rect::new(0, y, SIDE_W as u32, 36);
             if r.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r).ok(); }
             if let Some(tex) = icon_texture(creator, icon) {
-                canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
+                canvas.copy(&tex, None, Rect::new(32, y + 7, 22, 22)).ok();
             }
             text(canvas, creator, font, cache, label, 58, y + 10, TEXT_DARK);
             home.hit_map.push((r, act));
@@ -516,7 +516,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     let r_set = Rect::new(0, wh as i32 - 42, SIDE_W as u32, 36);
     if r_set.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_set).ok(); }
     if let Some(tex) = icon_texture(creator, icons::HOME_GEAR) {
-        canvas.copy(&tex, None, Rect::new(32, wh as i32 - 32, 17, 17)).ok();
+        canvas.copy(&tex, None, Rect::new(32, wh as i32 - 33, 22, 22)).ok();
     }
     text(canvas, creator, font, cache, "设置", 58, wh as i32 - 32, TEXT_DARK);
     home.hit_map.push((r_set, HomeAction::Stub("设置".into())));
@@ -579,7 +579,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         }
 
         // 操作条卡片：图标在上文字在下，按钮间细分隔线，最右四宫格。
-        let band = Rect::new(mx, card_top + preview_h as i32 + 10, cw, 64);
+        let band = Rect::new(mx, card_top + preview_h as i32 + 10, cw, 72);
         card(canvas, band, CARD_BG, MAIN_BG, 7, Some(CARD_BORDER));
         let feats: Vec<(&[u8], String, HomeAction, bool)> = vec![
             (icons::HOME_FOLDER, "文件传输".into(), HomeAction::Stub("文件传输".into()), true),
@@ -598,16 +598,16 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
             let ccx = cx0 + cell / 2;
             if let Some(mut tex) = icon_texture(creator, icon) {
                 if !enabled { tex.set_color_mod(200, 204, 209); }
-                canvas.copy(&tex, None, Rect::new(ccx - 11, band.y() + 8, 22, 22)).ok();
+                canvas.copy(&tex, None, Rect::new(ccx - 14, band.y() + 6, 28, 28)).ok();
             }
-            text(canvas, creator, font, cache, &label, ccx - 28, band.y() + 38, if enabled { TEXT_DARK } else { Color::RGB(190, 194, 199) });
+            text(canvas, creator, font, cache, &label, ccx - 30, band.y() + 42, if enabled { TEXT_DARK } else { Color::RGB(190, 194, 199) });
             if enabled { home.hit_map.push((Rect::new(cx0, band.y(), cell as u32, band.height()), action)); }
         }
         let gx = band.x() + (n as i32 - 1) * cell;
         canvas.set_draw_color(SEP);
         canvas.fill_rect(Rect::new(gx, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
         if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
-            canvas.copy(&tex, None, Rect::new(gx + cell / 2 - 11, band.y() + 21, 22, 22)).ok();
+            canvas.copy(&tex, None, Rect::new(gx + cell / 2 - 14, band.y() + 18, 28, 28)).ok();
         }
         home.hit_map.push((Rect::new(gx, band.y(), (band.x() + band.width() as i32 - gx) as u32, band.height()), HomeAction::Stub("快捷工具".into())));
 
@@ -689,7 +689,7 @@ fn text<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a
     let Some(font) = font else { return };
     let key = format!("{s}|{}|{}|{}", color.r, color.g, color.b);
     if !cache.contains_key(&key) {
-        if let Some(tex) = font.render(s).solid(color).ok().and_then(|surf| creator.create_texture_from_surface(&surf).ok()) { cache.insert(key.clone(), tex); }
+        if let Some(tex) = font.render(s).blended(color).ok().and_then(|surf| creator.create_texture_from_surface(&surf).ok()) { cache.insert(key.clone(), tex); }
     }
     if let Some(tex) = cache.get(&key) {
         let q = tex.query();
@@ -700,7 +700,7 @@ fn text_center<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creat
     let Some(font) = font else { return };
     let key = format!("{s}|{}|{}|{}", color.r, color.g, color.b);
     if !cache.contains_key(&key) {
-        if let Some(tex) = font.render(s).solid(color).ok().and_then(|surf| creator.create_texture_from_surface(&surf).ok()) { cache.insert(key.clone(), tex); }
+        if let Some(tex) = font.render(s).blended(color).ok().and_then(|surf| creator.create_texture_from_surface(&surf).ok()) { cache.insert(key.clone(), tex); }
     }
     if let Some(tex) = cache.get(&key) {
         let q = tex.query();
@@ -1109,7 +1109,7 @@ fn run_home_preview(snap: Option<&str>) {
     let sdl = sdl2::init().expect("SDL 初始化失败");
     let video = sdl.video().expect("视频子系统失败");
     let font = load_font();
-    let mut canvas = video.window("UU 远程 · 主页预览", 1100, 700).position_centered().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    let mut canvas = video.window("UU 远程 · 主页预览", 1280, 800).position_centered().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
     set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
     let mut home = Home::new(true);
@@ -1190,8 +1190,8 @@ fn load_font() -> Option<sdl2::ttf::Font<'static, 'static>> {
     ];
     for (path, index) in candidates {
         let font = match index {
-            Some(i) => ctx.load_font_at_index(path, i, 15),
-            None => ctx.load_font(path, 15),
+            Some(i) => ctx.load_font_at_index(path, i, 16),
+            None => ctx.load_font(path, 16),
         };
         if let Ok(font) = font { return Some(font); }
     }
@@ -1200,7 +1200,7 @@ fn load_font() -> Option<sdl2::ttf::Font<'static, 'static>> {
 
 fn text_texture<'a>(creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, text: &str, color: Color) -> Option<Texture<'a>> {
     let font = font?;
-    let surface = font.render(text).solid(color).ok()?;
+    let surface = font.render(text).blended(color).ok()?;
     creator.create_texture_from_surface(&surface).ok()
 }
 
