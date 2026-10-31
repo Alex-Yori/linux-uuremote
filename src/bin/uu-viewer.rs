@@ -163,22 +163,32 @@ fn main() {
 
     let mut event_pump = sdl.event_pump().expect("事件泵");
     let xconn = x_connect();
+    let mut last_move: Option<(i32, i32)> = None;
+    let mut drag_cookie: Option<x11rb::cookie::Cookie<'_, x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::QueryPointerReply>> = None;
     'home: loop {
         // 拖动帧：每轮用 X 服务器指针真值驱动搬窗（SDL 事件出界即断，X 查询不受限），松键自动收尾。
+        // 拖动期间不重绘（内容不变，mutter 直接搬已渲染缓冲），循环全速跑 → 跟手不掉帧。
         if home.drag.is_some() {
-            match x_query(&xconn) {
-                Some((gx, gy, down)) => {
-                    if !down { home.drag = None; }
-                    else {
-                        let (gx0, gy0, px0, py0) = home.drag.unwrap();
-                        let (nx, ny) = (px0 + gx - gx0, py0 + gy - gy0);
-                        if std::env::var_os("UU_DRAG_DEBUG").is_some() { eprintln!("drag: root=({gx},{gy}) -> win=({nx},{ny})"); }
+            // 流水线：收上一帧预发的指针回复 → 搬窗 → 立刻预发下一帧。X 往返不阻塞循环，拖动期间不重绘。
+            if let Some(r) = drag_cookie.take().and_then(|c| c.reply().ok()) {
+                use x11rb::protocol::xproto::KeyButMask;
+                let down = u16::from(KeyButMask::BUTTON1) & u16::from(r.mask) != 0;
+                if !down { home.drag = None; last_move = None; }
+                else {
+                    let (gx0, gy0, px0, py0) = home.drag.unwrap();
+                    let (nx, ny) = (px0 + r.root_x as i32 - gx0, py0 + r.root_y as i32 - gy0);
+                    if last_move != Some((nx, ny)) {
+                        last_move = Some((nx, ny));
+                        if std::env::var_os("UU_DRAG_DEBUG").is_some() { eprintln!("drag: root=({},{}) -> win=({nx},{ny})", r.root_x, r.root_y); }
                         canvas.window_mut().set_position(WindowPos::Positioned(nx), WindowPos::Positioned(ny));
                     }
                 }
-                None => {}
             }
+            if home.drag.is_some() { drag_cookie = x_query_send(&xconn); }
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
         }
+        last_move = None;
         while let Some(event) = event_pump.poll_event() {
             match event {
                 Event::Quit { .. } => break 'home,
@@ -663,6 +673,15 @@ fn x_query(c: &XConn) -> Option<(i32, i32, bool)> {
     Some((r.root_x as i32, r.root_y as i32, down))
 }
 
+
+/// 异步预发 XQueryPointer（不阻塞），下一帧收回复——拖动循环把它当采样器用。
+fn x_query_send(c: &XConn) -> Option<x11rb::cookie::Cookie<'_, x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::QueryPointerReply>> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let (conn, screen) = c.as_ref()?;
+    let root = conn.setup().roots[*screen].root;
+    conn.query_pointer(root).ok()
+}
 fn lerp(a: i32, b: i32, t: f64) -> i32 { (a as f64 + (b - a) as f64 * t) as i32 }
 
 /// 渲染文本缓存；缺字体时静默（形状仍然可见）。
