@@ -486,6 +486,11 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                                 "app_control_id": app_control_id,
                             });
                             emit_tx.send(("soac".to_string(), Some(payload))).ok();
+                            if std::env::var("UU_HOST_DEBUG").is_ok() {
+                                // 把 answer SDP 原文落盘：与 fork 的 answer 逐行 diff，
+                                // 查 SCTP/数据通道谈不拢的现场（setup/sctp-port/ bundle）。
+                                let _ = std::fs::write(format!("{}/.cache/uuremote/answer-last.sdp", std::env::var("HOME").unwrap_or_default()), &answer);
+                            }
                             session.answered = true;
                             session.t_answer = Some(std::time::Instant::now());
                             hostlog::log(&format!(
