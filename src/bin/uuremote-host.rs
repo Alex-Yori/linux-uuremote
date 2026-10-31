@@ -331,6 +331,10 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
     let settings = Arc::new(RemoteSettings::new(fps, still_fps));
     let mut session: Option<Session> = None;
     let mut early_candidates: Vec<(String, Option<String>, Option<u16>)> = Vec::new();
+    // be-controlled 登记的待用请求（capture_type + 本次会议的 ICE header），offer 到达时取最新一条建会话。
+    let mut pending_requests: Vec<(u64, Value)> = Vec::new();
+    // 本轮第一条 be-controlled 的时刻（客户端重试不算新一轮计时起点，量的是客户端收集耗时）。
+    let mut t_request: Option<std::time::Instant> = None;
     // offer 看门狗：be-controlled 到后只等到 candidate 而 offer 迟迟不来 = 云端
     // 路由卡死（2026-10-30 20:50 实测：13 条 candidate 全到、offer 一条没有，
     // 客户端 12s 超时重连才通）。到点主动重连信令，把房间重新注册一遍。
@@ -356,7 +360,7 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
             }
             _ = tokio::time::sleep_until(offer_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if offer_deadline.is_some()
-                    && session.as_ref().is_some_and(|s| !s.answered)
+                    && session.as_ref().map_or(true, |s| !s.answered)
                     && last_signal_at.elapsed() >= Duration::from_secs(5) =>
             {
                 hostlog::log(
@@ -373,7 +377,14 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     println!("   room_info ack ✓：iceServers {} 台", ice_servers_from_json(&v).len());
                 }
                 Some(Signal::BeControlled { header, capture_type, options }) => {
-                    hostlog::log(&format!("收到拉流请求（capture_type={capture_type}）"));
+                    if pending_requests.is_empty() {
+                        t_request = Some(std::time::Instant::now());
+                    }
+                    hostlog::log(&format!(
+                        "收到拉流请求（capture_type={capture_type}），登记等 offer（本轮已重试 {} 次，攒客户端 candidate {} 条）",
+                        pending_requests.len(),
+                        early_candidates.len()
+                    ));
                     // 官方 ConnectOptions 带来客户端的初始采集设置与解码能力：
                     // 先按它设初值（客户端 UI 上显示的就是这些），再拿解码能力与自身
                     // 编码能力求交——真彩/帧率上限都由这个交集决定，不是宿主单方面声明。
@@ -410,30 +421,35 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     SOAC_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
                     offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(20));
                     last_signal_at = tokio::time::Instant::now();
-                    // 客户端在等自己的 ICE 收集，超过超时就重发 be-controlled。只要
-                    // ice_id 还是同一个会议，就复用现有 PeerConnection：ufrag 不变，
-                    // 它发来的 remote candidate 与我们的 srflx/relay 收集成果都还有效。
-                    // be-controlled header 不带 ice_id（只在 soac offer/candidate 里），
-                    // 所以复用判据 = 还没 answer、也还没收到过 offer：即客户端还在自己的
-                    // ICE 收集阶段重试，会议还是同一个。
-                    // 真复用：还在收集阶段的重试不再建第二个 PeerConnection。
-                    // 之前这里只是「不拆旧的」，但还是无条件 Peer::new → 每次重试都泄一个
-                    // PC（TURN 分配 + mux 端点全留着），而 answer 出自最后那个新 PC，
-                    // 客户端在我们好几个 ufrag 之间挑候选 → SCTP INIT 永远没人回
-                    // （实测 09:28 会话：DTLS 连上、RTCP 双向通，5 分钟后 SCTP
-                    // retransmission failure → 黑屏）。
-                    let reuse = session.as_ref().is_some_and(|s| !s.answered && !s.saw_offer);
-                    if reuse {
-                        hostlog::log(&format!(
-                            "be-controlled 重试 → 复用同一个 PeerConnection（ufrag 不变，已攒客户端 candidate {} 条）",
-                            early_candidates.len()
-                        ));
-                    } else {
-                        // 新会议才拆旧会话：ICE 配置属于这一次会议，不能复用上一条。
+                    // fork 模型：be-controlled 只登记这次请求，等 offer 再建会话。
+                    // 不提前建 PeerConnection —— pion 的 ICE 收集要到 set_local_description
+                    // 才开始，提前建一个 PC 攒不了任何 candidate（实测 09:48 一轮：提前建的
+                    // PC 一条本地 candidate 都没产出，客户端干等 108 秒换 9 个 ice_id 重试），
+                    // 反而泄 TURN 分配、且复用旧 ufrag 与新会议对不上（09:49 offer 的
+                    // ice_id 与本会话不同 → SCTP INIT 没人回 → 黑屏）。
+                    if pending_requests.len() >= 32 {
+                        pending_requests.clear();
+                    }
+                    pending_requests.push((capture_type, header));
+                }
+                Some(Signal::Offer { sdp, ice_id, client_id, app_control_id }) => {
+                    last_signal_at = tokio::time::Instant::now();
+                    offer_deadline = None;
+                    // fork 模型：offer 才是权威（带本次会议的 ice_id/client_id），
+                    // 到这一步才建 PeerConnection —— answer 一 set_local_description，
+                    // ICE 收集立刻开始并 trickle 出去。
+                    if session.as_ref().is_some_and(|s| s.saw_offer) {
+                        // 同一信令连接上的第二个 offer = 客户端换了会议，拆旧建新。
+                        hostlog::log("第二个 offer 到达（客户端换新会议）→ 拆旧会话重建");
                         if let Some(old) = session.take() {
                             stop_session(old).await;
                         }
-                        let config = match ice_configuration(&header) {
+                    }
+                    if session.is_none() {
+                        let t0 = t_request.take().unwrap_or_else(std::time::Instant::now);
+                        let (_req_capture_type, req_header) = pending_requests.pop().unwrap_or((1, json!({})));
+                        pending_requests.clear();
+                        let config = match ice_configuration(&req_header) {
                             Ok(config) => config,
                             Err(e) => {
                                 eprintln!("   这次会议连不上：{e}");
@@ -441,27 +457,17 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                             }
                         };
                         match Peer::new(config, peer_tx.clone()).await {
-                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), local_candidates: Vec::new(), sent_under: None, video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
-                            Err(e) => eprintln!("   建会话失败：{e}"),
+                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), local_candidates: Vec::new(), sent_under: None, video_abort: None, shape_abort: None, t_be_controlled: t0, t_answer: None }),
+                            Err(e) => { eprintln!("   建会话失败：{e}"); continue; }
                         }
                     }
-                }
-                Some(Signal::Offer { sdp, ice_id, client_id, app_control_id }) => {
-                    last_signal_at = tokio::time::Instant::now();
-                    offer_deadline = None;
-                    let Some(session) = session.as_mut() else {
-                        println!("   soac offer 在没有会话时到达，忽略");
-                        continue;
-                    };
+                    let session = session.as_mut().expect("session just created");
                     hostlog::log(&format!(
                         "offer 到达（be-controlled 起累计 {} ms，SDP {} 字节）",
                         session.t_be_controlled.elapsed().as_millis(),
                         sdp.len()
                     ));
                     session.saw_offer = true;
-                    if session.ice_id.is_some() && session.ice_id != ice_id {
-                        hostlog::log("⚠ offer 的 ice_id 与本会话不同（客户端开了新会议），answer 可能对不上 ufrag");
-                    }
                     session.ice_id = ice_id.clone();
                     session.route = json!({ "ice_id": ice_id, "client_id": client_id, "app_control_id": app_control_id });
                     // offer 一到就补发攒下的本地 candidate，不等 answer：客户端越早拿到
@@ -501,24 +507,9 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 Some(Signal::Candidate { candidate, sdp_mid, sdp_mline_index, ice_id, client_id, app_control_id }) => {
                     // 信令还活着（有 candidate 在流）→ 看门狗不该动手。
                     last_signal_at = tokio::time::Instant::now();
-                    // 首连慢的关键一环：客户端的 candidate 比 offer 先到，而消息里带着本次会议的
-                    // ice_id/app_control_id。此前我们只在 offer 时才记 route，于是这之前自己
-                    // trickle 出去的 candidate 全是 ice_id=null → 客户端对不上号 → 一直等 →
-                    // 十几秒后放弃重来。提前采纳路由，并把已收集的本地 candidate 补发一遍。
-                    if let Some(session) = session.as_mut() {
-                        let same = session.route.get("ice_id").and_then(Value::as_str).is_some()
-                            && session.route.get("ice_id") == ice_id.as_ref();
-                        if !same && ice_id.is_some() {
-                            session.route = json!({
-                                "ice_id": ice_id,
-                                "client_id": client_id.clone(),
-                                "app_control_id": app_control_id,
-                            });
-                            session.ice_id = Some(session.route.get("ice_id").cloned().unwrap_or(Value::Null));
-                            hostlog::log(&format!("采纳会议路由（来自 candidate，早于 offer）：{}", session.route));
-                            flush_local_candidates(session, &emit_tx).await;
-                        }
-                    }
+                    // fork 模型：会议路由只认 offer 里的那份（candidate 带的 ice_id 每轮重试
+                    // 都会变，采纳它会跟着客户端抖）。offer 之前的 candidate 只攒不答。
+                    let _ = (ice_id, client_id, app_control_id);
                     // 客户端的 trickle candidate 常常比 offer 先到；这时 add 会报
                     // "remote description is not set"，白丢一批，连接就慢一步。先攒着。
                     if session.as_ref().is_some_and(|s| s.answered) {
@@ -538,16 +529,12 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 Some(Signal::PeerLeft) => {
                     offer_deadline = None;
                     linux_uuremote::virtual_audio::disable();
-                    // 还没谈定的「离开」不拆会话：客户端在 ICE 收集阶段离开房间又立刻重进，
-                    // 拆掉就等于换 ufrag + 重新 TURN 分配，它攒的 candidate 全作废 →
-                    // 十几秒一轮的死循环。保留的条件是「还没 answer 也没见过 offer」，
-                    // 并且挂 15 s 期限，不白占 TURN 分配。
-                    let keep = session.as_ref().is_some_and(|s| !s.answered && !s.saw_offer);
-                    if keep {
-                        hostlog::log("对端离开但还没谈定 → 保留同一个 PeerConnection（ufrag 不变，等它重进）");
-                        offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
-                        println!("   对端离开（未谈定，保留会话等重进）");
+                    // fork 模型：offer 前没有会话可拆；有会话（已谈定）就正常关。
+                    if pending_requests.is_empty() && session.is_none() {
+                        hostlog::log("对端离开（无会话，仅清待用请求）");
                     } else {
+                        pending_requests.clear();
+                        t_request = None;
                         println!("   对端离开，关会话");
                         if let Some(session) = session.take() {
                             stop_session(session).await;
