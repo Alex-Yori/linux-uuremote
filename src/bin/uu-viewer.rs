@@ -387,13 +387,6 @@ fn vdots(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, cx: i32, cy: i3
     circle(canvas, cx, cy + 6, 2, c);
 }
 
-/// 着色图标（白底剪影 PNG × color modulate）。
-fn tinted_icon<'a>(creator: &'a TextureCreator<WindowContext>, png: &[u8], c: Color) -> Option<Texture<'a>> {
-    let mut tex = icon_texture(creator, png)?;
-    tex.set_color_mod(c.r, c.g, c.b);
-    Some(tex)
-}
-
 fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, home: &mut Home, cache: &mut HashMap<String, Texture<'a>>, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
     let (ww, wh) = canvas.window().size();
     canvas.set_draw_color(MAIN_BG);
@@ -455,7 +448,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
                 canvas.fill_rect(r).ok();
             }
             dot(canvas, 20, y + 18, if d.online { GREEN } else { Color::RGB(176, 180, 183) });
-            let icon = if d.online { icons::MONITOR_BLUE } else { icons::MONITOR_GRAY };
+            let icon = if d.online { icons::HOME_MONITOR_ON } else { icons::HOME_MONITOR_OFF };
             if let Some(tex) = icon_texture(creator, icon) {
                 canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
             }
@@ -466,7 +459,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         if home.devices.is_empty() { text(canvas, creator, font, cache, if home.logged_in { "（无设备）" } else { "（未登录）" }, 30, y + 6, TEXT_MUT); y += 30; }
         let r_all = Rect::new(0, y, SIDE_W as u32, 36);
         if r_all.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_all).ok(); }
-        if let Some(tex) = icon_texture(creator, icons::GRID_BLUE) {
+        if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
             canvas.copy(&tex, None, Rect::new(32, y + 10, 17, 17)).ok();
         }
         text(canvas, creator, font, cache, "全部设备", 58, y + 10, TEXT_DARK);
@@ -479,7 +472,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     home.hit_map.push((hdr2, HomeAction::ToggleGroup(1)));
     y += 34;
     if home.groups_open[1] {
-        for (label, icon, act) in [("开始协助", icons::USER_BLUE, HomeAction::Stub("远程协助".into())), ("收藏设备", icons::STAR_BLUE, HomeAction::Stub("收藏设备".into()))] {
+        for (label, icon, act) in [("开始协助", icons::HOME_USER_BLUE, HomeAction::Stub("远程协助".into())), ("收藏设备", icons::HOME_STAR_BLUE, HomeAction::Stub("收藏设备".into()))] {
             let r = Rect::new(0, y, SIDE_W as u32, 36);
             if r.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r).ok(); }
             if let Some(tex) = icon_texture(creator, icon) {
@@ -492,7 +485,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     }
     let r_set = Rect::new(0, wh as i32 - 42, SIDE_W as u32, 36);
     if r_set.contains_point(Point::new(mx, my)) { canvas.set_draw_color(Color::RGB(233, 238, 242)); canvas.fill_rect(r_set).ok(); }
-    if let Some(tex) = icon_texture(creator, icons::GEAR_GRAY) {
+    if let Some(tex) = icon_texture(creator, icons::HOME_GEAR) {
         canvas.copy(&tex, None, Rect::new(32, wh as i32 - 32, 17, 17)).ok();
     }
     text(canvas, creator, font, cache, "设置", 58, wh as i32 - 32, TEXT_DARK);
@@ -559,10 +552,10 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         let band = Rect::new(mx, card_top + preview_h as i32 + 10, cw, 64);
         card(canvas, band, CARD_BG, MAIN_BG, 7, Some(CARD_BORDER));
         let feats: Vec<(&[u8], String, HomeAction, bool)> = vec![
-            (icons::FOLDER_INK, "文件传输".into(), HomeAction::Stub("文件传输".into()), true),
-            (icons::EYE_INK, "观看模式".into(), HomeAction::Enter(true), online && controllable),
-            (icons::POWER_INK, "关机".into(), HomeAction::Stub("关机".into()), online),
-            (icons::TERMINAL_INK, "终端".into(), HomeAction::Stub("终端".into()), online),
+            (icons::HOME_FOLDER, "文件传输".into(), HomeAction::Stub("文件传输".into()), true),
+            (icons::HOME_EYE, "观看模式".into(), HomeAction::Enter(true), online && controllable),
+            (icons::HOME_POWER, "关机".into(), HomeAction::Stub("关机".into()), online),
+            (icons::HOME_TERMINAL, "终端".into(), HomeAction::Stub("终端".into()), online),
         ];
         let n = feats.len() + 1;
         let cell = band.width() as i32 / n as i32;
@@ -573,8 +566,9 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
                 canvas.fill_rect(Rect::new(cx0, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
             }
             let ccx = cx0 + cell / 2;
-            if let Some(tex) = tinted_icon(creator, icon, if enabled { INK } else { Color::RGB(190, 194, 199) }) {
-                canvas.copy(&tex, None, Rect::new(ccx - 9, band.y() + 10, 18, 18)).ok();
+            if let Some(mut tex) = icon_texture(creator, icon) {
+                if !enabled { tex.set_color_mod(200, 204, 209); }
+                canvas.copy(&tex, None, Rect::new(ccx - 11, band.y() + 8, 22, 22)).ok();
             }
             text(canvas, creator, font, cache, &label, ccx - 28, band.y() + 38, if enabled { TEXT_DARK } else { Color::RGB(190, 194, 199) });
             if enabled { home.hit_map.push((Rect::new(cx0, band.y(), cell as u32, band.height()), action)); }
@@ -582,8 +576,8 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         let gx = band.x() + (n as i32 - 1) * cell;
         canvas.set_draw_color(SEP);
         canvas.fill_rect(Rect::new(gx, band.y() + 12, 1, (band.height() as i32 - 24) as u32)).ok();
-        if let Some(tex) = icon_texture(creator, icons::GRID_BLUE) {
-            canvas.copy(&tex, None, Rect::new(gx + cell / 2 - 9, band.y() + 22, 18, 18)).ok();
+        if let Some(tex) = icon_texture(creator, icons::HOME_GRID_BLUE) {
+            canvas.copy(&tex, None, Rect::new(gx + cell / 2 - 11, band.y() + 21, 22, 22)).ok();
         }
         home.hit_map.push((Rect::new(gx, band.y(), (band.x() + band.width() as i32 - gx) as u32, band.height()), HomeAction::Stub("快捷工具".into())));
 
