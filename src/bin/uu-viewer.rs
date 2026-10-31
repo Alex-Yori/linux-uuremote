@@ -162,7 +162,23 @@ fn main() {
     let mut qr_tex: Option<Texture> = None;
 
     let mut event_pump = sdl.event_pump().expect("事件泵");
+    let xconn = x_connect();
     'home: loop {
+        // 拖动帧：每轮用 X 服务器指针真值驱动搬窗（SDL 事件出界即断，X 查询不受限），松键自动收尾。
+        if home.drag.is_some() {
+            match x_query(&xconn) {
+                Some((gx, gy, down)) => {
+                    if !down { home.drag = None; }
+                    else {
+                        let (gx0, gy0, px0, py0) = home.drag.unwrap();
+                        let (nx, ny) = (px0 + gx - gx0, py0 + gy - gy0);
+                        if std::env::var_os("UU_DRAG_DEBUG").is_some() { eprintln!("drag: root=({gx},{gy}) -> win=({nx},{ny})"); }
+                        canvas.window_mut().set_position(WindowPos::Positioned(nx), WindowPos::Positioned(ny));
+                    }
+                }
+                None => {}
+            }
+        }
         while let Some(event) = event_pump.poll_event() {
             match event {
                 Event::Quit { .. } => break 'home,
@@ -171,11 +187,14 @@ fn main() {
                     match home.hit(x, y) {
                         HomeAction::None => {
                             // 顶栏空白区按下 = 拖动整窗（borderless 后没有系统标题栏，这里就是标题栏）。
-                            // 抓鼠：指针移出窗口边界后 SDL 仍继续送相对事件，拖动不会断/跳。
+                            // 抓鼠 + 全局指针真值：拖动量 = 服务器指针当前位置 - 按下时的指针位置，
+                            // 与窗口相对坐标/搬窗延迟完全解耦，出界、积压、mutter 排队都不会跑偏。
                             let (ww, _) = canvas.window().size();
                             if y < TOPBAR_H && x < ww as i32 - 222 {
-                                home.drag = Some((x, y));
-                                canvas.window_mut().set_grab(true);
+                                // 按下瞬间的指针真值取 SDL 事件自带的相对坐标 + 当时窗口位置（零竞态）。
+                                let (px, py) = canvas.window().position();
+                                if std::env::var_os("UU_DRAG_DEBUG").is_some() { eprintln!("press: root=({},{}) win=({px},{py})", px + x, py + y); }
+                                home.drag = Some((px + x, py + y, px, py));
                             }
                         }
                         HomeAction::Select(i) => home.selected = Some(i),
@@ -216,14 +235,8 @@ fn main() {
                 }
                 Event::MouseMotion { x, y, .. } => {
                     home.mouse = (x, y);
-                    if let Some((ox, oy)) = home.drag {
-                        let (px, py) = canvas.window().position();
-                        canvas.window_mut().set_position(WindowPos::Positioned(px + (x - ox)), WindowPos::Positioned(py + (y - oy)));
-                    }
                 }
-                Event::MouseButtonUp { .. } => {
-                    if home.drag.take().is_some() { canvas.window_mut().set_grab(false); }
-                },
+                Event::MouseButtonUp { .. } => home.drag = None,
                 _ => {}
             }
         }
@@ -303,7 +316,8 @@ struct Home {
     status_msg: String,
     session_busy: bool,
     mouse: (i32, i32),
-    drag: Option<(i32, i32)>,
+    // 拖动锚点：按下瞬间的全局鼠标位置 + 窗口位置（增量直接由服务器指针真值驱动）。
+    drag: Option<(i32, i32, i32, i32)>,
     groups_open: [bool; 2],
     hit_map: Vec<(Rect, HomeAction)>,
 }
@@ -628,6 +642,25 @@ fn draw_login_panel<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, 
     let rx = panel.x() + 280;
     text(canvas, creator, font, cache, &home.login_status, rx, panel.y() + 90, TEXT_DARK);
     text(canvas, creator, font, cache, "短信登录暂未实现", rx, panel.y() + 130, TEXT_MUT);
+}
+
+/// X 服务器连接（同项目输入注入用的 x11rb）；连不上返回 None（无 X 环境）。
+type XConn = Option<(x11rb::rust_connection::RustConnection, usize)>;
+
+fn x_connect() -> XConn {
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    Some((conn, screen))
+}
+
+/// 服务器指针真值 + 左键状态（XQueryPointer：不受 SDL 抓鼠钳制、事件积压、搬窗延迟影响）。
+fn x_query(c: &XConn) -> Option<(i32, i32, bool)> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, KeyButMask};
+    let (conn, screen) = c.as_ref()?;
+    let root = conn.setup().roots[*screen].root;
+    let r = conn.query_pointer(root).ok()?.reply().ok()?;
+    let down = u16::from(KeyButMask::BUTTON1) & u16::from(r.mask) != 0;
+    Some((r.root_x as i32, r.root_y as i32, down))
 }
 
 fn lerp(a: i32, b: i32, t: f64) -> i32 { (a as f64 + (b - a) as f64 * t) as i32 }
