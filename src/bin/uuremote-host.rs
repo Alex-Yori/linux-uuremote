@@ -218,6 +218,14 @@ fn main() {
     // 信令断线是常态（云端闲时关连）：就地退避重建房间，只有登录态失效才退出交给 systemd/人。
     let mut fail_streak = 0u32;
     loop {
+        // 无凭证（查看器登出后 config 已删 token）：不空转重建，安静等扫码写回。
+        // 重登后 token 落盘 → 自动建房上线，无需重启服务。
+        loop {
+            let have_token = config::read_with_fallback().ok().and_then(|(f, _)| f).and_then(|f| f.get("token").and_then(serde_json::Value::as_str).map(str::to_owned)).is_some_and(|t| !t.is_empty());
+            if have_token { break; }
+            println!("未登录：等待扫码写回凭证…");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
         let t0 = std::time::Instant::now();
         match rt.block_on(run(display.clone(), fps, still_fps, bitrate_kbps, gop, clipboard.clone())) {
             Ok(()) => println!("信令通道结束，重建房间…"),
@@ -302,6 +310,15 @@ async fn run(
                             signaling::EVENT_SOAC => forward_soac(&sig_tx, v),
                             signaling::EVENT_BE_CONTROLLED => { let _ = sig_tx.send(Signal::BeControlled { header: v, capture_type: 0, options: None }); }
                             signaling::EVENT_RELEASED | signaling::EVENT_LEFT => { let _ = sig_tx.send(Signal::PeerLeft); }
+                            signaling::EVENT_BMSG_PUSH => {
+                                // 账号登出/设备解绑：云端主动推 device_unbind（实测登出后 ~10s 内到）。
+                                // 就此拆会话 → 主循环发现 config 无凭证 → 安静等重登，设备下线。
+                                if v.get("type").and_then(Value::as_str) == Some("device_unbind") {
+                                    println!("   云端推送 device_unbind：账号已登出/设备解绑，拆会话下线。");
+                                    let _ = sig_tx.send(Signal::Closed("device_unbind".into()));
+                                    break;
+                                }
+                            }
                             _ => {}
                         }
                     }

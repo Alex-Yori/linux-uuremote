@@ -166,6 +166,8 @@ fn main() {
 
     let (login_tx, login_rx) = std::sync::mpsc::channel::<LoginUpdate>();
     let mut login_thread: Option<std::thread::JoinHandle<()>> = None;
+    // 登出 API 结果（HTTP status）后台回报，只在状态条体现，不阻塞 UI。
+    let (logout_tx, logout_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
 
     let mut home = Home::new(logged);
     home.account_name = config::read().ok().flatten().and_then(|f| f.get("account_name").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
@@ -265,12 +267,37 @@ fn main() {
                         HomeAction::ToggleGroup(g) => home.groups_open[g as usize] ^= true,
                         HomeAction::ToggleAccount => { home.account_open = !home.account_open; }
                         HomeAction::Logout => {
-                            // 退出账户：只撤 token/csrf（设备身份留在 config，重新登录后还能找回这台机）。
+                            // 官方语义登出：先打 /api/v1/user/logout 让服务端作废 token
+                            // （云端随即给被控端推 device_unbind，设备下线），再删本地凭证。
+                            // 只删文件 = 服务端凭证还活着，宿主会保持在线——不符合官方行为。
                             home.account_open = false;
                             if let Some(mut f) = config::read().ok().flatten() {
+                                if let Some(c) = Credentials::load(Some(&f)).ok() {
+                                    let tx = logout_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+                                        rt.block_on(async move {
+                                            let api = ApiClient::new(c);
+                                            let _ = tx.send(api.logout().await.map(|(s, _)| s));
+                                        });
+                                    });
+                                }
                                 if let Some(map) = f.as_object_mut() {
                                     map.remove("token");
                                     map.remove("csrf");
+                                }
+                                // 参照实现的配置也清掉：宿主凭证不全时会借用它（read_with_fallback），
+                                // 不清的话登出后设备会被"借来的凭证"重新拉上线。
+                                if std::env::var_os("UU_CONFIG").is_none() {
+                                    if let Some(mut fb) = config::read_at(&config::fallback_path()).ok().flatten() {
+                                        if fb.get("token").is_some() || fb.get("csrf").is_some() {
+                                            if let Some(m) = fb.as_object_mut() {
+                                                m.remove("token");
+                                                m.remove("csrf");
+                                            }
+                                            config::write_at(&config::fallback_path(), &fb).ok();
+                                        }
+                                    }
                                 }
                                 match config::write(&f) {
                                     Ok(_) => { home.logged_in = false; home.devices.clear(); home.selected = None; home.status_msg = "已退出账户。".into(); }
@@ -341,6 +368,13 @@ fn main() {
                 LoginUpdate::LoggedIn => { home.login_open = false; home.logged_in = true; home.status_msg = "登录成功。".into(); qr_tex = None; }
                 LoginUpdate::Failed(e) => { home.login_status = e; qr_tex = None; }
             }
+        }
+        while let Ok(r) = logout_rx.try_recv() {
+            home.status_msg = match r {
+                Ok(200) => "已退出账户（服务端凭证已作废，设备下线）。".into(),
+                Ok(s) => format!("已退出账户；服务端登出返回 http {s}。"),
+                Err(e) => format!("已退出账户；服务端登出失败：{e}"),
+            };
         }
         if login_thread.as_ref().is_some_and(|h| h.is_finished()) { login_thread = None; }
 

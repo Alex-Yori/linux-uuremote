@@ -278,6 +278,13 @@ impl ApiClient {
         self.post(path, Some(body), Duration::from_secs(12)).await
     }
 
+    /// 官方登出端点（GameViewer.exe `NrdLogin::logout` → `/api/v1/user/logout`）。
+    /// 服务端立即作废 token（实测：随后任何请求 `code=1120`），并向被控端信令
+    /// 推 `bmsg_push type=device_unbind` —— 设备就此下线。只删本地文件不叫登出。
+    pub async fn logout(&self) -> Result<(u16, Value), String> {
+        self.post("/api/v1/user/logout", None, Duration::from_secs(12)).await
+    }
+
     /// 签名 GET：设备列表这类只读接口（参照实现的 viewer 用 GET，POST 会 405）。
     pub async fn get(&self, path: &str, timeout: Duration) -> Result<(u16, Value), String> {
         let resp = self.http

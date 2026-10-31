@@ -75,9 +75,13 @@ pub fn credentials_complete(file: Option<&serde_json::Value>) -> bool {
 
 /// 原子写入（tmp + rename），权限 0600。token 是机密，文件不能进 git。
 pub fn write(cfg: &serde_json::Value) -> Result<PathBuf, String> {
+    write_at(&path(), cfg)
+}
+
+/// 写任意路径（0600、原子替换）：登出时同步清参照实现配置的凭证。
+pub fn write_at(p: &PathBuf, cfg: &serde_json::Value) -> Result<PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let p = path();
     let dir = p.parent().ok_or("config path has no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = p.with_extension("json.tmp");
@@ -94,7 +98,7 @@ pub fn write(cfg: &serde_json::Value) -> Result<PathBuf, String> {
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &p).map_err(|e| format!("replace {}: {e}", p.display()))?;
-    Ok(p)
+    Ok(p.clone())
 }
 
 #[cfg(test)]
