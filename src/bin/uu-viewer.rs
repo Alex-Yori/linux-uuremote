@@ -428,10 +428,10 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     canvas.fill_rect(Rect::new(0, 0, ww, TOPBAR_H as u32)).ok();
     canvas.set_draw_color(SEP);
     canvas.fill_rect(Rect::new(0, TOPBAR_H - 1, ww, 1)).ok();
-    if let Some(tex) = icon_texture(creator, icons::APP) {
-        canvas.copy(&tex, None, Rect::new(14, (TOPBAR_H - 22) / 2, 22, 22)).ok();
+    // 官方品牌图 1a7ddd73c74d.svg（logo+「网易UU远程」字标合体），顶栏只放这一个，不再单独画文字
+    if let Some(tex) = icon_texture(creator, icons::BRAND) {
+        canvas.copy(&tex, None, Rect::new(14, (TOPBAR_H - 32) / 2, 94, 32)).ok();
     }
-    text(canvas, creator, font, cache, "网易UU远程", 42, 11, TEXT_DARK);
     let topbar: [(&[u8], HomeAction); 6] = [
         (icons::TOP_SUBSCREEN, HomeAction::Stub("无线副屏".into())),
         (icons::TOP_BELL, HomeAction::Stub("消息中心".into())),
