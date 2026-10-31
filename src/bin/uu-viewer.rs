@@ -49,6 +49,12 @@ fn main() {
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let flag = |name: &str| args.iter().any(|a| a == name);
 
+    // UI 预览：不连云端，用合成帧驱动远程窗口界面，验证工具栏/图标/HUD/Toast 渲染。
+    if flag("--ui-preview") {
+        run_ui_preview();
+        return;
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
 
     if flag("--list") {
@@ -605,6 +611,7 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
     'main: loop {
         for event in event_pump.poll_iter() {
             let (_, wh0) = canvas.window().size();
+            let wh0 = wh0 as i32;
             match event {
                 Event::Quit { .. } => break 'main,
                 Event::Window { win_event: WindowEvent::Close, .. } => break 'main,
@@ -619,10 +626,11 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
                 }
                 Event::MouseMotion { x, y, xrel, yrel, .. } => {
                     mouse_at = Point::new(x, y);
+                    if y >= wh0 - 70 { ui.last_near_bottom = Instant::now(); }
                     if ui.mouse_mode == 3 {
                         // 游戏鼠标：relative 模式采到的增量按 Windows notch 语义原样投出。
                         if !ui.view_only && (xrel != 0 || yrel != 0) { let _ = cmd_tx.send(Cmd::MouseRelative { dx: xrel, dy: yrel }); }
-                    } else if ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 2 && frame_size.0 > 0 {
+                    } else if ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 2 && frame_size.0 > 0 && !(ui.toolbar_open && y >= wh0 - 70) {
                         let vp = linux_uuremote::viewer::input::Viewport::fit(canvas.window().size(), (frame_size.0.max(1) as u32, frame_size.1.max(1) as u32));
                         if vp.contains(x as f64, y as f64) {
                             if let Some(m) = vp.motion(x as f64, y as f64) {
@@ -679,6 +687,11 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
         if let Ok(result) = conn_rx.try_recv() {
             if let Err(e) = result { err = Some(e); }
             break 'main;
+        }
+
+        // 官方悬浮球行为：鼠标离开底部 3 秒后自动收起工具栏（下拉开着不收）。
+        if ui.toolbar_open && ui.panel.is_none() && ui.last_near_bottom.elapsed() > Duration::from_secs(3) {
+            ui.toolbar_open = false;
         }
 
         let mut latest: Option<Frame> = None;
@@ -741,11 +754,10 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
         if let Some(tex) = &video_tex {
             canvas.copy(tex, None, Rect::new(vp.x as i32, vp.y as i32, vp.width as u32, vp.height as u32)).ok();
         }
-        if ui.toolbar_open || ui.panel.is_some() || !ui.hud.is_empty() || ui.toast.is_some() {
-            ui.draw(&mut canvas, &texture_creator, font, ww, wh);
-        }
-        mouse_sys.show_cursor(ui.toolbar_open || ui.panel.is_some() || ui.view_only || ui.mouse_mode == 3);
-        if !ui.toolbar_open && ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 3 {
+        ui.draw(&mut canvas, &texture_creator, font, ww, wh);
+        let near_bottom = (mouse_at.y() as i64) >= wh as i64 - 70;
+        mouse_sys.show_cursor(ui.toolbar_open || ui.panel.is_some() || ui.view_only || ui.mouse_mode == 3 || near_bottom);
+        if !ui.toolbar_open && ui.panel.is_none() && !ui.view_only && ui.mouse_mode != 3 && !near_bottom {
             if let Some((tex, hx, hy)) = &cursor_tex {
                 let scale = vp.width / frame_size.0.max(1) as f64;
                 let x = mouse_at.x as f64 - *hx as f64 * scale;
@@ -788,6 +800,51 @@ fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf:
 }
 
 // ---------------- 共用小件 ----------------
+
+/// --ui-preview：合成帧 + 新 UI，12 秒后自动退出（自测渲染，不需要云端/被控端）。
+fn run_ui_preview() {
+    let sdl = sdl2::init().expect("SDL 初始化失败");
+    let video = sdl.video().expect("视频子系统失败");
+    let font = load_font();
+    let mut canvas = video.window("UU 远程 · UI 预览", 1280, 720).position_centered().resizable().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    let creator = canvas.texture_creator();
+    let mut ui = Ui::new(4, 90, false);
+    ui.notify("真彩模式下不支持当前画质，已降到超清");
+    ui.hud = vec!["帧率：88 fps    带宽占用：2010 Kbps".into(), "frm：6 ms    延迟：12 ms    2560x1440".into()];
+    let mut tex = creator.create_texture(PixelFormatEnum::YV12, sdl2::render::TextureAccess::Streaming, 1280, 720).expect("纹理失败");
+    let w = 1280usize;
+    let h = 720usize;
+    let mut y = vec![16u8; w * h];
+    let u = vec![128u8; w * h / 4];
+    let v = vec![128u8; w * h / 4];
+    let start = Instant::now();
+    let mut tick = 0usize;
+    let mut pump = sdl.event_pump().expect("事件泵");
+    loop {
+        for event in pump.poll_iter() {
+            if matches!(event, Event::Quit { .. } | Event::Window { win_event: WindowEvent::Close, .. }) { return; }
+        }
+        if start.elapsed() > Duration::from_secs(12) { return; }
+        ui.last_near_bottom = Instant::now();
+        if start.elapsed() > Duration::from_secs(7) { ui.toolbar_open = false; } // 验证收起态悬浮球
+        // 移动亮块当内容，模拟画面在动。
+        let bx = (tick * 7) % (w - 200);
+        for row in 200..360usize {
+            for col in bx..bx + 200 {
+                y[row * w + col] = 235;
+            }
+        }
+        tick += 1;
+        tex.update_yuv(None, &y, w, &u, w / 2, &v, w / 2).ok();
+        let (ww, wh) = canvas.window().size();
+        canvas.set_draw_color(Color::RGB(10, 10, 12));
+        canvas.clear();
+        canvas.copy(&tex, None, Rect::new(0, 0, w as u32, h as u32)).ok();
+        ui.draw(&mut canvas, &creator, font.as_ref(), ww, wh);
+        canvas.present();
+        std::thread::sleep(Duration::from_millis(33));
+    }
+}
 
 fn clone_creds(c: &Credentials) -> Credentials {
     Credentials { user_id: c.user_id.clone(), device_id: c.device_id.clone(), client_id: c.client_id.clone(), system_id: c.system_id.clone(), token: c.token.clone(), csrf: c.csrf.clone(), sign_key: c.sign_key.clone() }
@@ -891,6 +948,8 @@ struct Ui {
     rects: Vec<Rect>,
     option_rects: Vec<(Rect, Action)>,
     hud: Vec<String>,
+    /// 官方悬浮球行为：鼠标 3 秒不碰底部区域，工具栏自动收起（点悬浮球或 F1 恢复）。
+    last_near_bottom: Instant,
 }
 
 const MOUSE_MODES: [&str; 4] = ["智能鼠标", "仿真鼠标", "使用被控端鼠标", "游戏鼠标"];
@@ -912,24 +971,30 @@ impl Ui {
             rects: Vec::new(),
             option_rects: Vec::new(),
             hud: Vec::new(),
+            last_near_bottom: Instant::now(),
         }
     }
     fn notify(&mut self, msg: &str) {
         self.toast = Some((msg.to_owned(), Instant::now()));
     }
-    /// 工具栏占用高度（下拉面板在其上方，不在这高度里）。
+    /// 工具栏占用高度（收起时只剩底部居中的悬浮球，占用 26px）。
     fn bar_h(&self) -> i32 {
-        if self.toolbar_open { 40 } else { 0 }
+        if self.toolbar_open { 44 } else { 26 }
     }
-    /// 命中判定：底部工具栏条 或 下拉面板选项区。
-    fn hit_menu(&self, x: i32, y: i32, wh: u32) -> bool {
+    /// 命中判定：底部悬浮条 / 收起时的悬浮球 / 下拉面板选项区。
+    fn hit_menu(&self, x: i32, y: i32, wh: i32) -> bool {
         let h = self.bar_h();
-        if h > 0 && y >= wh as i32 - h { return true; }
+        if y >= wh - h - 6 { return true; }
         self.option_rects.iter().any(|(r, _)| r.contains_point(Point::new(x, y)))
     }
-    fn pick(&mut self, x: i32, y: i32, wh: u32) -> Option<Action> {
+    fn pick(&mut self, x: i32, y: i32, wh: i32) -> Option<Action> {
         let h = self.bar_h();
-        if h > 0 && y >= wh as i32 - h {
+        if y >= wh - h - 6 {
+            if !self.toolbar_open {
+                self.toolbar_open = true;
+                self.panel = None;
+                return None;
+            }
             if let Some(i) = self.rects.iter().position(|r| r.contains_point(Point::new(x, y))) {
                 self.panel = if self.panel == Some(i) { None } else { Some(i) };
             } else {
@@ -974,8 +1039,9 @@ impl Ui {
         let h = self.bar_h();
         self.rects.clear();
         self.option_rects.clear();
-        if h > 0 {
-            let by = height as i32 - h;
+        let by = height as i32 - h;
+        if self.toolbar_open {
+            // 官方悬浮条：深色圆角条居中（SDL 无圆角 API，用整条深色底 + 两侧渐隐近似）。
             canvas.set_draw_color(Color::RGBA(20, 22, 28, 235));
             canvas.fill_rect(Rect::new(0, by, width, h as u32)).ok();
             let buttons: Vec<String> = vec![
@@ -987,7 +1053,7 @@ impl Ui {
                 if self.sound_on { "声音 开".into() } else { "声音 关".into() },
                 if self.view_only { "观看模式".into() } else { "操控模式".into() },
                 if self.fullscreen { "退出全屏".into() } else { "全屏".into() },
-                "工具栏".into(),
+                "隐藏工具栏".into(),
                 "断开".into(),
             ];
             let mut x = 8i32;
@@ -995,16 +1061,22 @@ impl Ui {
                 let tex = text_texture(creator, font, label, Color::RGB(235, 235, 235));
                 let tw = tex.as_ref().map(|t| t.query().width as i32).unwrap_or(70);
                 let w = tw + 30;
-                let r = Rect::new(x, by + 6, w as u32, (h - 12) as u32);
+                let r = Rect::new(x, by + 8, w as u32, (h - 16) as u32);
                 if self.panel == Some(i) {
                     canvas.set_draw_color(Color::RGBA(80, 120, 220, 235));
                     canvas.fill_rect(r).ok();
                 }
-                if let Some(tex) = icon_texture(creator, Ui::icon_for(i)) { canvas.copy(&tex, None, Rect::new(x + 6, by + 12, 16, 16)).ok(); }
-                if let Some(tex) = tex { canvas.copy(&tex, None, Rect::new(x + 26, by + 12, tex.query().width, tex.query().height)).ok(); }
+                if let Some(tex) = icon_texture(creator, Ui::icon_for(i)) { canvas.copy(&tex, None, Rect::new(x + 6, by + 14, 16, 16)).ok(); }
+                if let Some(tex) = tex { canvas.copy(&tex, None, Rect::new(x + 26, by + 14, tex.query().width, tex.query().height)).ok(); }
                 self.rects.push(r);
                 x += w + 4;
             }
+        } else {
+            // 收起态：底部居中的悬浮球（官方默认形态），点它重新展开。
+            let ball = Rect::new(width as i32 / 2 - 13, by, 26, 26);
+            canvas.set_draw_color(Color::RGBA(20, 22, 28, 200));
+            canvas.fill_rect(Rect::new(ball.x() - 6, ball.y() - 4, ball.width() + 12, ball.height() + 8)).ok();
+            if let Some(tex) = icon_texture(creator, icons::BALL) { canvas.copy(&tex, None, Rect::new(ball.x(), ball.y(), 24, 24)).ok(); }
         }
         if let Some(i) = self.panel {
             let options = self.options(i);
