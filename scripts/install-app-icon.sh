@@ -33,15 +33,10 @@ StartupWMClass=uu-viewer
 Keywords=UU;远程;远控;remote;desktop;
 EOF
 
-# 旧的重复条目与 fork 遗留的控制端条目（deb 装的），在应用网格里都算 UU，
-# 本地覆盖 NoDisplay 隐藏（不动包文件）。
-rm -f "$HOME/.local/share/applications/linux-uuremote-viewer.desktop"
-cat > "$HOME/.local/share/applications/uu-remote-linux-viewer.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=UU 远程 Linux 控制端
-NoDisplay=true
-EOF
+# 旧的重复条目删掉；fork 的 deb 包（uu-remote-linux）已 purge，
+# 残留的本地覆盖条目一并清掉。
+rm -f "$HOME/.local/share/applications/linux-uuremote-viewer.desktop" \
+      "$HOME/.local/share/applications/uu-remote-linux-viewer.desktop"
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
