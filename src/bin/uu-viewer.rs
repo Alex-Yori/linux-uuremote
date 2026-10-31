@@ -429,28 +429,36 @@ fn vdots(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, cx: i32, cy: i3
 fn argb_visual_id() -> Option<String> {
     use x11rb::connection::Connection;
     let (conn, scr_idx) = x11rb::connect(None).ok()?;
-    let fmts = x11rb::protocol::render::query_pict_formats(&conn).ok()?.reply().ok()?;
-    let argb_ids: Vec<u32> = fmts.formats.iter().filter(|f| f.depth == 32 && f.direct.alpha_mask != 0).map(|f| f.id).collect();
     for depth in conn.setup().roots[scr_idx].allowed_depths.iter() {
         if depth.depth != 32 { continue; }
         for v in depth.visuals.iter() {
-            if argb_ids.contains(&v.visual_id) { return Some(v.visual_id.to_string()); }
+            if v.class == x11rb::protocol::xproto::VisualClass::TRUE_COLOR
+                && v.red_mask == 0x00ff_0000
+                && v.green_mask == 0x0000_ff00
+                && v.blue_mask == 0x0000_00ff
+            {
+                return Some(v.visual_id.to_string());
+            }
         }
     }
     None
 }
 
 fn force_argb() {
+    // alphatest 实测：hint::set（SDL hint 名不带 SDL_HINT_ 前缀）+ GL 渲染器 → 窗口 depth 32，
+    // 透明像素被 mutter 按 alpha 合成。
+    // SDL 建窗时读这两个环境变量（实测 export 生效、hint::set 不生效）：
+    // 32-bit ARGB visual + 禁 bypass-compositor → mutter 按窗口 alpha 合成，圆角外透出桌面。
+    // alphatest 实测：hint::set 用 SDL_HINT_ 全名 + GL 默认渲染器 → 窗口 depth 32、alpha 被 mutter 合成。
+    let vid = std::env::var("UU_VISUALID").ok().or_else(argb_visual_id).unwrap_or_default();
+    if !vid.is_empty() { sdl2::hint::set("SDL_VIDEO_X11_WINDOW_VISUALID", &vid); eprintln!("ARGB visual {vid} 已启用"); } else { eprintln!("没找到 ARGB visual，圆角外会显黑"); }
     sdl2::hint::set("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
-    if let Some(vid) = std::env::var("UU_VISUALID").ok().or_else(argb_visual_id) {
-        if !vid.is_empty() { sdl2::hint::set("SDL_VIDEO_X11_WINDOW_VISUALID", &vid); }
-    }
 }
 
 // 主页卡片几何：官方 920x700，四周 30px 阴影带（0 8px 24px rgba(0,0,0,0.08)），圆角 8。
 const CARD_W: i32 = 920;
 const CARD_H: i32 = 700;
-const MARGIN: i32 = 30;
+const MARGIN: i32 = 0;                     // 官方阴影在 X11/mutter 下显成一圈黑，按用户要求去掉边距
 const WIN_W: u32 = (CARD_W + 2 * MARGIN) as u32;
 const WIN_H: u32 = (CARD_H + 2 * MARGIN) as u32;
 const CORNER_R: f32 = 8.0;
