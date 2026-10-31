@@ -31,7 +31,7 @@ use sdl2::mouse::MouseButton;
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::{Point, Rect};
 use sdl2::render::{Texture, TextureCreator};
-use sdl2::video::{FullscreenType, WindowContext};
+use sdl2::video::{FullscreenType, Window, WindowContext, WindowPos};
 use sdl2::Sdl;
 use serde_json::{json, Value};
 
@@ -120,7 +120,8 @@ fn main() {
     }
 
     // ---- 主页 ----
-    let mut canvas = video.window("网易UU远程", 980, 640).position_centered().resizable().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    let mut canvas = video.window("网易UU远程", 980, 640).position_centered().resizable().borderless().build().expect("窗口创建失败").into_canvas().build().expect("渲染器创建失败");
+    canvas.window_mut().set_bordered(false);
     set_app_icon(canvas.window_mut());
     let creator = canvas.texture_creator();
 
@@ -159,7 +160,11 @@ fn main() {
                 Event::Window { win_event: WindowEvent::Close, .. } => break 'home,
                 Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
                     match home.hit(x, y) {
-                        HomeAction::None => {}
+                        HomeAction::None => {
+                            // 顶栏空白区按下 = 拖动整窗（borderless 后没有系统标题栏，这里就是标题栏）。
+                            let (ww, _) = canvas.window().size();
+                            if y < TOPBAR_H && x < ww as i32 - 222 { home.drag = Some((x, y)); }
+                        }
                         HomeAction::Select(i) => home.selected = Some(i),
                         HomeAction::Login => {
                             home.login_open = true;
@@ -195,7 +200,14 @@ fn main() {
                         HomeAction::Stub(label) => home.status_msg = format!("{label}（暂未实现）"),
                     }
                 }
-                Event::MouseMotion { x, y, .. } => home.mouse = (x, y),
+                Event::MouseMotion { x, y, .. } => {
+                    home.mouse = (x, y);
+                    if let Some((ox, oy)) = home.drag {
+                        let (px, py) = canvas.window().position();
+                        canvas.window_mut().set_position(WindowPos::Positioned(px + (x - ox)), WindowPos::Positioned(py + (y - oy)));
+                    }
+                }
+                Event::MouseButtonUp { .. } => home.drag = None,
                 _ => {}
             }
         }
@@ -275,11 +287,12 @@ struct Home {
     status_msg: String,
     session_busy: bool,
     mouse: (i32, i32),
+    drag: Option<(i32, i32)>,
     hit_map: Vec<(Rect, HomeAction)>,
 }
 impl Home {
     fn new(logged_in: bool) -> Self {
-        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, mouse: (-1, -1), hit_map: Vec::new() }
+        Self { devices: Vec::new(), selected: None, logged_in, login_open: false, login_status: String::new(), status_msg: String::new(), session_busy: false, mouse: (-1, -1), drag: None, hit_map: Vec::new() }
     }
     fn selected_device(&self) -> Option<&DeviceRow> { self.selected.and_then(|i| self.devices.get(i)) }
     fn hit(&mut self, x: i32, y: i32) -> HomeAction {
@@ -332,7 +345,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
             canvas.fill_rect(r).ok();
         }
         if let Some(tex) = icon_texture(creator, png) {
-            canvas.copy(&tex, None, Rect::new(r.x() + 5, r.y() + 3, 24, 24)).ok();
+            canvas.copy(&tex, None, Rect::new(r.x() + (34 - 20) / 2, r.y() + (30 - 20) / 2, 20, 20)).ok();
         }
         home.hit_map.push((r, action.clone()));
     }
@@ -587,7 +600,8 @@ fn set_app_icon(window: &mut sdl2::video::Window) {
 
 fn run_session(sdl: &Sdl, video: &sdl2::VideoSubsystem, font: Option<&sdl2::ttf::Font<'static, 'static>>, creds: &Credentials, target: &str, alias: &str, quality: u64, fps: u32, win_w: u32, win_h: u32, view_only: bool, no_audio: bool, event_pump: &mut sdl2::EventPump) -> Result<(), String> {
     let title = if alias.is_empty() { "UU 远程".to_owned() } else { format!("UU 远程 · {alias}") };
-    let mut canvas = video.window(&title, win_w, win_h).position_centered().resizable().build().map_err(|e| e.to_string())?.into_canvas().build().map_err(|e| e.to_string())?;
+    let mut canvas = video.window(&title, win_w, win_h).position_centered().resizable().borderless().build().map_err(|e| e.to_string())?.into_canvas().build().map_err(|e| e.to_string())?;
+    canvas.window_mut().set_bordered(false);
     set_app_icon(canvas.window_mut());
     canvas.window_mut().set_always_on_top(true);
     let texture_creator = canvas.texture_creator();
