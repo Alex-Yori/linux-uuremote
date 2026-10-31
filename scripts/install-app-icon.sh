@@ -22,14 +22,31 @@ cat > "$HOME/.local/share/applications/uu-remote.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=UU 远程
-Comment=网易UU远程（Linux 自研控制端）
-Exec=$REPO/target/release/uu-viewer %u
+Name[en]=UU Remote
+GenericName=Remote Desktop Client
+Comment=连接并控制你的其他设备（键鼠透传 / 画质帧率调节 / 声音）
+Exec=$HOME/.local/bin/uu-viewer-launch
 Icon=uu-remote
 Terminal=false
-StartupWMClass=uu-viewer
 Categories=Network;RemoteAccess;
+StartupWMClass=uu-viewer
+Keywords=UU;远程;远控;remote;desktop;
+EOF
+
+# 旧的重复条目与 fork 遗留的控制端条目（deb 装的），在应用网格里都算 UU，
+# 本地覆盖 NoDisplay 隐藏（不动包文件）。
+rm -f "$HOME/.local/share/applications/linux-uuremote-viewer.desktop"
+cat > "$HOME/.local/share/applications/uu-remote-linux-viewer.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=UU 远程 Linux 控制端
+NoDisplay=true
 EOF
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
-echo "installed: hicolor sizes + ~/.local/share/applications/uu-remote.desktop (StartupWMClass=uu-viewer)"
+
+# 启动器用的也是最新构建
+mkdir -p "$HOME/.local/bin"
+cp "$REPO/target/release/uu-viewer" "$HOME/.local/bin/uu-viewer"
+echo "installed: hicolor sizes + uu-remote.desktop(唯一条目) + ~/.local/bin/uu-viewer 已更新"
