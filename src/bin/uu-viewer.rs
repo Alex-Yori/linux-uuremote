@@ -212,6 +212,12 @@ fn main() {
                 Event::Quit { .. } => break 'home,
                 Event::Window { win_event: WindowEvent::Close, .. } => break 'home,
                 Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
+                    if std::env::var_os("UU_CLICK_DEBUG").is_some() {
+                        eprintln!("click: sdl=({x},{y})");
+                        for (r, a) in home.hit_map.iter() {
+                            eprintln!("  hit_rect x={}..{} y={}..{} act={:?}", r.x(), r.x() + r.width() as i32, r.y(), r.y() + r.height() as i32, a);
+                        }
+                    }
                     match home.hit(x - MARGIN, y - MARGIN) {
                         HomeAction::None => {
                             // 顶栏空白区按下 = 拖动整窗（borderless 后没有系统标题栏，这里就是标题栏）。
@@ -229,6 +235,8 @@ fn main() {
                             home.login_open = true;
                             home.login_status = "正在生成二维码……".into();
                             qr_tex = None;
+                            if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("login: opening panel, spawning flow (thread busy={:?})", login_thread.as_ref().map(|h| !h.is_finished())); }
+                            if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("login: after handler login_open={} logged_in={}", home.login_open, home.logged_in); }
                             if login_thread.as_ref().map_or(true, |h| h.is_finished()) {
                                 let tx = login_tx.clone();
                                 login_thread = Some(std::thread::spawn(move || {
@@ -286,35 +294,44 @@ fn main() {
         }
 
         while let Ok(devs) = dev_rx.try_recv() {
+            if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("dev_rx: {} devices", devs.len()); }
             home.devices = devs.iter().filter_map(DeviceRow::from_json).collect();
             if home.selected.is_none() && !home.devices.is_empty() { home.selected = Some(0); }
             home.logged_in = true;
         }
         while let Ok(u) = login_rx.try_recv() {
+            if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("login_rx: {:?}", match &u { LoginUpdate::Qr(_) => "Qr", LoginUpdate::Status(s) => s.as_str(), LoginUpdate::LoggedIn => "LoggedIn", LoginUpdate::Failed(e) => e.as_str() }); }
             match u {
                 LoginUpdate::Qr(url) => {
+                    if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("qr build: url_len={} scale_w_after", url.len()); }
                     match qrcode::QrCode::new(url.as_bytes()) {
                         Ok(code) => {
                             let w = code.width();
                             let colors = code.to_colors();
-                            let scale = 4usize;
+                            // Fit the QR (plus 4-module quiet zone) into the ~200px slot;
+                            // each module is `scale` px — the old code forgot to divide
+                            // pixel coords by scale, so the code rendered as a tiny dot.
+                            let scale = (200usize / (w + 8)).clamp(2, 4);
                             let px = (w + 8) * scale;
-                            if let Ok(mut tex) = creator.create_texture(PixelFormatEnum::RGBA32, sdl2::render::TextureAccess::Static, px as u32, px as u32) {
-                                let ok = tex.with_lock(None, |buf, pitch| {
+                            if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("qr: w={w} scale={scale} px={px}"); }
+                            let mut texres = creator.create_texture_streaming(PixelFormatEnum::RGBA32, px as u32, px as u32);
+                            match &mut texres { Ok(t) => {
+                                let ok = t.with_lock(None, |buf, pitch| {
                                     for row in 0..px {
                                         let line = &mut buf[row * pitch..row * pitch + pitch];
                                         for col in 0..px {
                                             let q = row as i64 - 4 * scale as i64;
                                             let c = col as i64 - 4 * scale as i64;
-                                            let dark = q >= 0 && c >= 0 && (q as usize) < w && (c as usize) < w && colors[q as usize * w + c as usize] == qrcode::types::Color::Dark;
+                                            let dark = q >= 0 && c >= 0 && (q as usize) / scale < w && (c as usize) / scale < w && colors[(q as usize / scale) * w + c as usize / scale] == qrcode::types::Color::Dark;
                                             let v: [u8; 4] = if dark { [20, 20, 20, 255] } else { [255, 255, 255, 255] };
                                             line[col * 4..col * 4 + 4].copy_from_slice(&v);
                                         }
                                     }
                                     Ok::<(), String>(())
                                 });
-                                if ok.is_ok() { qr_tex = Some(tex); }
-                            }
+                                if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("qr lock: {:?}", ok.as_ref().map(|_| "ok").map_err(|e| e.as_str())); }
+                                if ok.is_ok() { qr_tex = Some(texres.unwrap()); }
+                            } Err(e) => { if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("qr tex fail: {e}"); } } }
                             home.login_status = "请使用网易UU远程或微信 扫码登录".into();
                         }
                         Err(e) => home.login_status = format!("二维码生成失败：{e}"),
@@ -348,7 +365,7 @@ impl DeviceRow {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum HomeAction { None, Select(usize), Login, Enter(bool), Minimize, Close, Stub(String), ToggleGroup(u8), ToggleAccount, Logout }
 
 struct Home {
@@ -690,6 +707,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
     let cw = (ww as i32 - cx - PAD).max(320) as u32;
     let cy = TOPBAR_H + PAD;
     if !home.logged_in {
+        if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("draw: logged_in=false login_open={}", home.login_open); }
         htext(canvas, creator, fonts.s20.as_ref(), cache, "全部设备", 20, cx, cy + 10, TEXT_MAIN);
         htext(canvas, creator, fonts.r13.as_ref(), cache, "随时访问个人设备，可用于办公、游戏、文件传输。", 13, cx, cy + 46, TEXT_MUT);
         if !home.login_open {
@@ -884,6 +902,7 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
 
 
 fn draw_login_panel<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator: &'a TextureCreator<WindowContext>, font: Option<&sdl2::ttf::Font<'static, 'static>>, cache: &mut HashMap<String, Texture<'a>>, home: &mut Home, qr: Option<&Texture<'a>>, mx: i32, my: i32) {
+    if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("panel: font={} qr={} cache={}", font.is_some(), qr.is_some(), cache.len()); }
     let panel = Rect::new(mx, my, 520, 340);
     card(canvas, panel, Color::RGB(252, 253, 255), MAIN_BG, 10, Some(CARD_BORDER));
     text(canvas, creator, font, cache, "网易UU远程", panel.x() + 16, panel.y() + 12, TEXT_DARK);
@@ -893,7 +912,9 @@ fn draw_login_panel<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, 
     text(canvas, creator, font, cache, "扫码登录", panel.x() + 40, panel.y() + 56, TEXT_DARK);
     if let Some(tex) = qr {
         let q = tex.query();
-        canvas.copy(tex, None, Rect::new(panel.x() + 40, panel.y() + 84, q.width, q.height)).ok();
+        let res = canvas.copy(tex, None, Rect::new(panel.x() + 40, panel.y() + 84, q.width, q.height));
+        if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("panel qr copy: tex={}x{} -> res {:?}", q.width, q.height, res.as_ref().map(|_| "ok").map_err(|e| e.to_string())); }
+        res.ok();
     } else {
         canvas.set_draw_color(Color::RGB(240, 242, 245));
         canvas.fill_rect(Rect::new(panel.x() + 40, panel.y() + 84, 200, 200)).ok();
@@ -1063,7 +1084,9 @@ enum LoginUpdate { Qr(String), Status(String), LoggedIn, Failed(String) }
 
 /// 扫码登录（与 uu-login 同链路），把状态推给主页 UI。
 async fn qr_login_flow(tx: std::sync::mpsc::Sender<LoginUpdate>) {
-    let creds = Credentials::default();
+    // 登出后重登：设备身份（client_id/device_id/system_id）留在 config 里，签名要带上它们；
+    // token/csrf 缺失无所谓（load_partial 不校验）。文件没有则退回内置 key 的空身份。
+    let creds = config::read().ok().flatten().map(|f| Credentials::load_partial(Some(&f))).unwrap_or_default();
     let client = ApiClient::new(creds.clone());
     let (status, body) = match client.post("/api/v1/qrcode/gen/login", None, Duration::from_secs(12)).await { Ok(v) => v, Err(e) => { let _ = tx.send(LoginUpdate::Failed(e)); return; } };
     let gen = match api_data("gen/login", status, &body) { Ok(v) => v, Err(e) => { let _ = tx.send(LoginUpdate::Failed(e)); return; } };
@@ -1072,10 +1095,18 @@ async fn qr_login_flow(tx: std::sync::mpsc::Sender<LoginUpdate>) {
     let _ = tx.send(LoginUpdate::Qr(url.clone()));
     let mut last = 1i64;
     loop {
-        let (status, body) = client
+        let (status, body) = match client
             .post("/api/v1/qrcode/login/status", Some(&json!({ "token": ticket, "qrcode_jump_url": url, "login_status": last })), Duration::from_secs(60))
             .await
-            .unwrap_or((0, Value::Null));
+        {
+            Ok(v) => v,
+            // 状态查询是长轮询：服务端挂连接直到扫码/过期，传输层超时 ≠ 失败，继续等。
+            Err(e) => {
+                if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("poll transport: {e}"); }
+                (0, json!({ "code": 0, "data": { "status": last } }))
+            }
+        };
+        if std::env::var_os("UU_CLICK_DEBUG").is_some() { eprintln!("poll: http {status} {}", &body.to_string()[..body.to_string().len().min(200)]); }
         match api::qr_poll_action(last, status, &body) {
             QrPollAction::Wait(s) => last = s,
             QrPollAction::Scanned => { let _ = tx.send(LoginUpdate::Status("已扫码，请在手机上确认……".into())); last = 2; }

@@ -35,7 +35,7 @@ pub const TOKEN_INVALID: i64 = 1120;
 pub const QR_EXPIRED: i64 = 1190;
 
 /// 账号绑定与签名 key。永不提交：从私有配置文件或 `UU_*` 环境变量加载。
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub user_id: String,
     pub device_id: String,
@@ -54,10 +54,26 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+/// 未登录态（登录流）也用内置签名 key —— derive(Default) 会把 sign_key 留成空串，
+/// HMAC 拿空 key 签名服务端必拒（http 400 code 1003 无效签名）。
+impl Default for Credentials {
+    fn default() -> Self {
+        Self {
+            user_id: String::new(),
+            device_id: String::new(),
+            client_id: String::new(),
+            system_id: String::new(),
+            token: String::new(),
+            csrf: String::new(),
+            sign_key: DEFAULT_SIGN_KEY.into(),
+        }
+    }
+}
+
 impl Credentials {
     /// `UU_*` 环境变量覆盖文件值（UU_USER_ID / UU_DEVICE_ID / UU_CLIENT_ID /
     /// UU_SYSTEM_ID / UU_TOKEN / UU_CSRF / UU_SIGN_KEY）。
-    pub fn load(file: Option<&Value>) -> Result<Self, String> {
+    fn from_sources(file: Option<&Value>) -> Self {
         let get = |key: &str| -> String {
             std::env::var(format!("UU_{}", key.to_uppercase()))
                 .ok()
@@ -65,7 +81,7 @@ impl Credentials {
                 .or_else(|| file.and_then(|f| f.get(key)).and_then(|v| v.as_str()).map(str::to_owned))
                 .unwrap_or_default()
         };
-        let creds = Self {
+        Self {
             user_id: get("user_id"),
             device_id: get("device_id"),
             client_id: get("client_id"),
@@ -75,7 +91,11 @@ impl Credentials {
             sign_key: Some(get("sign_key"))
                 .filter(|k| !k.is_empty())
                 .unwrap_or_else(|| DEFAULT_SIGN_KEY.into()),
-        };
+        }
+    }
+
+    pub fn load(file: Option<&Value>) -> Result<Self, String> {
+        let creds = Self::from_sources(file);
         let missing: Vec<&str> = [("user_id", &creds.user_id), ("device_id", &creds.device_id), ("client_id", &creds.client_id), ("system_id", &creds.system_id), ("token", &creds.token), ("csrf", &creds.csrf)]
             .iter()
             .filter(|(_, v)| v.is_empty())
@@ -86,6 +106,11 @@ impl Credentials {
         } else {
             Err(format!("missing credential settings: {}", missing.join(", ")))
         }
+    }
+
+    /// 宽松加载：不要求 token/csrf（登出后的扫码登录流只需设备身份参与签名）。
+    pub fn load_partial(file: Option<&Value>) -> Self {
+        Self::from_sources(file)
     }
 
     /// 写回配置文件用：只写非空字段，保留文件里的其他键由调用方合并。
@@ -183,6 +208,7 @@ impl ApiClient {
             .collect::<Vec<_>>()
             .join("&");
         let string_to_sign = format!("{}{}{}{}", method.to_uppercase(), path, params_str, body);
+        if std::env::var_os("UU_SIGN_DEBUG").is_some() { eprintln!("sign-string: {string_to_sign}"); }
         let mut mac = HmacSha256::new_from_slice(self.creds.sign_key.as_bytes()).expect("HMAC accepts any key length");
         mac.update(string_to_sign.as_bytes());
         hex::encode(mac.finalize().into_bytes())
