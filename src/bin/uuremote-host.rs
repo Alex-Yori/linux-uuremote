@@ -411,25 +411,34 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                     // be-controlled header 不带 ice_id（只在 soac offer/candidate 里），
                     // 所以复用判据 = 还没 answer、也还没收到过 offer：即客户端还在自己的
                     // ICE 收集阶段重试，会议还是同一个。
+                    // 真复用：还在收集阶段的重试不再建第二个 PeerConnection。
+                    // 之前这里只是「不拆旧的」，但还是无条件 Peer::new → 每次重试都泄一个
+                    // PC（TURN 分配 + mux 端点全留着），而 answer 出自最后那个新 PC，
+                    // 客户端在我们好几个 ufrag 之间挑候选 → SCTP INIT 永远没人回
+                    // （实测 09:28 会话：DTLS 连上、RTCP 双向通，5 分钟后 SCTP
+                    // retransmission failure → 黑屏）。
                     let reuse = session.as_ref().is_some_and(|s| !s.answered && !s.saw_offer);
                     if reuse {
-                        hostlog::log("be-controlled 重试（同 ice_id）→ 复用会话，不重建 ICE");
+                        hostlog::log(&format!(
+                            "be-controlled 重试 → 复用同一个 PeerConnection（ufrag 不变，已攒客户端 candidate {} 条）",
+                            early_candidates.len()
+                        ));
                     } else {
                         // 新会议才拆旧会话：ICE 配置属于这一次会议，不能复用上一条。
                         if let Some(old) = session.take() {
                             stop_session(old).await;
                         }
-                    }
-                    let config = match ice_configuration(&header) {
-                        Ok(config) => config,
-                        Err(e) => {
-                            eprintln!("   这次会议连不上：{e}");
-                            continue;
+                        let config = match ice_configuration(&header) {
+                            Ok(config) => config,
+                            Err(e) => {
+                                eprintln!("   这次会议连不上：{e}");
+                                continue;
+                            }
+                        };
+                        match Peer::new(config, peer_tx.clone()).await {
+                            Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
+                            Err(e) => eprintln!("   建会话失败：{e}"),
                         }
-                    };
-                    match Peer::new(config, peer_tx.clone()).await {
-                        Ok(peer) => session = Some(Session { peer: Arc::new(peer), keyframe: Arc::new(AtomicBool::new(false)), input: None, capture: None, mode_guard: None, route: json!({}), control_msgs: 0, ice_id: None, saw_offer: false, answered: false, pending_local: Vec::new(), video_abort: None, shape_abort: None, t_be_controlled: std::time::Instant::now(), t_answer: None }),
-                        Err(e) => eprintln!("   建会话失败：{e}"),
                     }
                 }
                 Some(Signal::Offer { sdp, ice_id, client_id, app_control_id }) => {
@@ -522,15 +531,15 @@ async fn run(display: Option<String>, fps: u32, still_fps: u32, bitrate_kbps: u3
                 Some(Signal::PeerLeft) => {
                     offer_deadline = None;
                     linux_uuremote::virtual_audio::disable();
-                    // 还没谈定就拆 PeerConnection = 换 ufrag + 重新 TURN 分配（几秒），
-                    // 客户端攒的 candidate 全作废 → 外网首连变成十几秒一轮的死循环。
-                    // 客户端只是离开房间又立刻重进，这时候留着会话，下一轮直接接着谈。
+                    // 还没谈定的「离开」不拆会话：客户端在 ICE 收集阶段离开房间又立刻重进，
+                    // 拆掉就等于换 ufrag + 重新 TURN 分配，它攒的 candidate 全作废 →
+                    // 十几秒一轮的死循环。保留的条件是「还没 answer 也没见过 offer」，
+                    // 并且挂 15 s 期限，不白占 TURN 分配。
                     let keep = session.as_ref().is_some_and(|s| !s.answered && !s.saw_offer);
                     if keep {
-                        hostlog::log("对端离开但会话还没谈定 → 保留 PeerConnection（ufrag/TURN 分配不重来）");
-                        println!("   对端离开（未谈定，保留会话等重进）");
-                        // 保留不是无限占着 TURN 分配：15 秒内没有新 offer 照样拆。
+                        hostlog::log("对端离开但还没谈定 → 保留同一个 PeerConnection（ufrag 不变，等它重进）");
                         offer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
+                        println!("   对端离开（未谈定，保留会话等重进）");
                     } else {
                         println!("   对端离开，关会话");
                         if let Some(session) = session.take() {
