@@ -1183,6 +1183,21 @@ fn start_video(
     let settings_pipe = Some(settings.clone());
     // 首帧时刻是用户体感「连接时长」的终点：客户端从点连接到看见画面全靠它。
     let t_connect_start = session.t_be_controlled;
+    // 带宽地板 padding（对齐官方 pacer ALR padding，见 src/padding.rs）：
+    // 每个 AU 用 Filler Data NAL 补到「地板码率 × 帧时长」预算线。只加字节不加帧数
+    // → 帧率完全不动；静止窗从 170K 抬到地板，3M↔170K 闪烁收敛为恒定地板。
+    let pad_kbps: u64 = std::env::var("UU_PAD_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    hostlog::log(&format!(
+        "带宽地板 padding：{}（UU_PAD_KBPS=0 关闭）",
+        if pad_kbps > 0 { format!("{pad_kbps} kbps") } else { "关闭".into() }
+    ));
+    let mut pad_win_start = Instant::now();
+    let mut pad_win_bytes: u64 = 0;
+    let mut pad_win_pad_bytes: u64 = 0;
+    let mut pad_win_frames: u64 = 0;
     let video_task = tokio::spawn(async move {
         let _ = init_done_rx.await;
         let mut write_fails = 0u32;
@@ -1194,7 +1209,28 @@ fn start_video(
                 s.pipe_sum_us.fetch_add(pipeline_us, Ordering::Relaxed);
                 s.pipe_n.fetch_add(1, Ordering::Relaxed);
             }
-            if let Err(e) = peer.write_video(frame.data, frame.duration, pipeline_ms).await {
+            let mut data = frame.data;
+            let added = linux_uuremote::padding::pad_au_to(
+                &mut data,
+                linux_uuremote::padding::frame_budget(pad_kbps, frame.duration),
+            );
+            pad_win_bytes += data.len() as u64;
+            pad_win_pad_bytes += added as u64;
+            pad_win_frames += 1;
+            if pad_win_start.elapsed() >= Duration::from_secs(5) {
+                let secs = pad_win_start.elapsed().as_secs_f64().max(0.5);
+                hostlog::log(&format!(
+                    "发送带宽 {:.0} kbps（其中 padding {:.0} kbps，窗口 {} 帧）",
+                    pad_win_bytes as f64 * 8.0 / 1000.0 / secs,
+                    pad_win_pad_bytes as f64 * 8.0 / 1000.0 / secs,
+                    pad_win_frames
+                ));
+                pad_win_start = Instant::now();
+                pad_win_bytes = 0;
+                pad_win_pad_bytes = 0;
+                pad_win_frames = 0;
+            }
+            if let Err(e) = peer.write_video(data, frame.duration, pipeline_ms).await {
                 eprintln!("   写视频样本失败：{e}");
                 // 轨道连着失败 = 这条会话已经死了，别再拖着一整套编码器空转。
                 write_fails += 1;

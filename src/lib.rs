@@ -25,6 +25,7 @@ pub mod transport;
 pub mod audio;
 pub mod virtual_audio;
 pub mod nvenc;
+pub mod padding;
 pub mod hostlog;
 pub mod rtcp_observe;
 pub mod rtp_metadata;
