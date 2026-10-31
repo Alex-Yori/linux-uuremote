@@ -576,14 +576,14 @@ fn draw_home<'a>(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, creator
         (icons::TOP_CLOSE, HomeAction::Close),
     ];
     for (i, (png, action)) in topbar.iter().enumerate() {
-        // 图标显示尺寸保持 24（图标不动），最右贴边 16，步进 40（= gap 16 + 24）
-        let ix = ww as i32 - PAD / 2 - 24 - (5 - i as i32) * 40;
-        let r = Rect::new(ix - 4, TOPBAR_H / 2 - 16, 32, 32);
+        // 顶栏细线图标在 24px 下笔画太细看不清，按用户要求放大到 32px 显示（资源不动）；步进 48。
+        let ix = ww as i32 - PAD / 2 - 32 - (5 - i as i32) * 48;
+        let r = Rect::new(ix - 6, TOPBAR_H / 2 - 20, 44, 40);
         if r.contains_point(Point::new(mx, my)) {
             card(canvas, r, SELECTED, MAIN_BG, 4, None);
         }
         if let Some(tex) = icon_texture(creator, png) {
-            canvas.copy(&tex, None, Rect::new(ix, TOPBAR_H / 2 - 12, 24, 24)).ok();
+            canvas.copy(&tex, None, Rect::new(ix, TOPBAR_H / 2 - 16, 32, 32)).ok();
         }
         home.hit_map.push((r, action.clone()));
     }
